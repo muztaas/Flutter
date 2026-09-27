@@ -83,7 +83,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> with SingleTicker
                   child: Container(
                   width: MediaQuery.of(context).size.width,
                   height: MediaQuery.of(context).size.height,
-                  color: Theme.of(context).colorScheme.onBackground.withOpacity(0.6 * _anim.value),
+                  color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6 * _anim.value),
                 ),
               ),
               // panel
@@ -92,7 +92,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> with SingleTicker
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Material(
-                    color: Theme.of(context).colorScheme.surface.withOpacity(0.75),
+                    color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.75),
                     child: SizedBox(
                       width: width,
                       height: double.infinity,

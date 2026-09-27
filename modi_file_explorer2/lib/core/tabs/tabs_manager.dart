@@ -10,13 +10,22 @@ class TabEntry {
   final Widget Function() pageBuilder;
   // optional handler that should return true if it handled the back action (i.e., consumed it)
   final Future<bool> Function()? onWillPop;
-  TabEntry({required this.id, required this.title, required this.pageBuilder, this.onWillPop});
+  TabEntry({
+    required this.id,
+    required this.title,
+    required this.pageBuilder,
+    this.onWillPop,
+  });
 }
 
 class TabsManager extends ChangeNotifier {
+  static const int maxOpenTabs = 22;
+
   TabsManager._internal() {
     _pageController = PageController(initialPage: 0);
-    _tabs = [TabEntry(id: 'home', title: 'Home', pageBuilder: () => const HomePage())];
+    _tabs = [
+      TabEntry(id: 'home', title: 'Home', pageBuilder: () => const HomePage()),
+    ];
     _selected = 0;
   }
 
@@ -32,37 +41,54 @@ class TabsManager extends ChangeNotifier {
   List<TabEntry> get tabs => List.unmodifiable(_tabs);
   int get selectedIndex => _selected;
 
-  void openStorageTab(String path, {String? title}) {
-    // if tab for path exists, jump to it
-    final exist = _tabs.indexWhere((t) => t.id == path);
-    if (exist != -1) {
-      goTo(exist);
-      return;
+  void openStorageTab(
+    String path, {
+    String? title,
+    bool allowDuplicate = false,
+  }) {
+    // Existing callers retain focus-existing-tab behavior. Only an explicit
+    // duplicate request, such as an Available Storage card tap, skips this.
+    if (!allowDuplicate) {
+      final exist = _tabs.indexWhere((t) => t.id == path);
+      if (exist != -1) {
+        goTo(exist);
+        return;
+      }
     }
+
+    if (_tabs.length >= maxOpenTabs) return;
     final key = GlobalKey<State>();
     final entry = TabEntry(
       id: path,
-      title: title ?? (path.split('/').where((s) => s.isNotEmpty).isEmpty ? 'Storage' : path.split('/').last),
-      pageBuilder: () => StorageTab(key: key, initialPath: path, displayName: title),
-        onWillPop: () async {
-          try {
-            final state = key.currentState;
-            if (state != null) {
-              final dyn = state as dynamic;
-              final handler = dyn.handleWillPop;
-              if (handler is Function) {
-                final res = await handler();
-                return res == true;
-              }
+      title:
+          title ??
+          (path.split('/').where((s) => s.isNotEmpty).isEmpty
+              ? 'Storage'
+              : path.split('/').last),
+      pageBuilder: () =>
+          StorageTab(key: key, initialPath: path, displayName: title),
+      onWillPop: () async {
+        try {
+          final state = key.currentState;
+          if (state != null) {
+            final dyn = state as dynamic;
+            final handler = dyn.handleWillPop;
+            if (handler is Function) {
+              final res = await handler();
+              return res == true;
             }
-          } catch (_) {}
-          return false;
-        });
+          }
+        } catch (_) {}
+        return false;
+      },
+    );
     _tabs.add(entry);
     final target = _tabs.length - 1;
     // set selection first so listeners rebuild for the new selected index
     _selected = target;
-    debugPrint('[TabsManager] openStorageTab -> added tab "$path" target=$target selected=$_selected');
+    debugPrint(
+      '[TabsManager] openStorageTab -> added tab "$path" target=$target selected=$_selected',
+    );
     notifyListeners();
 
     // Schedule navigation to the new tab after the next frame so the
@@ -72,7 +98,9 @@ class TabsManager extends ChangeNotifier {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_pendingProgrammaticPage != target) return; // cancelled/replaced
       if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
-        debugPrint('[TabsManager] openStorageTab -> jumping to page $target (hasClients)');
+        debugPrint(
+          '[TabsManager] openStorageTab -> jumping to page $target (hasClients)',
+        );
         _pageController.jumpToPage(target);
       }
     });
@@ -86,11 +114,9 @@ class TabsManager extends ChangeNotifier {
       return;
     }
 
-    _tabs.add(TabEntry(
-      id: id,
-      title: 'Apps',
-      pageBuilder: () => const AppsTab(),
-    ));
+    _tabs.add(
+      TabEntry(id: id, title: 'Apps', pageBuilder: () => const AppsTab()),
+    );
     final target = _tabs.length - 1;
     _selected = target;
     notifyListeners();
@@ -120,7 +146,9 @@ class TabsManager extends ChangeNotifier {
     if (idx <= 0 || idx >= _tabs.length) return; // never close home
     _tabs.removeAt(idx);
     if (_selected >= _tabs.length) _selected = _tabs.length - 1;
-    debugPrint('[TabsManager] closeTabAt -> removed idx=$idx newSelected=$_selected');
+    debugPrint(
+      '[TabsManager] closeTabAt -> removed idx=$idx newSelected=$_selected',
+    );
     notifyListeners();
     // schedule programmatic jump to new selected
     _pendingProgrammaticPage = _selected;
@@ -128,7 +156,9 @@ class TabsManager extends ChangeNotifier {
       final target = _pendingProgrammaticPage;
       if (target == null) return;
       if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
-        debugPrint('[TabsManager] closeTabAt -> jumping to page $_selected (hasClients)');
+        debugPrint(
+          '[TabsManager] closeTabAt -> jumping to page $_selected (hasClients)',
+        );
         _pageController.jumpToPage(_selected);
       }
     });
@@ -159,7 +189,9 @@ class TabsManager extends ChangeNotifier {
     // report if it matches the pending target; otherwise ignore to avoid
     // reverting the selection to a stale index.
     if (_pendingProgrammaticPage != null) {
-      debugPrint('[TabsManager] setSelectedFromPage -> pending=$_pendingProgrammaticPage idx=$idx');
+      debugPrint(
+        '[TabsManager] setSelectedFromPage -> pending=$_pendingProgrammaticPage idx=$idx',
+      );
       if (_pendingProgrammaticPage == idx) {
         _pendingProgrammaticPage = null;
         if (_selected == idx) return;
@@ -169,7 +201,9 @@ class TabsManager extends ChangeNotifier {
       return;
     }
     if (_selected == idx) return;
-    debugPrint('[TabsManager] setSelectedFromPage -> idx=$idx previousSelected=$_selected');
+    debugPrint(
+      '[TabsManager] setSelectedFromPage -> idx=$idx previousSelected=$_selected',
+    );
     _selected = idx;
     notifyListeners();
   }

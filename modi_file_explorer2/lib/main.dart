@@ -53,16 +53,6 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
-  void _setThemeMode(ThemeMode mode) {
-    setState(() => _themeMode = mode);
-    persistThemeMode(mode);
-  }
-
-  void _setTextScale(double scale) {
-    setState(() => _textScale = scale);
-    persistTextScale(scale);
-  }
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -73,7 +63,7 @@ class _MyAppState extends State<MyApp> {
       builder: (context, child) {
         final media = MediaQuery.of(context);
         return MediaQuery(
-          data: media.copyWith(textScaleFactor: _textScale),
+          data: media.copyWith(textScaler: TextScaler.linear(_textScale)),
           child: child ?? const SizedBox.shrink(),
         );
       },
