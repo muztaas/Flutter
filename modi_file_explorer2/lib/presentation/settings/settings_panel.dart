@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/providers/default_file_apps_provider.dart';
+import '../../core/providers/open_with_providers.dart';
 import '../../core/providers/settings_provider.dart';
+import '../../domain/entities/default_file_app.dart';
 import '../about/about_page.dart';
 
 class SettingsPanel extends ConsumerStatefulWidget {
@@ -125,6 +128,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> with SingleTicker
                                     ListTile(title: const Text('Show hidden files'), trailing: const Switch.adaptive(value: false, onChanged: null)),
                                     ListTile(title: const Text('Default view'), subtitle: const Text('List (default)')),
                                     ListTile(title: const Text('Font size'), subtitle: const Text('Medium')),
+                                    const _DefaultAppsSection(),
                                   ],
                                 ),
                                 ExpansionTile(
@@ -155,6 +159,100 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel> with SingleTicker
           );
         },
       ),
+    );
+  }
+}
+
+class _DefaultAppsSection extends ConsumerWidget {
+  const _DefaultAppsSection();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final defaults = ref.watch(defaultFileAppsProvider);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ListTile(
+          title: const Text('Default apps'),
+          subtitle: const Text('Apps used automatically for file extensions'),
+        ),
+        defaults.when(
+          loading: () => const Padding(
+            padding: EdgeInsets.all(16),
+            child: Center(child: CircularProgressIndicator()),
+          ),
+          error: (error, _) => Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text('Could not load default apps: $error'),
+          ),
+          data: (items) => items.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  child: Center(
+                    child: Text(
+                      'No default apps',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                  ),
+                )
+              : Column(
+                  children: [
+                    for (final item in items)
+                      _DefaultFileAppTile(defaultApp: item),
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+class _DefaultFileAppTile extends ConsumerWidget {
+  const _DefaultFileAppTile({required this.defaultApp});
+
+  final DefaultFileApp defaultApp;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final appName = defaultApp.isTextEditor
+        ? Future<String?>.value('Text Editor (built-in)')
+        : ref
+            .read(openWithRepositoryProvider)
+            .resolveAppName(defaultApp.packageName ?? '');
+    return FutureBuilder<String?>(
+      future: appName,
+      builder: (context, snapshot) {
+        final label =
+            snapshot.data?.trim().isNotEmpty == true
+                ? snapshot.data!
+                : defaultApp.displayName?.trim().isNotEmpty == true
+                ? defaultApp.displayName!
+                : defaultApp.packageName ?? 'Unknown app';
+        return ListTile(
+          title: Text(defaultApp.extension),
+          subtitle: Text('Opens with $label'),
+          trailing: IconButton(
+            tooltip: 'Delete default for ${defaultApp.extension}',
+            icon: const Icon(Icons.delete_outline),
+            onPressed: () async {
+              try {
+                await ref
+                    .read(defaultFileAppsProvider.notifier)
+                    .delete(defaultApp.extension);
+              } catch (error) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Could not delete default app: $error')),
+                  );
+                }
+              }
+            },
+          ),
+        );
+      },
     );
   }
 }

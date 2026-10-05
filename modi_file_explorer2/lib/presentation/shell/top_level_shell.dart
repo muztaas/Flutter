@@ -2,9 +2,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../core/tabs/tabs_manager.dart';
+import '../text_editor/text_editor_tab.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../settings/settings_panel.dart';
 import '../../core/providers/settings_provider.dart';
+import '../common/marquee_text.dart';
 
 class TopLevelShell extends StatefulWidget {
   const TopLevelShell({super.key});
@@ -16,6 +18,7 @@ class TopLevelShell extends StatefulWidget {
 class _TopLevelShellState extends State<TopLevelShell> {
   final TabsManager tabs = TabsManager.instance;
   DateTime? _lastBackPress;
+  bool _exitConfirmationInProgress = false;
   // Storage paths can intentionally occur in multiple tabs, so tab ids are
   // not unique enough to identify header widgets.
   final Map<TabEntry, GlobalKey> _tabKeys = {};
@@ -24,6 +27,7 @@ class _TopLevelShellState extends State<TopLevelShell> {
   void initState() {
     super.initState();
     tabs.addListener(_onTabsChanged);
+    unawaited(tabs.restorePersistedTabs());
   }
 
   @override
@@ -53,6 +57,38 @@ class _TopLevelShellState extends State<TopLevelShell> {
     });
   }
 
+  Future<void> _confirmExitWithUnsavedEditors() async {
+    if (_exitConfirmationInProgress) return;
+    _exitConfirmationInProgress = true;
+    try {
+      final unsavedTabs = tabs.tabs
+          .where((tab) => tab.hasUnsavedChanges?.call() == true)
+          .toList();
+      if (unsavedTabs.isEmpty) return;
+
+      final decision = await TextEditorTabState.showUnsavedChangesDialog(
+        context,
+        fileCount: unsavedTabs.length,
+        fileName: unsavedTabs.first.title,
+        isExit: true,
+      );
+      if (!mounted ||
+          decision == null ||
+          decision == TextEditorCloseDecision.cancel) {
+        return;
+      }
+      if (decision == TextEditorCloseDecision.save) {
+        for (final tab in unsavedTabs) {
+          final saveChanges = tab.saveChanges;
+          if (saveChanges == null || !await saveChanges()) return;
+        }
+      }
+      if (mounted) unawaited(SystemNavigator.pop(animated: false));
+    } finally {
+      _exitConfirmationInProgress = false;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Consumer(
@@ -70,6 +106,15 @@ class _TopLevelShellState extends State<TopLevelShell> {
             // Ask the current tab to handle back first.
             final handled = await tabs.handleSelectedTabWillPop();
             if (!context.mounted || handled) return; // consumed by tab
+
+            final hasUnsavedEditors = tabs.tabs.any(
+              (tab) => tab.hasUnsavedChanges?.call() == true,
+            );
+            if (hasUnsavedEditors) {
+              _lastBackPress = null;
+              await _confirmExitWithUnsavedEditors();
+              return;
+            }
 
             // Not handled by tab: require double-back within 1 second to exit
             final now = DateTime.now();
@@ -114,53 +159,73 @@ class _TopLevelShellState extends State<TopLevelShell> {
                                   );
                                   return GestureDetector(
                                     onTap: () => tabs.goTo(index),
-                                    child: Container(
-                                      key: key,
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 12,
-                                        vertical: 4,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: selected
-                                            ? Theme.of(
-                                                context,
-                                              ).colorScheme.secondaryContainer
-                                            : Colors.transparent,
-                                        borderRadius: BorderRadius.circular(8),
-                                      ),
-                                      child: Row(
-                                        children: [
-                                          Text(
-                                            t.title,
-                                            style: Theme.of(context)
-                                                .textTheme
-                                                .titleSmall
-                                                ?.copyWith(
-                                                  fontSize: 14,
-                                                  color: selected
-                                                      ? Theme.of(context)
-                                                            .colorScheme
-                                                            .onSecondaryContainer
-                                                      : null,
-                                                ),
+                                    child: SizedBox(
+                                      key: ValueKey('tab-header-item-${t.id}'),
+                                      width: index == 0 ? 60 : 100,
+                                      child: Container(
+                                        key: key,
+                                        padding: EdgeInsets.symmetric(
+                                          horizontal: index == 0 ? 0 : 8,
+                                          vertical: 4,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: selected
+                                              ? Theme.of(
+                                                  context,
+                                                ).colorScheme.secondaryContainer
+                                              : Colors.transparent,
+                                          borderRadius: BorderRadius.circular(
+                                            8,
                                           ),
-                                          if (index != 0) ...[
-                                            const SizedBox(width: 8),
-                                            GestureDetector(
-                                              onTap: () =>
-                                                  tabs.closeTabAt(index),
-                                              child: Icon(
-                                                Icons.close,
-                                                size: 16,
-                                                color: selected
-                                                    ? Theme.of(context)
-                                                          .colorScheme
-                                                          .onSecondaryContainer
-                                                    : null,
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            Expanded(
+                                              child: MarqueeText(
+                                                t.title,
+                                                style: Theme.of(context)
+                                                    .textTheme
+                                                    .titleSmall
+                                                    ?.copyWith(
+                                                      fontSize: 14,
+                                                      color: selected
+                                                          ? Theme.of(context)
+                                                                .colorScheme
+                                                                .onSecondaryContainer
+                                                          : null,
+                                                    ),
+                                                textAlign: TextAlign.center,
+                                                styleMode:
+                                                    MarqueeStyle.pauseAndLoop,
+                                                isActive: selected,
                                               ),
                                             ),
+                                            if (index != 0) ...[
+                                              const SizedBox(width: 4),
+                                              GestureDetector(
+                                                onTap: () => unawaited(
+                                                  tabs.requestCloseTab(
+                                                    context,
+                                                    index,
+                                                  ),
+                                                ),
+                                                child: SizedBox(
+                                                  width: 24,
+                                                  height: 24,
+                                                  child: Icon(
+                                                    Icons.close,
+                                                    size: 16,
+                                                    color: selected
+                                                        ? Theme.of(context)
+                                                              .colorScheme
+                                                              .onSecondaryContainer
+                                                        : null,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
                                           ],
-                                        ],
+                                        ),
                                       ),
                                     ),
                                   );
@@ -173,15 +238,50 @@ class _TopLevelShellState extends State<TopLevelShell> {
                     ),
                   ),
                 ),
-                body: PageView.builder(
-                  controller: tabs.pageController,
-                  itemCount: tabs.tabs.length,
-                  // When PageView reports a page change, update the selected index
-                  // without asking the PageController to jump again (prevents a
-                  // feedback loop that could revert the selection).
-                  onPageChanged: (i) => tabs.setSelectedFromPage(i),
-                  itemBuilder: (context, index) =>
-                      tabs.tabs[index].pageBuilder(),
+                body: AnimatedBuilder(
+                  animation: tabs.copyPanelNotifier,
+                  builder: (context, _) {
+                    final selectedTab = tabs.tabs[tabs.selectedIndex];
+                    final panel = selectedTab.bottomPanelBuilder?.call();
+                    final panelHeight = panel == null
+                        ? 0.0
+                        : selectedTab.bottomPanelHeightBuilder?.call() ?? 72;
+                    final bottomInset = MediaQuery.viewPaddingOf(
+                      context,
+                    ).bottom;
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Padding(
+                          padding: EdgeInsets.only(
+                            bottom: panel == null
+                                ? 0
+                                : panelHeight + bottomInset,
+                          ),
+                          child: PageView.builder(
+                            controller: tabs.pageController,
+                            itemCount: tabs.tabs.length,
+                            // When PageView reports a page change, update the selected index
+                            // without asking the PageController to jump again (prevents a
+                            // feedback loop that could revert the selection).
+                            onPageChanged: (i) => tabs.setSelectedFromPage(i),
+                            itemBuilder: (context, index) => MarqueeVisibility(
+                              isVisible: index == tabs.selectedIndex,
+                              child: tabs.tabs[index].pageBuilder(),
+                            ),
+                          ),
+                        ),
+                        if (panel != null)
+                          Align(
+                            alignment: Alignment.bottomCenter,
+                            child: SizedBox(
+                              width: double.infinity,
+                              child: panel,
+                            ),
+                          ),
+                      ],
+                    );
+                  },
                 ),
               ),
               // Settings panel overlay

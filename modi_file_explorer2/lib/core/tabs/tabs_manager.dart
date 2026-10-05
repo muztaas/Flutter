@@ -1,25 +1,44 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../presentation/home/home_page.dart';
 import '../../presentation/apps/apps_tab.dart';
 import '../../presentation/storage/storage_tab.dart';
+import '../../presentation/text_editor/text_editor_tab.dart';
 
 class TabEntry {
   final String id;
   final String title;
   // builder used to create the page widget when requested by the UI
   final Widget Function() pageBuilder;
+  final Widget? Function()? bottomPanelBuilder;
+  final double Function()? bottomPanelHeightBuilder;
   // optional handler that should return true if it handled the back action (i.e., consumed it)
   final Future<bool> Function()? onWillPop;
+  final bool Function()? hasUnsavedChanges;
+  final Future<bool> Function(BuildContext context)? onCloseRequest;
+  final Future<bool> Function()? saveChanges;
   TabEntry({
     required this.id,
     required this.title,
     required this.pageBuilder,
+    this.bottomPanelBuilder,
+    this.bottomPanelHeightBuilder,
     this.onWillPop,
+    this.hasUnsavedChanges,
+    this.onCloseRequest,
+    this.saveChanges,
   });
 }
 
 class TabsManager extends ChangeNotifier {
   static const int maxOpenTabs = 22;
+  final ChangeNotifier copyPanelNotifier = ChangeNotifier();
+  late final StorageCopySession copySession = StorageCopySession(
+    onChanged: copyPanelNotifier.notifyListeners,
+  );
 
   TabsManager._internal() {
     _pageController = PageController(initialPage: 0);
@@ -36,10 +55,63 @@ class TabsManager extends ChangeNotifier {
   late List<TabEntry> _tabs;
   late int _selected;
   int? _pendingProgrammaticPage;
+  bool _restoreAttempted = false;
+  bool _restoring = false;
 
   PageController get pageController => _pageController;
   List<TabEntry> get tabs => List.unmodifiable(_tabs);
   int get selectedIndex => _selected;
+
+  Future<void> restorePersistedTabs() async {
+    if (_restoreAttempted) return;
+    _restoreAttempted = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString('tabs.open');
+      if (saved == null) return;
+      final data = Map<String, dynamic>.from(jsonDecode(saved) as Map);
+      final items = data['items'] as List<dynamic>? ?? const [];
+      _restoring = true;
+      for (final raw in items) {
+        final item = Map<String, dynamic>.from(raw as Map);
+        if (item['type'] == 'storage' && item['path'] is String) {
+          openStorageTab(
+            item['path'] as String,
+            title: item['title'] as String?,
+            allowDuplicate: true,
+          );
+        } else if (item['type'] == 'textEditor' && item['path'] is String) {
+          openTextEditor(item['path'] as String, allowDuplicate: true);
+        } else if (item['type'] == 'apps') {
+          openAppsTab();
+        }
+      }
+      _restoring = false;
+      final selected = data['selectedIndex'] as int? ?? 0;
+      if (selected > 0 && selected < _tabs.length) goTo(selected);
+      await _persistTabs();
+    } catch (_) {
+      _restoring = false;
+    }
+  }
+
+  Future<void> _persistTabs() async {
+    if (_restoring) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final items = _tabs.skip(1).map((tab) {
+        if (tab.id == 'apps') return {'type': 'apps'};
+        if (tab.id.startsWith('textEditor:')) {
+          return {'type': 'textEditor', 'path': tab.id.substring(11)};
+        }
+        return {'type': 'storage', 'path': tab.id, 'title': tab.title};
+      }).toList();
+      await prefs.setString(
+        'tabs.open',
+        jsonEncode({'selectedIndex': _selected, 'items': items}),
+      );
+    } catch (_) {}
+  }
 
   void openStorageTab(
     String path, {
@@ -57,7 +129,7 @@ class TabsManager extends ChangeNotifier {
     }
 
     if (_tabs.length >= maxOpenTabs) return;
-    final key = GlobalKey<State>();
+    final key = GlobalKey<StorageTabState>();
     final entry = TabEntry(
       id: path,
       title:
@@ -65,8 +137,14 @@ class TabsManager extends ChangeNotifier {
           (path.split('/').where((s) => s.isNotEmpty).isEmpty
               ? 'Storage'
               : path.split('/').last),
-      pageBuilder: () =>
-          StorageTab(key: key, initialPath: path, displayName: title),
+      pageBuilder: () => StorageTab(
+        key: key,
+        initialPath: path,
+        displayName: title,
+        copySession: copySession,
+      ),
+      bottomPanelBuilder: () => key.currentState?.buildCopyPanel(),
+      bottomPanelHeightBuilder: () => copySession.panelHeight,
       onWillPop: () async {
         try {
           final state = key.currentState;
@@ -90,6 +168,7 @@ class TabsManager extends ChangeNotifier {
       '[TabsManager] openStorageTab -> added tab "$path" target=$target selected=$_selected',
     );
     notifyListeners();
+    unawaited(_persistTabs());
 
     // Schedule navigation to the new tab after the next frame so the
     // PageView has rebuilt with the new item. Mark the target as pending
@@ -120,6 +199,46 @@ class TabsManager extends ChangeNotifier {
     final target = _tabs.length - 1;
     _selected = target;
     notifyListeners();
+    unawaited(_persistTabs());
+    _pendingProgrammaticPage = target;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_pendingProgrammaticPage != target) return;
+      if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
+        _pageController.jumpToPage(target);
+      }
+    });
+  }
+
+  void openTextEditor(String path, {bool allowDuplicate = false}) {
+    final id = 'textEditor:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere((tab) => tab.id == id);
+      if (existing != -1) {
+        goTo(existing);
+        return;
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) return;
+
+    final title = path.split(RegExp(r'[/\\]')).last;
+    final key = GlobalKey<TextEditorTabState>();
+    _tabs.add(
+      TabEntry(
+        id: id,
+        title: title.isEmpty ? 'Text Editor' : title,
+        pageBuilder: () => TextEditorTab(key: key, path: path),
+        hasUnsavedChanges: () =>
+            key.currentState?.hasUnsavedChanges ?? false,
+        onCloseRequest: (context) =>
+            key.currentState?.confirmClose(context) ?? Future.value(true),
+        saveChanges: () =>
+            key.currentState?.saveFromClosePrompt() ?? Future.value(false),
+      ),
+    );
+    final target = _tabs.length - 1;
+    _selected = target;
+    notifyListeners();
+    unawaited(_persistTabs());
     _pendingProgrammaticPage = target;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_pendingProgrammaticPage != target) return;
@@ -142,6 +261,15 @@ class TabsManager extends ChangeNotifier {
     }
   }
 
+  Future<bool> requestCloseTab(BuildContext context, int idx) async {
+    if (idx <= 0 || idx >= _tabs.length) return false;
+    final closeRequest = _tabs[idx].onCloseRequest;
+    final shouldClose = closeRequest == null || await closeRequest(context);
+    if (!shouldClose || idx >= _tabs.length) return false;
+    closeTabAt(idx);
+    return true;
+  }
+
   void closeTabAt(int idx) {
     if (idx <= 0 || idx >= _tabs.length) return; // never close home
     _tabs.removeAt(idx);
@@ -150,6 +278,7 @@ class TabsManager extends ChangeNotifier {
       '[TabsManager] closeTabAt -> removed idx=$idx newSelected=$_selected',
     );
     notifyListeners();
+    unawaited(_persistTabs());
     // schedule programmatic jump to new selected
     _pendingProgrammaticPage = _selected;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -197,6 +326,7 @@ class TabsManager extends ChangeNotifier {
         if (_selected == idx) return;
         _selected = idx;
         notifyListeners();
+        unawaited(_persistTabs());
       }
       return;
     }
@@ -206,6 +336,7 @@ class TabsManager extends ChangeNotifier {
     );
     _selected = idx;
     notifyListeners();
+    unawaited(_persistTabs());
   }
 
   void disposeManager() {

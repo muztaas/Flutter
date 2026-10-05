@@ -6,6 +6,7 @@ import '../../core/providers/settings_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../domain/entities/storage_device.dart';
+import '../common/marquee_text.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -18,9 +19,30 @@ class _HomePageState extends State<HomePage>
     with AutomaticKeepAliveClientMixin<HomePage> {
   final _categoryKey = GlobalKey<_CategoryCardsState>();
   final _storageKey = GlobalKey<_AvailableStorageSectionState>();
+  final TabsManager _tabs = TabsManager.instance;
+  bool _isHomeVisible = true;
 
   @override
   bool get wantKeepAlive => true;
+
+  @override
+  void initState() {
+    super.initState();
+    _isHomeVisible = _tabs.selectedIndex == 0;
+    _tabs.addListener(_onTabsChanged);
+  }
+
+  @override
+  void dispose() {
+    _tabs.removeListener(_onTabsChanged);
+    super.dispose();
+  }
+
+  void _onTabsChanged() {
+    final isHomeVisible = _tabs.selectedIndex == 0;
+    if (_isHomeVisible == isHomeVisible || !mounted) return;
+    setState(() => _isHomeVisible = isHomeVisible);
+  }
 
   void _refresh() {
     _categoryKey.currentState?.refresh();
@@ -66,7 +88,10 @@ class _HomePageState extends State<HomePage>
               Expanded(child: _QuickAccessSection()),
               SizedBox(
                 height: 215,
-                child: _AvailableStorageSection(key: _storageKey),
+                child: _AvailableStorageSection(
+                  key: _storageKey,
+                  isActive: _isHomeVisible,
+                ),
               ),
             ],
           ),
@@ -299,20 +324,18 @@ class _QuickAccessSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // For now, show an empty state
-    return Padding(
+    return SingleChildScrollView(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text('Recent', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 8),
-          Expanded(
-            child: Center(
-              child: Text(
-                'No favourites',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
+          Center(
+            child: Text(
+              'No favourites',
+              style: Theme.of(context).textTheme.bodyMedium,
             ),
           ),
         ],
@@ -322,7 +345,9 @@ class _QuickAccessSection extends StatelessWidget {
 }
 
 class _AvailableStorageSection extends StatefulWidget {
-  const _AvailableStorageSection({super.key});
+  final bool isActive;
+
+  const _AvailableStorageSection({super.key, required this.isActive});
 
   @override
   State<_AvailableStorageSection> createState() =>
@@ -374,7 +399,10 @@ class _AvailableStorageSectionState extends State<_AvailableStorageSection> {
                   mainAxisSpacing: 8,
                   shrinkWrap: true,
                   children: devices
-                      .map((d) => _StorageCard(device: d))
+                      .map(
+                        (d) =>
+                            _StorageCard(device: d, isActive: widget.isActive),
+                      )
                       .toList(),
                 );
               },
@@ -388,7 +416,9 @@ class _AvailableStorageSectionState extends State<_AvailableStorageSection> {
 
 class _StorageCard extends StatelessWidget {
   final StorageDevice device;
-  const _StorageCard({required this.device});
+  final bool isActive;
+
+  const _StorageCard({required this.device, required this.isActive});
 
   String _formatBytes(int? value) {
     if (value == null || value <= 0) {
@@ -437,14 +467,18 @@ class _StorageCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    _AutoScrollingText(
+                    MarqueeText(
                       device.name,
                       style: Theme.of(context).textTheme.titleSmall,
+                      styleMode: MarqueeStyle.pauseAndLoop,
+                      isActive: isActive,
                     ),
                     const SizedBox(height: 4),
-                    _AutoScrollingText(
+                    MarqueeText(
                       usageText,
                       style: Theme.of(context).textTheme.labelSmall,
+                      styleMode: MarqueeStyle.pauseAndLoop,
+                      isActive: isActive,
                     ),
                   ],
                 ),
@@ -452,139 +486,6 @@ class _StorageCard extends StatelessWidget {
             ],
           ),
         ),
-      ),
-    );
-  }
-}
-
-class _AutoScrollingText extends StatefulWidget {
-  final String text;
-  final TextStyle? style;
-
-  const _AutoScrollingText(this.text, {this.style});
-
-  @override
-  State<_AutoScrollingText> createState() => _AutoScrollingTextState();
-}
-
-class _AutoScrollingTextState extends State<_AutoScrollingText>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
-  bool _wasScrolling = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 7),
-    );
-  }
-
-  @override
-  void didUpdateWidget(covariant _AutoScrollingText oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.text != widget.text) {
-      _controller.reset();
-      _controller.stop();
-      _wasScrolling = false;
-    }
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final textStyle = widget.style ?? Theme.of(context).textTheme.titleSmall;
-
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final painter = TextPainter(
-          text: TextSpan(text: widget.text, style: textStyle),
-          maxLines: 1,
-          textDirection: Directionality.of(context),
-        )..layout(minWidth: 0, maxWidth: double.infinity);
-
-        final shouldScroll = painter.width > constraints.maxWidth;
-        if (!shouldScroll) {
-          if (_wasScrolling) {
-            _controller.stop();
-            _controller.reset();
-            _wasScrolling = false;
-          }
-          return Text(
-            widget.text,
-            style: textStyle,
-            maxLines: 1,
-            overflow: TextOverflow.visible,
-            softWrap: false,
-          );
-        }
-
-        if (!_controller.isAnimating && !_wasScrolling) {
-          _wasScrolling = true;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted && _wasScrolling && !_controller.isAnimating) {
-              _controller.repeat();
-            }
-          });
-        }
-
-        const gap = 32.0;
-        final cycleWidth = painter.width + gap;
-        // Reduce the scrolling speed by 50% for both labels.
-        _controller.duration = Duration(
-          milliseconds: (cycleWidth / (25 * 0.54) * 1000).round(),
-        );
-        return ClipRect(
-          child: SizedBox(
-            width: constraints.maxWidth,
-            child: AnimatedBuilder(
-              animation: _controller,
-              builder: (context, _) {
-                final offset = -cycleWidth * _controller.value;
-                return SizedBox(
-                  width: constraints.maxWidth,
-                  height: painter.height,
-                  child: ClipRect(
-                    child: Stack(
-                      clipBehavior: Clip.hardEdge,
-                      children: [
-                        Positioned(
-                          left: offset,
-                          top: 0,
-                          child: _buildText(painter.width, textStyle),
-                        ),
-                        Positioned(
-                          left: offset + cycleWidth,
-                          top: 0,
-                          child: _buildText(painter.width, textStyle),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildText(double width, TextStyle? style) {
-    return SizedBox(
-      width: width,
-      child: Text(
-        widget.text,
-        style: style,
-        maxLines: 1,
-        overflow: TextOverflow.visible,
-        softWrap: false,
       ),
     );
   }
