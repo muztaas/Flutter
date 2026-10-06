@@ -6,6 +6,11 @@ abstract class OpenWithRepository {
     required String category,
   });
 
+  Future<List<OpenWithApp>> listAppsForType({
+    required String extension,
+    required String category,
+  });
+
   Future<void> openFile({
     required String path,
     required String category,

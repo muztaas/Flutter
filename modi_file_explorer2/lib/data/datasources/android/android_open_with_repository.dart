@@ -15,14 +15,33 @@ class AndroidOpenWithRepository implements OpenWithRepository {
       'listOpenWithApps',
       {'path': path, 'category': category},
     );
-    return (result ?? const <dynamic>[]).map((raw) {
-      final app = Map<String, dynamic>.from(raw as Map);
-      return OpenWithApp(
-        name: app['name'] as String? ?? 'Unknown app',
-        packageName: app['packageName'] as String? ?? '',
-        mimeType: app['mimeType'] as String? ?? 'application/octet-stream',
-      );
-    }).where((app) => app.packageName.isNotEmpty).toList();
+    return _decodeApps(result);
+  }
+
+  @override
+  Future<List<OpenWithApp>> listAppsForType({
+    required String extension,
+    required String category,
+  }) async {
+    final result = await _channel.invokeMethod<List<dynamic>>(
+      'listOpenWithAppsForType',
+      {'extension': extension, 'category': category},
+    );
+    return _decodeApps(result);
+  }
+
+  List<OpenWithApp> _decodeApps(List<dynamic>? result) {
+    return (result ?? const <dynamic>[])
+        .map((raw) {
+          final app = Map<String, dynamic>.from(raw as Map);
+          return OpenWithApp(
+            name: app['name'] as String? ?? 'Unknown app',
+            packageName: app['packageName'] as String? ?? '',
+            mimeType: app['mimeType'] as String? ?? 'application/octet-stream',
+          );
+        })
+        .where((app) => app.packageName.isNotEmpty)
+        .toList();
   }
 
   @override

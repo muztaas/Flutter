@@ -28,8 +28,16 @@ ThemeData buildLightTheme() {
 
 ThemeData buildDarkTheme() {
   const seed = Color(0xFF1565C0);
+  final colorScheme = ColorScheme.fromSeed(
+    seedColor: seed,
+    brightness: Brightness.dark,
+  );
   return ThemeData(
-    colorScheme: ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark),
+    colorScheme: colorScheme,
+    snackBarTheme: SnackBarThemeData(
+      backgroundColor: const Color(0xFF292B30),
+      contentTextStyle: TextStyle(color: colorScheme.onSurface),
+    ),
     useMaterial3: true,
   );
 }

@@ -5,9 +5,11 @@ import android.content.Intent
 import android.content.ActivityNotFoundException
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.storage.StorageManager
 import android.provider.Settings
 import android.webkit.MimeTypeMap
+import android.app.UiModeManager
 import androidx.core.content.FileProvider
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.android.FlutterActivity
@@ -18,6 +20,25 @@ class MainActivity : FlutterActivity() {
 	private val channelName = "modi_file_explorer2/installed_apps"
 	private val storageChannelName = "modi_file_explorer2/storage_volumes"
 	private val openWithChannelName = "modi_file_explorer2/open_with"
+	private val navigationModeChannelName = "modi_file_explorer2/navigation_mode"
+
+	override fun onCreate(savedInstanceState: Bundle?) {
+		val darkTheme = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+			.getString("flutter.theme.mode", "light") == "dark"
+		applyApplicationNightMode(darkTheme)
+		setTheme(if (darkTheme) R.style.LaunchThemeDark else R.style.LaunchThemeLight)
+		super.onCreate(savedInstanceState)
+	}
+
+	private fun applyApplicationNightMode(darkTheme: Boolean) {
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+			val uiModeManager = getSystemService(UiModeManager::class.java)
+			uiModeManager.setApplicationNightMode(
+				if (darkTheme) UiModeManager.MODE_NIGHT_YES
+				else UiModeManager.MODE_NIGHT_NO,
+			)
+		}
+	}
 
 	private fun categoryMimeType(category: String): String = when (category) {
 		"Text" -> "text/plain"
@@ -44,6 +65,40 @@ class MainActivity : FlutterActivity() {
 
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
 		super.configureFlutterEngine(flutterEngine)
+
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, navigationModeChannelName)
+			.setMethodCallHandler { call, result ->
+				if (call.method != "isButtonNavigationEnabled") {
+					result.notImplemented()
+					return@setMethodCallHandler
+				}
+
+				val tappableNavigationInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+					window.decorView.rootWindowInsets
+						?.getInsets(android.view.WindowInsets.Type.tappableElement())
+						?.bottom
+				} else {
+					null
+				}
+				val hasButtonNavigation = tappableNavigationInset?.let { it > 0 }
+					?: (Settings.Secure.getInt(contentResolver, "navigation_mode", 0) != 2)
+				result.success(hasButtonNavigation)
+			}
+
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "modi_file_explorer2/app_theme")
+			.setMethodCallHandler { call, result ->
+				if (call.method != "setDarkTheme") {
+					result.notImplemented()
+					return@setMethodCallHandler
+				}
+				val darkTheme = call.argument<Boolean>("enabled")
+				if (darkTheme == null) {
+					result.error("INVALID_ARGUMENT", "Theme mode is required", null)
+					return@setMethodCallHandler
+				}
+				applyApplicationNightMode(darkTheme)
+				result.success(null)
+			}
 
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
 			.setMethodCallHandler { call, result ->
@@ -77,6 +132,36 @@ class MainActivity : FlutterActivity() {
 			.setMethodCallHandler { call, result ->
 				try {
 					when (call.method) {
+						"listOpenWithAppsForType" -> {
+							val extension = call.argument<String>("extension")?.removePrefix(".")
+							val category = call.argument<String>("category")
+							if (extension.isNullOrBlank() || category.isNullOrBlank()) {
+								result.error("INVALID_ARGUMENT", "A file extension and category are required", null)
+								return@setMethodCallHandler
+							}
+							val extensionMimeType = MimeTypeMap.getSingleton()
+								.getMimeTypeFromExtension(extension.lowercase())
+							val mimeTypes = linkedSetOf(categoryMimeType(category))
+							if (extensionMimeType != null) mimeTypes.add(extensionMimeType)
+							val apps = linkedMapOf<String, Map<String, String>>()
+							for (mimeType in mimeTypes) {
+								val intent = Intent(Intent.ACTION_VIEW).setType(mimeType)
+								for (resolveInfo in queryActivities(intent)) {
+									val appPackageName = resolveInfo.activityInfo?.packageName ?: continue
+									if (appPackageName == packageName) continue
+									val label = resolveInfo.loadLabel(packageManager)?.toString()
+										?.takeIf { it.isNotBlank() } ?: appPackageName
+									if (!apps.containsKey(appPackageName)) {
+										apps[appPackageName] = mapOf(
+											"name" to label,
+											"packageName" to appPackageName,
+											"mimeType" to mimeType,
+										)
+									}
+								}
+							}
+							result.success(apps.values.sortedBy { it["name"]?.lowercase() })
+						}
 						"listOpenWithApps" -> {
 							val path = call.argument<String>("path")
 							val category = call.argument<String>("category")

@@ -9,9 +9,11 @@ import '../../core/providers/settings_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/providers/open_with_providers.dart';
 import '../../core/providers/default_file_apps_provider.dart';
+import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/sort_rules_provider.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../domain/entities/default_file_app.dart';
+import '../../domain/entities/quick_access_item.dart';
 import '../../domain/entities/sort_rule.dart';
 import '../../domain/entities/open_with_app.dart';
 import '../../domain/usecases/resolve_effective_sort_rule.dart';
@@ -331,6 +333,8 @@ class StorageTabState extends ConsumerState<StorageTab>
   // tab can be revisited without causing another filesystem read.
   static final Map<String, List<FileSystemEntity>> _directoryCache = {};
   static final Map<String, bool> _subfolderCache = {};
+  static final Map<String, Future<FileStat>> _statCache = {};
+  static final Map<String, Future<int>> _itemCountCache = {};
   Directory? _dir;
   String? _anchorPath;
   List<String> _storageRootPaths = const [];
@@ -338,9 +342,6 @@ class StorageTabState extends ConsumerState<StorageTab>
   bool _selectionMode = false;
   final Set<String> _selected = {};
   late final StorageCopySession _copySession;
-  // The Settings section should control this value and refresh the current
-  // directory with _loadRoot(_dir?.path, forceRefresh: true) when it changes.
-  bool _showHidden = false;
   String _sortBy = 'Name';
   bool _sortAscending = true;
   final GlobalKey _menuKey = GlobalKey();
@@ -412,6 +413,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     // set anchor path on first load so this tab won't navigate above it
     _anchorPath ??= dir.path;
     _syncSortChoice(_currentRules(), dir.path);
+    if (forceRefresh) _invalidateMetadataCache(dir.path);
 
     final cachedItems = _directoryCache[dir.path];
     if (!forceRefresh && cachedItems != null) {
@@ -431,8 +433,15 @@ class StorageTabState extends ConsumerState<StorageTab>
       // can fail for an accessible directory and leave the folder empty.
       items = await dir.list(followLinks: false).toList();
       _subfolderCache[dir.path] = items.any((item) => item is Directory);
-      if (!_showHidden) {
-        items.removeWhere((item) => _displayName(item.path).startsWith('.'));
+      final settings = ref.read(appSettingsProvider);
+      if (!settings.showNomediaFiles && await _isInsideNoMediaDirectory(dir)) {
+        items = [];
+      } else {
+        items.removeWhere((item) {
+          final name = _displayName(item.path);
+          if (name == '.nomedia' && settings.showNomediaFiles) return false;
+          return !settings.showHiddenFiles && name.startsWith('.');
+        });
       }
       _sortList(items, _sortBy, _sortAscending);
     } catch (_) {
@@ -1878,6 +1887,26 @@ class StorageTabState extends ConsumerState<StorageTab>
         final selectedItem = _items
             .where((item) => item.path == selectedPath)
             .firstOrNull;
+        if (selectedItem != null) {
+          final isInQuickAccess =
+              ref
+                  .read(quickAccessProvider)
+                  .asData
+                  ?.value
+                  .any((item) => item.path == selectedPath) ??
+              false;
+          entries.insert(
+            0,
+            PopupMenuItem(
+              value: 'quick_access',
+              child: Text(
+                isInQuickAccess
+                    ? 'Remove from Quick Access'
+                    : 'Add to Quick Access',
+              ),
+            ),
+          );
+        }
         if (selectedItem is File) {
           entries.insert(
             1,
@@ -1909,14 +1938,22 @@ class StorageTabState extends ConsumerState<StorageTab>
         _message('${_items.length} items selected');
         break;
       case 'hidden':
-        setState(() => _showHidden = !_showHidden);
-        _loadRoot(_dir?.path, forceRefresh: true).then(
-          (_) => _message(
-            _showHidden
-                ? 'Show hidden files enabled'
-                : 'Show hidden files disabled',
-          ),
-        );
+        final showHidden = !ref.read(appSettingsProvider).showHiddenFiles;
+        ref
+            .read(appSettingsProvider.notifier)
+            .setShowHiddenFiles(showHidden)
+            .then((_) {
+              if (mounted) {
+                _message(
+                  showHidden
+                      ? 'Show hidden files enabled'
+                      : 'Show hidden files disabled',
+                );
+              }
+            })
+            .catchError((Object error) {
+              if (mounted) _message('Could not save setting: $error');
+            });
         break;
       case 'sort':
         _showSortMenu();
@@ -1930,6 +1967,9 @@ class StorageTabState extends ConsumerState<StorageTab>
               ? _items.where((e) => _selected.contains(e.path)).toList()
               : (_dir == null ? [] : [_dir!]),
         );
+        break;
+      case 'quick_access':
+        _toggleSelectedQuickAccess();
         break;
       case 'delete':
         _deleteSelected();
@@ -1956,6 +1996,42 @@ class StorageTabState extends ConsumerState<StorageTab>
         });
         _copySession.setSources(sources);
         break;
+    }
+  }
+
+  Future<void> _toggleSelectedQuickAccess() async {
+    if (_selected.length != 1) return;
+    final entity = _items
+        .where((item) => item.path == _selected.single)
+        .firstOrNull;
+    if (entity == null) {
+      _message('The selected item is no longer available');
+      return;
+    }
+    try {
+      final items = ref.read(quickAccessProvider).asData?.value ?? const [];
+      final wasSaved = items.any((item) => item.path == entity.path);
+      await ref
+          .read(quickAccessProvider.notifier)
+          .toggle(
+            QuickAccessItem(
+              path: entity.path,
+              name: _displayName(entity.path),
+              isDirectory: entity is Directory,
+            ),
+          );
+      if (!mounted) return;
+      setState(() {
+        _selected.clear();
+        _selectionMode = false;
+      });
+      _message(
+        wasSaved
+            ? 'Removed ${_displayName(entity.path)} from Quick Access'
+            : 'Added ${_displayName(entity.path)} to Quick Access',
+      );
+    } catch (error) {
+      if (mounted) _message('Could not update Quick Access: $error');
     }
   }
 
@@ -3326,6 +3402,16 @@ class StorageTabState extends ConsumerState<StorageTab>
     ref.listen<bool>(foldersFirstProvider, (previous, next) {
       if (_dir != null) _applyEffectiveSort(_currentRules());
     });
+    ref.listen<AppSettings>(appSettingsProvider, (previous, next) {
+      if (previous?.showHiddenFiles != next.showHiddenFiles ||
+          previous?.showNomediaFiles != next.showNomediaFiles) {
+        _directoryCache.clear();
+        _subfolderCache.clear();
+        _itemCountCache.clear();
+        if (_dir != null) _loadRoot(_dir!.path, forceRefresh: true);
+      }
+    });
+    final settings = ref.watch(appSettingsProvider);
     return Scaffold(
       appBar: AppBar(
         toolbarHeight: kToolbarHeight * 0.80,
@@ -3386,66 +3472,301 @@ class StorageTabState extends ConsumerState<StorageTab>
       ),
       body: _dir == null
           ? const Center(child: CircularProgressIndicator())
+          : settings.defaultViewMode == 'grid'
+          ? GridView.builder(
+              padding: const EdgeInsets.all(8),
+              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: 220,
+                mainAxisExtent: 70.4,
+                crossAxisSpacing: 8,
+                mainAxisSpacing: 8,
+              ),
+              itemCount: _items.length,
+              itemBuilder: (context, index) =>
+                  _buildStorageItem(_items[index], settings, grid: true),
+            )
           : ListView.builder(
               itemCount: _items.length,
-              itemBuilder: (context, index) {
-                final e = _items[index];
-                final name = _displayName(e.path);
-
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTapDown: (_) {
-                    _longPressTriggered = false;
-                    _pressTimer?.cancel();
-                    _pressTimer = Timer(const Duration(milliseconds: 500), () {
-                      if (!mounted) return;
-                      // start selection mode and select this item
-                      setState(() {
-                        _selectionMode = true;
-                        _selected.add(e.path);
-                        _longPressTriggered = true;
-                      });
-                    });
-                  },
-                  onTapUp: (_) {
-                    _pressTimer?.cancel();
-                    if (!_longPressTriggered) {
-                      _openEntity(e);
-                    }
-                  },
-                  onTapCancel: () {
-                    _pressTimer?.cancel();
-                    _longPressTriggered = false;
-                  },
-                  child: ListTile(
-                    selected: _selected.contains(e.path),
-                    onTap: null, // allow outer GestureDetector to handle taps
-                    leading: _selectionMode
-                        ? Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                _selected.contains(e.path)
-                                    ? Icons.check_box
-                                    : Icons.check_box_outline_blank,
-                              ),
-                              const SizedBox(width: 8),
-                              Icon(
-                                e is Directory
-                                    ? Icons.folder
-                                    : Icons.insert_drive_file,
-                              ),
-                            ],
-                          )
-                        : (e is Directory
-                              ? const Icon(Icons.folder)
-                              : const Icon(Icons.insert_drive_file)),
-                    title: Text(name),
-                  ),
-                );
-              },
+              itemBuilder: (context, index) =>
+                  _buildStorageItem(_items[index], settings),
             ),
     );
+  }
+
+  Widget _buildStorageItem(
+    FileSystemEntity entity,
+    AppSettings settings, {
+    bool grid = false,
+  }) {
+    final name = _displayName(entity.path);
+    final canShowDateTime = settings.defaultViewMode != 'grid';
+    final detailsEnabled =
+        (canShowDateTime &&
+            (settings.showModifiedDate || settings.showModifiedTime)) ||
+        settings.showFolderItemCount ||
+        settings.showFileSize;
+    final leading = _selectionMode
+        ? Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _selected.contains(entity.path)
+                    ? Icons.check_box
+                    : Icons.check_box_outline_blank,
+              ),
+              const SizedBox(width: 8),
+              Icon(
+                entity is Directory ? Icons.folder : Icons.insert_drive_file,
+                size: 24,
+              ),
+            ],
+          )
+        : Icon(
+            entity is Directory ? Icons.folder : Icons.insert_drive_file,
+            size: 24,
+          );
+    final text = _storageItemText(entity, name, settings, detailsEnabled);
+
+    final Widget content = grid
+        ? Card(
+            margin: EdgeInsets.zero,
+            color: _selected.contains(entity.path)
+                ? Theme.of(context).colorScheme.secondaryContainer
+                : null,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                children: [
+                  leading,
+                  const SizedBox(width: 8),
+                  Expanded(child: text),
+                ],
+              ),
+            ),
+          )
+        : ListTile(
+            selected: _selected.contains(entity.path),
+            onTap: null,
+            dense: true,
+            visualDensity: const VisualDensity(vertical: -1),
+            minVerticalPadding: 2,
+            horizontalTitleGap: 12,
+            leading: leading,
+            title: detailsEnabled
+                ? SizedBox(height: 52, child: text)
+                : Text(
+                    name,
+                    textAlign: TextAlign.left,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontSize: (Theme.of(context)
+                              .textTheme
+                              .titleMedium
+                              ?.fontSize ??
+                          16) +
+                          1,
+                    ),
+                  ),
+          );
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) {
+        _longPressTriggered = false;
+        _pressTimer?.cancel();
+        _pressTimer = Timer(const Duration(milliseconds: 500), () {
+          if (!mounted) return;
+          setState(() {
+            _selectionMode = true;
+            _selected.add(entity.path);
+            _longPressTriggered = true;
+          });
+        });
+      },
+      onTapUp: (_) {
+        _pressTimer?.cancel();
+        if (!_longPressTriggered) _openEntity(entity);
+      },
+      onTapCancel: () {
+        _pressTimer?.cancel();
+        _longPressTriggered = false;
+      },
+      child: content,
+    );
+  }
+
+  Widget _storageItemText(
+    FileSystemEntity entity,
+    String name,
+    AppSettings settings,
+    bool detailsEnabled,
+  ) {
+    final canShowDateTime = settings.defaultViewMode != 'grid';
+    final mutedStyle = Theme.of(context).textTheme.bodySmall?.copyWith(
+      color: Theme.of(context).colorScheme.onSurfaceVariant,
+      fontSize: (Theme.of(context).textTheme.titleMedium?.fontSize ?? 16) - 4,
+    );
+    final itemNameStyle = Theme.of(context).textTheme.titleMedium?.copyWith(
+      fontSize: (Theme.of(context).textTheme.titleMedium?.fontSize ?? 16) + 1,
+    );
+    if (!detailsEnabled) {
+      return Text(
+        name,
+        textAlign: TextAlign.left,
+        style: itemNameStyle,
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(
+          name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.left,
+          style: itemNameStyle,
+        ),
+        const SizedBox(height: 2),
+        Row(
+          children: [
+            Expanded(
+              child: entity is Directory && settings.showFolderItemCount
+                  ? _metadataText(
+                      _itemCountFor(entity, settings),
+                      (count) => '$count ${count == 1 ? 'item' : 'items'}',
+                      mutedStyle,
+                      alignment: Alignment.centerLeft,
+                    )
+                  : entity is File && settings.showFileSize
+                  ? _metadataText(
+                      _statFor(entity),
+                      (stat) => _formatFileSize(stat.size),
+                      mutedStyle,
+                      alignment: Alignment.centerLeft,
+                    )
+                  : const SizedBox.shrink(),
+            ),
+            if (canShowDateTime && settings.showModifiedTime)
+              Expanded(
+                child: _metadataText(
+                  _statFor(entity),
+                  (stat) => _timeLabel(stat.modified),
+                  mutedStyle,
+                  alignment: Alignment.center,
+                ),
+              ),
+            if (canShowDateTime && settings.showModifiedDate)
+              Expanded(
+                child: _metadataText(
+                  _statFor(entity),
+                  (stat) => _dateLabel(stat.modified),
+                  mutedStyle,
+                  alignment: Alignment.centerRight,
+                ),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _metadataText<T>(
+    Future<T> future,
+    String Function(T value) label,
+    TextStyle? style, {
+    Alignment alignment = Alignment.centerRight,
+  }) => Align(
+    alignment: alignment,
+    child: FutureBuilder<T>(
+      future: future,
+      builder: (context, snapshot) => Text(
+        snapshot.hasError
+            ? 'Unavailable'
+            : !snapshot.hasData
+            ? '…'
+            : label(snapshot.requireData),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: style,
+      ),
+    ),
+  );
+
+  Future<FileStat> _statFor(FileSystemEntity entity) =>
+      _statCache.putIfAbsent(entity.path, entity.stat);
+
+  void _invalidateMetadataCache(String directoryPath) {
+    final normalized = _normalizedPath(directoryPath);
+    _statCache.removeWhere((path, _) {
+      final candidate = _normalizedPath(path);
+      return candidate == normalized || candidate.startsWith('$normalized/');
+    });
+    _itemCountCache.remove(directoryPath);
+  }
+
+  Future<int> _itemCountFor(Directory directory, AppSettings settings) =>
+      _itemCountCache.putIfAbsent(directory.path, () async {
+        if (!settings.showNomediaFiles &&
+            await _isInsideNoMediaDirectory(directory)) {
+          return 0;
+        }
+        final children = await directory.list(followLinks: false).toList();
+        return children.where((child) {
+          final name = _displayName(child.path);
+          if (name == '.nomedia' && settings.showNomediaFiles) return true;
+          return settings.showHiddenFiles || !name.startsWith('.');
+        }).length;
+      });
+
+  Future<bool> _isInsideNoMediaDirectory(Directory directory) async {
+    final path = _normalizedPath(directory.path);
+    final root = _storageRootPaths
+        .map(_normalizedPath)
+        .where(
+          (candidate) => path == candidate || path.startsWith('$candidate/'),
+        )
+        .fold<String?>(
+          null,
+          (current, candidate) =>
+              current == null || candidate.length > current.length
+              ? candidate
+              : current,
+        );
+    if (root == null || path == root) return false;
+
+    var current = directory;
+    while (_normalizedPath(current.path) != root) {
+      if (await File(
+        '${current.path}${Platform.pathSeparator}.nomedia',
+      ).exists()) {
+        return true;
+      }
+      final parent = current.parent;
+      if (_normalizedPath(parent.path) == _normalizedPath(current.path)) break;
+      current = parent;
+    }
+    return false;
+  }
+
+  String _normalizedPath(String path) =>
+      path.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '');
+
+  String _dateLabel(DateTime modified) =>
+      '${modified.year.toString().padLeft(4, '0')}-'
+      '${modified.month.toString().padLeft(2, '0')}-'
+      '${modified.day.toString().padLeft(2, '0')}';
+
+  String _timeLabel(DateTime modified) =>
+      '${modified.hour.toString().padLeft(2, '0')}:'
+      '${modified.minute.toString().padLeft(2, '0')}';
+
+  String _formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    final kb = bytes / 1024;
+    if (kb < 1024) return '${kb.toStringAsFixed(1)} KB';
+    final mb = kb / 1024;
+    if (mb < 1024) return '${mb.toStringAsFixed(1)} MB';
+    return '${(mb / 1024).toStringAsFixed(1)} GB';
   }
 
   @override

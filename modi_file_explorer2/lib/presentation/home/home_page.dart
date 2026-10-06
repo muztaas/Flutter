@@ -2,9 +2,16 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/services.dart';
+import '../../core/providers/default_file_apps_provider.dart';
+import '../../core/providers/open_with_providers.dart';
 import '../../core/providers/settings_provider.dart';
+import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/tabs/tabs_manager.dart';
+import '../../domain/entities/default_file_app.dart';
+import '../../domain/entities/open_with_app.dart';
+import '../../domain/entities/quick_access_item.dart';
 import '../../domain/entities/storage_device.dart';
 import '../common/marquee_text.dart';
 
@@ -319,28 +326,401 @@ class _CategorySize extends StatelessWidget {
   }
 }
 
-class _QuickAccessSection extends StatelessWidget {
+class _QuickAccessSection extends ConsumerStatefulWidget {
   const _QuickAccessSection();
 
   @override
+  ConsumerState<_QuickAccessSection> createState() =>
+      _QuickAccessSectionState();
+}
+
+class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
+  List<String> _orderedPaths = [];
+
+  @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+    final ref = this.ref;
+    final quickAccess = ref.watch(quickAccessProvider);
+    return Padding(
+      padding: const EdgeInsets.only(left: 16, right: 16, top: 4),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Recent', style: Theme.of(context).textTheme.titleLarge),
+          Text('Quick Access', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 8),
-          Center(
-            child: Text(
-              'No favourites',
-              style: Theme.of(context).textTheme.bodyMedium,
+          Expanded(
+            child: quickAccess.when(
+              loading: () => const Center(child: CircularProgressIndicator()),
+              error: (error, _) =>
+                  Center(child: Text('Could not load Quick Access: $error')),
+              data: (items) => items.isEmpty
+                  ? Center(
+                      child: Text(
+                        'No favourites',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                    )
+                  : _buildReorderableList(context, ref, items),
             ),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildReorderableList(
+    BuildContext context,
+    WidgetRef ref,
+    List<QuickAccessItem> items,
+  ) {
+    final paths = items.map((item) => item.path).toSet();
+    final orderedPaths = [
+      ..._orderedPaths.where(paths.contains),
+      ...items
+          .map((item) => item.path)
+          .where((path) => !_orderedPaths.contains(path)),
+    ];
+    final orderedItems = orderedPaths
+        .map((path) => items.firstWhere((item) => item.path == path))
+        .toList();
+
+    return ReorderableListView.builder(
+      padding: EdgeInsets.zero,
+      primary: false,
+      shrinkWrap: false,
+      physics: const ClampingScrollPhysics(),
+      buildDefaultDragHandles: false,
+      itemCount: orderedItems.length,
+      onReorder: (oldIndex, newIndex) {
+        if (newIndex > oldIndex) newIndex--;
+        final reordered = List<QuickAccessItem>.of(orderedItems);
+        final movedItem = reordered.removeAt(oldIndex);
+        reordered.insert(newIndex, movedItem);
+        setState(() {
+          _orderedPaths = reordered.map((item) => item.path).toList();
+        });
+      },
+      itemBuilder: (context, index) {
+        final item = orderedItems[index];
+        return ReorderableDelayedDragStartListener(
+          key: ValueKey(item.path),
+          index: index,
+          child: ListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.only(left: 16, right: 0),
+            leading: Icon(
+              item.isDirectory ? Icons.folder : Icons.insert_drive_file,
+            ),
+            title: MarqueeText(
+              item.name,
+              style: Theme.of(context).textTheme.titleSmall,
+              styleMode: MarqueeStyle.pauseAndLoop,
+            ),
+            subtitle: MarqueeText(
+              item.path,
+              style: Theme.of(context).textTheme.labelSmall,
+              styleMode: MarqueeStyle.pauseAndLoop,
+            ),
+            onTap: () => _openQuickAccess(context, ref, item),
+            trailing: PopupMenuButton<String>(
+              tooltip: 'Quick Access options',
+              icon: const Icon(Icons.more_vert),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+              onSelected: (value) {
+                if (value == 'remove') {
+                  _removeQuickAccess(context, ref, item);
+                }
+              },
+              itemBuilder: (context) => const [
+                PopupMenuItem<String>(
+                  value: 'remove',
+                  child: Text('Remove from Quick Access'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _removeQuickAccess(
+    BuildContext context,
+    WidgetRef ref,
+    QuickAccessItem item,
+  ) async {
+    try {
+      await ref.read(quickAccessProvider.notifier).delete(item.path);
+      if (mounted) {
+        setState(() => _orderedPaths.remove(item.path));
+      }
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not remove favourite: $error')),
+        );
+      }
+    }
+  }
+
+  Future<void> _openQuickAccess(
+    BuildContext context,
+    WidgetRef ref,
+    QuickAccessItem item,
+  ) async {
+    if (item.isDirectory) {
+      TabsManager.instance.openStorageTab(item.path);
+      return;
+    }
+
+    final file = File(item.path);
+    final extension = item.name.contains('.')
+        ? '.${item.name.split('.').last.toLowerCase()}'
+        : '';
+    var category = _categoryForExtension(extension);
+    if (extension.isNotEmpty) {
+      final DefaultFileApp? savedDefault;
+      try {
+        savedDefault = await ref
+            .read(defaultFileAppsProvider.notifier)
+            .find(extension);
+      } catch (error) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Could not load saved default apps: $error'),
+            ),
+          );
+        }
+        return;
+      }
+
+      if (savedDefault != null) {
+        category = savedDefault.category;
+        if (savedDefault.isTextEditor) {
+          TabsManager.instance.openTextEditor(item.path);
+          return;
+        }
+
+        final packageName = savedDefault.packageName;
+        final repository = ref.read(openWithRepositoryProvider);
+        if (packageName != null && packageName.isNotEmpty) {
+          try {
+            final availableApps = await repository.listApps(
+              path: item.path,
+              category: savedDefault.category,
+            );
+            final isAvailable = availableApps.any(
+              (app) => app.packageName == packageName,
+            );
+            if (isAvailable) {
+              await repository.openFile(
+                path: item.path,
+                category: savedDefault.category,
+                packageName: packageName,
+                mimeType: savedDefault.mimeType,
+              );
+              return;
+            }
+          } on PlatformException catch (error) {
+            if (error.code != 'APP_UNAVAILABLE') {
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(error.message ?? 'Could not open file'),
+                  ),
+                );
+              }
+              return;
+            }
+          } catch (error) {
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Could not open file: $error')),
+              );
+            }
+            return;
+          }
+        }
+
+        try {
+          await ref.read(defaultFileAppsProvider.notifier).delete(extension);
+        } catch (error) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Could not clear the unavailable default app: $error',
+                ),
+              ),
+            );
+          }
+          return;
+        }
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'The app previously used to open $extension files is no longer available',
+            ),
+          ),
+        );
+      }
+    }
+
+    final List<OpenWithApp> apps;
+    try {
+      apps = await ref
+          .read(openWithRepositoryProvider)
+          .listApps(path: item.path, category: category);
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load apps for this file: $error')),
+        );
+      }
+      return;
+    }
+
+    final canUseTextEditor = category == 'Text';
+
+    if (apps.isEmpty && !canUseTextEditor) {
+      TabsManager.instance.openStorageTab(file.parent.path);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'No compatible app found; opened its containing folder',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+    if (!context.mounted) return;
+
+    final selection = await showDialog<OpenWithApp?>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text('Open ${item.name} with'),
+        children: [
+          if (canUseTextEditor)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(
+                dialogContext,
+                OpenWithApp(
+                  name: 'Text Editor (built-in)',
+                  packageName: DefaultFileApp.textEditorHandlerId,
+                  mimeType: 'text/plain',
+                ),
+              ),
+              child: const Text('Text Editor (built-in)'),
+            ),
+          for (final app in apps)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(dialogContext, app),
+              child: Text(app.name),
+            ),
+        ],
+      ),
+    );
+    if (!context.mounted) return;
+    if (selection == null) return;
+    if (selection.packageName == DefaultFileApp.textEditorHandlerId) {
+      TabsManager.instance.openTextEditor(item.path);
+      return;
+    }
+
+    try {
+      await ref
+          .read(openWithRepositoryProvider)
+          .openFile(
+            path: item.path,
+            category: category,
+            packageName: selection.packageName,
+            mimeType: selection.mimeType,
+          );
+    } on PlatformException catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message ?? 'Could not open file')),
+      );
+    } catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not open file: $error')));
+    }
+  }
+
+  String _categoryForExtension(String extension) {
+    if (const {
+      '.txt',
+      '.md',
+      '.markdown',
+      '.json',
+      '.csv',
+      '.tsv',
+      '.xml',
+      '.html',
+      '.htm',
+      '.css',
+      '.js',
+      '.ts',
+      '.dart',
+      '.kt',
+      '.java',
+      '.py',
+      '.yaml',
+      '.yml',
+      '.log',
+      '.ini',
+      '.cfg',
+      '.conf',
+      '.sh',
+      '.c',
+      '.h',
+      '.cpp',
+      '.sql',
+      '.toml',
+      '.properties',
+    }.contains(extension)) {
+      return 'Text';
+    }
+    if (const {
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.gif',
+      '.bmp',
+      '.webp',
+      '.heic',
+      '.svg',
+    }.contains(extension)) {
+      return 'Image';
+    }
+    if (const {
+      '.mp3',
+      '.wav',
+      '.ogg',
+      '.m4a',
+      '.flac',
+      '.aac',
+    }.contains(extension)) {
+      return 'Audio';
+    }
+    if (const {
+      '.mp4',
+      '.mkv',
+      '.mov',
+      '.avi',
+      '.webm',
+      '.3gp',
+    }.contains(extension)) {
+      return 'Video';
+    }
+    return 'Others';
   }
 }
 

@@ -1,75 +1,116 @@
+import 'dart:ui' show ImageFilter;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'core/providers/settings_provider.dart';
 import 'core/theme/app_theme.dart';
 import 'presentation/shell/top_level_shell.dart';
 import 'presentation/startup/startup_permission_gate.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+const _navigationModeChannel = MethodChannel(
+  'modi_file_explorer2/navigation_mode',
+);
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Defer loading SharedPreferences until after the first frame to avoid long
-  // native splash durations. Start app immediately with sensible defaults.
-  runApp(ProviderScope(child: MyApp(initialMode: ThemeMode.system, initialScale: 1.0)));
+  final preferences = await SharedPreferences.getInstance();
+  final settings = AppSettings.fromPreferences(preferences);
+  final buttonNavigationEnabled =
+      await _navigationModeChannel.invokeMethod<bool>(
+        'isButtonNavigationEnabled',
+      ) ??
+      true;
+  runApp(
+    ProviderScope(
+      overrides: [
+        appSettingsProvider.overrideWith(
+          (ref) => AppSettingsController(settings),
+        ),
+      ],
+      child: MyApp(buttonNavigationEnabled: buttonNavigationEnabled),
+    ),
+  );
 }
 
-class MyApp extends StatefulWidget {
-  final ThemeMode initialMode;
-  final double initialScale;
-  const MyApp({super.key, required this.initialMode, required this.initialScale});
+class MyApp extends ConsumerWidget {
+  const MyApp({super.key, required this.buttonNavigationEnabled});
+
+  final bool buttonNavigationEnabled;
 
   @override
-  State<MyApp> createState() => _MyAppState();
-}
-
-class _MyAppState extends State<MyApp> {
-  late ThemeMode _themeMode;
-  late double _textScale;
-
-  @override
-  void initState() {
-    super.initState();
-    _themeMode = widget.initialMode;
-    _textScale = widget.initialScale;
-    // Load persisted settings asynchronously after init so we don't block
-    // the native splash. This keeps cold startup fast; UI will update when
-    // preferences are loaded.
-    _loadPersistedPrefs();
-  }
-
-  Future<void> _loadPersistedPrefs() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final s = prefs.getString('theme.mode') ?? 'system';
-      final mode = s == 'light' ? ThemeMode.light : s == 'dark' ? ThemeMode.dark : ThemeMode.system;
-      final scale = prefs.getDouble('theme.textScale') ?? 1.0;
-      if (!mounted) return;
-      setState(() {
-        _themeMode = mode;
-        _textScale = scale;
-      });
-    } catch (_) {
-      // ignore and keep defaults
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settings = ref.watch(appSettingsProvider);
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Modi File Explorer',
       theme: buildLightTheme(),
       darkTheme: buildDarkTheme(),
-      themeMode: _themeMode,
+      themeMode: settings.darkTheme ? ThemeMode.dark : ThemeMode.light,
       builder: (context, child) {
         final media = MediaQuery.of(context);
-        return MediaQuery(
-          data: media.copyWith(textScaler: TextScaler.linear(_textScale)),
-          child: child ?? const SizedBox.shrink(),
+        final colorScheme = Theme.of(context).colorScheme;
+        final navigationBarHeight = media.viewPadding.bottom > 24
+            ? media.viewPadding.bottom
+            : 24.0;
+        final blurHeight = (navigationBarHeight + 24) * 0.6;
+        final hasButtonNavigation =
+            buttonNavigationEnabled && media.viewPadding.bottom > 0;
+        return AnnotatedRegion<SystemUiOverlayStyle>(
+          value: SystemUiOverlayStyle(
+            systemNavigationBarColor: Colors.transparent,
+            systemNavigationBarDividerColor: Colors.transparent,
+            systemNavigationBarIconBrightness: settings.darkTheme
+                ? Brightness.light
+                : Brightness.dark,
+            systemNavigationBarContrastEnforced: false,
+          ),
+          child: MediaQuery(
+            data: media.copyWith(
+              textScaler: _OffsetTextScaler(settings.textSizeOffset),
+            ),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                child ?? const SizedBox.shrink(),
+                if (hasButtonNavigation)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    height: blurHeight,
+                    child: IgnorePointer(
+                      child: ClipRect(
+                        child: BackdropFilter(
+                          filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                          child: ColoredBox(
+                            color: colorScheme.surface.withValues(alpha: 0.3),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
         );
       },
       home: const StartupPermissionGate(child: TopLevelShell()),
     );
   }
+}
+
+class _OffsetTextScaler extends TextScaler {
+  const _OffsetTextScaler(this.offset);
+
+  final double offset;
+
+  @override
+  double scale(double fontSize) =>
+      (fontSize + offset).clamp(1, double.infinity).toDouble();
+
+  @override
+  double get textScaleFactor => 1;
 }
 
 class MyHomePage extends StatefulWidget {

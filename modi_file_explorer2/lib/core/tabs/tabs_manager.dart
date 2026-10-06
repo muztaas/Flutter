@@ -170,19 +170,7 @@ class TabsManager extends ChangeNotifier {
     notifyListeners();
     unawaited(_persistTabs());
 
-    // Schedule navigation to the new tab after the next frame so the
-    // PageView has rebuilt with the new item. Mark the target as pending
-    // so transient PageView callbacks don't revert our selection.
-    _pendingProgrammaticPage = target;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_pendingProgrammaticPage != target) return; // cancelled/replaced
-      if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
-        debugPrint(
-          '[TabsManager] openStorageTab -> jumping to page $target (hasClients)',
-        );
-        _pageController.jumpToPage(target);
-      }
-    });
+    _schedulePageJump(target);
   }
 
   void openAppsTab() {
@@ -200,13 +188,7 @@ class TabsManager extends ChangeNotifier {
     _selected = target;
     notifyListeners();
     unawaited(_persistTabs());
-    _pendingProgrammaticPage = target;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_pendingProgrammaticPage != target) return;
-      if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
-        _pageController.jumpToPage(target);
-      }
-    });
+    _schedulePageJump(target);
   }
 
   void openTextEditor(String path, {bool allowDuplicate = false}) {
@@ -227,8 +209,7 @@ class TabsManager extends ChangeNotifier {
         id: id,
         title: title.isEmpty ? 'Text Editor' : title,
         pageBuilder: () => TextEditorTab(key: key, path: path),
-        hasUnsavedChanges: () =>
-            key.currentState?.hasUnsavedChanges ?? false,
+        hasUnsavedChanges: () => key.currentState?.hasUnsavedChanges ?? false,
         onCloseRequest: (context) =>
             key.currentState?.confirmClose(context) ?? Future.value(true),
         saveChanges: () =>
@@ -239,13 +220,7 @@ class TabsManager extends ChangeNotifier {
     _selected = target;
     notifyListeners();
     unawaited(_persistTabs());
-    _pendingProgrammaticPage = target;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_pendingProgrammaticPage != target) return;
-      if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
-        _pageController.jumpToPage(target);
-      }
-    });
+    _schedulePageJump(target);
   }
 
   /// Ask the selected tab to handle a back press. Returns true if the tab
@@ -272,25 +247,19 @@ class TabsManager extends ChangeNotifier {
 
   void closeTabAt(int idx) {
     if (idx <= 0 || idx >= _tabs.length) return; // never close home
+    final closingSelectedTab = idx == _selected;
     _tabs.removeAt(idx);
-    if (_selected >= _tabs.length) _selected = _tabs.length - 1;
+    if (closingSelectedTab) {
+      _selected = idx - 1;
+    } else if (idx < _selected) {
+      _selected--;
+    }
     debugPrint(
       '[TabsManager] closeTabAt -> removed idx=$idx newSelected=$_selected',
     );
     notifyListeners();
     unawaited(_persistTabs());
-    // schedule programmatic jump to new selected
-    _pendingProgrammaticPage = _selected;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final target = _pendingProgrammaticPage;
-      if (target == null) return;
-      if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
-        debugPrint(
-          '[TabsManager] closeTabAt -> jumping to page $_selected (hasClients)',
-        );
-        _pageController.jumpToPage(_selected);
-      }
-    });
+    _schedulePageJump(_selected);
   }
 
   void goTo(int idx) {
@@ -298,13 +267,22 @@ class TabsManager extends ChangeNotifier {
     _selected = idx;
     debugPrint('[TabsManager] goTo -> idx=$idx selected=$_selected');
     notifyListeners();
-    // schedule programmatic jump
-    _pendingProgrammaticPage = idx;
+    _schedulePageJump(idx);
+  }
+
+  void _schedulePageJump(int target) {
+    _pendingProgrammaticPage = target;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_pendingProgrammaticPage != idx) return; // cancelled/replaced
-      if (idx >= 0 && idx < _tabs.length && _pageController.hasClients) {
-        debugPrint('[TabsManager] goTo -> jumping to page $idx');
-        _pageController.jumpToPage(idx);
+      if (_pendingProgrammaticPage != target) return;
+      if (target >= 0 && target < _tabs.length && _pageController.hasClients) {
+        debugPrint('[TabsManager] jumping to page $target');
+        _pageController.jumpToPage(target);
+      }
+      // jumpToPage may not emit onPageChanged when already at this page or
+      // when the PageView is not attached. Do not leave a stale guard that
+      // suppresses later user-driven page changes.
+      if (_pendingProgrammaticPage == target) {
+        _pendingProgrammaticPage = null;
       }
     });
   }
@@ -314,9 +292,9 @@ class TabsManager extends ChangeNotifier {
   /// (avoids feedback loops where PageView->goTo->PageView causes reversion).
   void setSelectedFromPage(int idx) {
     if (idx < 0 || idx >= _tabs.length) return;
-    // If a programmatic page jump is pending, only accept the PageView's
-    // report if it matches the pending target; otherwise ignore to avoid
-    // reverting the selection to a stale index.
+    // Ignore intermediate callbacks until the scheduled programmatic jump
+    // reaches its target. The pending guard is cleared immediately after the
+    // jump too, since jumping to the current page may not emit a callback.
     if (_pendingProgrammaticPage != null) {
       debugPrint(
         '[TabsManager] setSelectedFromPage -> pending=$_pendingProgrammaticPage idx=$idx',
