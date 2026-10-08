@@ -8,6 +8,8 @@ class AppSettings {
     this.defaultViewMode = 'list',
     this.showHiddenFiles = false,
     this.showNomediaFiles = true,
+    this.useSavedDefaultApps = true,
+    this.useSavedDefaultAppsForQuickAccess = true,
     this.showModifiedDate = false,
     this.showModifiedTime = false,
     this.showFolderItemCount = false,
@@ -19,6 +21,8 @@ class AppSettings {
   final String defaultViewMode;
   final bool showHiddenFiles;
   final bool showNomediaFiles;
+  final bool useSavedDefaultApps;
+  final bool useSavedDefaultAppsForQuickAccess;
   final bool showModifiedDate;
   final bool showModifiedTime;
   final bool showFolderItemCount;
@@ -36,6 +40,8 @@ class AppSettings {
     String? defaultViewMode,
     bool? showHiddenFiles,
     bool? showNomediaFiles,
+    bool? useSavedDefaultApps,
+    bool? useSavedDefaultAppsForQuickAccess,
     bool? showModifiedDate,
     bool? showModifiedTime,
     bool? showFolderItemCount,
@@ -46,6 +52,10 @@ class AppSettings {
     defaultViewMode: defaultViewMode ?? this.defaultViewMode,
     showHiddenFiles: showHiddenFiles ?? this.showHiddenFiles,
     showNomediaFiles: showNomediaFiles ?? this.showNomediaFiles,
+    useSavedDefaultApps: useSavedDefaultApps ?? this.useSavedDefaultApps,
+    useSavedDefaultAppsForQuickAccess:
+        useSavedDefaultAppsForQuickAccess ??
+        this.useSavedDefaultAppsForQuickAccess,
     showModifiedDate: showModifiedDate ?? this.showModifiedDate,
     showModifiedTime: showModifiedTime ?? this.showModifiedTime,
     showFolderItemCount: showFolderItemCount ?? this.showFolderItemCount,
@@ -70,6 +80,13 @@ class AppSettings {
       showHiddenFiles: preferences.getBool('settings.showHiddenFiles') ?? false,
       showNomediaFiles:
           preferences.getBool('settings.showNomediaFiles') ?? true,
+      useSavedDefaultApps:
+          preferences.getBool('settings.files.useSavedDefaultApps') ?? true,
+      useSavedDefaultAppsForQuickAccess:
+          preferences.getBool(
+            'settings.files.useSavedDefaultAppsForQuickAccess',
+          ) ??
+          true,
       showModifiedDate:
           preferences.getBool('settings.showModifiedDate') ?? false,
       showModifiedTime:
@@ -113,6 +130,21 @@ class AppSettingsController extends StateNotifier<AppSettings> {
     state = state.copyWith(showNomediaFiles: value);
     final preferences = await SharedPreferences.getInstance();
     await preferences.setBool('settings.showNomediaFiles', value);
+  }
+
+  Future<void> setUseSavedDefaultApps(bool value) async {
+    state = state.copyWith(useSavedDefaultApps: value);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool('settings.files.useSavedDefaultApps', value);
+  }
+
+  Future<void> setUseSavedDefaultAppsForQuickAccess(bool value) async {
+    state = state.copyWith(useSavedDefaultAppsForQuickAccess: value);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool(
+      'settings.files.useSavedDefaultAppsForQuickAccess',
+      value,
+    );
   }
 
   Future<void> setShowModifiedDate(bool value) async {

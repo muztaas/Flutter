@@ -38,6 +38,9 @@ class AndroidOpenWithRepository implements OpenWithRepository {
             name: app['name'] as String? ?? 'Unknown app',
             packageName: app['packageName'] as String? ?? '',
             mimeType: app['mimeType'] as String? ?? 'application/octet-stream',
+            applicationName: app['applicationName'] as String?,
+            activityName: app['activityName'] as String?,
+            iconBytes: app['icon'] is Uint8List ? app['icon'] as Uint8List : null,
           );
         })
         .where((app) => app.packageName.isNotEmpty)
@@ -49,12 +52,14 @@ class AndroidOpenWithRepository implements OpenWithRepository {
     required String path,
     required String category,
     required String packageName,
+    String? activityName,
     required String mimeType,
   }) async {
     await _channel.invokeMethod<void>('openWithApp', {
       'path': path,
       'category': category,
       'packageName': packageName,
+      'activityName': activityName,
       'mimeType': mimeType,
     });
   }
@@ -64,5 +69,10 @@ class AndroidOpenWithRepository implements OpenWithRepository {
     return _channel.invokeMethod<String?>('resolveOpenWithAppName', {
       'packageName': packageName,
     });
+  }
+
+  @override
+  Future<Uint8List?> getOwnApplicationIcon() {
+    return _channel.invokeMethod<Uint8List>('getOwnApplicationIcon');
   }
 }

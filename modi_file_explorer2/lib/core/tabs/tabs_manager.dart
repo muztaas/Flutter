@@ -7,6 +7,7 @@ import '../../presentation/home/home_page.dart';
 import '../../presentation/apps/apps_tab.dart';
 import '../../presentation/storage/storage_tab.dart';
 import '../../presentation/text_editor/text_editor_tab.dart';
+import '../../presentation/image_viewer/image_viewer_tab.dart';
 
 class TabEntry {
   final String id;
@@ -20,6 +21,9 @@ class TabEntry {
   final bool Function()? hasUnsavedChanges;
   final Future<bool> Function(BuildContext context)? onCloseRequest;
   final Future<bool> Function()? saveChanges;
+  TabEntry? returnToTab;
+  final bool isImageViewer;
+  bool isFullscreen = false;
   TabEntry({
     required this.id,
     required this.title,
@@ -30,6 +34,8 @@ class TabEntry {
     this.hasUnsavedChanges,
     this.onCloseRequest,
     this.saveChanges,
+    this.returnToTab,
+    this.isImageViewer = false,
   });
 }
 
@@ -72,6 +78,7 @@ class TabsManager extends ChangeNotifier {
       final data = Map<String, dynamic>.from(jsonDecode(saved) as Map);
       final items = data['items'] as List<dynamic>? ?? const [];
       _restoring = true;
+      final imageOriginIndices = <TabEntry, int>{};
       for (final raw in items) {
         final item = Map<String, dynamic>.from(raw as Map);
         if (item['type'] == 'storage' && item['path'] is String) {
@@ -82,13 +89,26 @@ class TabsManager extends ChangeNotifier {
           );
         } else if (item['type'] == 'textEditor' && item['path'] is String) {
           openTextEditor(item['path'] as String, allowDuplicate: true);
+        } else if (item['type'] == 'imageViewer' &&
+            item['path'] is String) {
+          final tab = openImageViewer(item['path'] as String, allowDuplicate: true);
+          final originIndex = item['originTabIndex'];
+          if (tab != null) {
+            imageOriginIndices[tab] = originIndex is int ? originIndex : 0;
+          }
         } else if (item['type'] == 'apps') {
           openAppsTab();
         }
       }
+      for (final entry in imageOriginIndices.entries) {
+        final index = entry.value;
+        entry.key.returnToTab = index >= 0 && index < _tabs.length
+            ? _tabs[index]
+            : _tabs.first;
+      }
       _restoring = false;
       final selected = data['selectedIndex'] as int? ?? 0;
-      if (selected > 0 && selected < _tabs.length) goTo(selected);
+      if (selected >= 0 && selected < _tabs.length) goTo(selected);
       await _persistTabs();
     } catch (_) {
       _restoring = false;
@@ -101,6 +121,15 @@ class TabsManager extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       final items = _tabs.skip(1).map((tab) {
         if (tab.id == 'apps') return {'type': 'apps'};
+        if (tab.isImageViewer) {
+          return {
+            'type': 'imageViewer',
+            'path': tab.id.substring('imageViewer:'.length),
+            'originTabIndex': tab.returnToTab == null
+                ? -1
+                : _tabs.indexOf(tab.returnToTab!),
+          };
+        }
         if (tab.id.startsWith('textEditor:')) {
           return {'type': 'textEditor', 'path': tab.id.substring(11)};
         }
@@ -223,6 +252,64 @@ class TabsManager extends ChangeNotifier {
     _schedulePageJump(target);
   }
 
+  TabEntry? openImageViewer(String path, {bool allowDuplicate = false}) {
+    final id = 'imageViewer:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere((tab) => tab.id == id);
+      if (existing != -1) {
+        goTo(existing);
+        return _tabs[existing];
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) return null;
+
+    final originTab = _tabs[_selected];
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: id,
+      title: path.split(RegExp(r'[/\\]')).last,
+      isImageViewer: true,
+      returnToTab: originTab,
+      pageBuilder: () => ImageViewerTab(
+        path: path,
+        isFullscreen: entry.isFullscreen,
+        onFullscreenChanged: (isFullscreen) =>
+            setImageViewerFullscreen(entry, isFullscreen),
+      ),
+      onWillPop: () async {
+        final index = _tabs.indexOf(entry);
+        if (index <= 0) return false;
+        closeTabAt(index);
+        return true;
+      },
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _selected = target;
+    notifyListeners();
+    unawaited(_persistTabs());
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  void setImageViewerFullscreen(TabEntry entry, bool isFullscreen) {
+    if (!_tabs.contains(entry) ||
+        !entry.isImageViewer ||
+        entry.isFullscreen == isFullscreen) {
+      return;
+    }
+    entry.isFullscreen = isFullscreen;
+    notifyListeners();
+  }
+
+  void _leaveFullscreenViewer() {
+    if (_selected < 0 || _selected >= _tabs.length) return;
+    final selectedTab = _tabs[_selected];
+    if (selectedTab.isImageViewer && selectedTab.isFullscreen) {
+      selectedTab.isFullscreen = false;
+    }
+  }
+
   /// Ask the selected tab to handle a back press. Returns true if the tab
   /// handled (consumed) the back action.
   Future<bool> handleSelectedTabWillPop() async {
@@ -248,9 +335,14 @@ class TabsManager extends ChangeNotifier {
   void closeTabAt(int idx) {
     if (idx <= 0 || idx >= _tabs.length) return; // never close home
     final closingSelectedTab = idx == _selected;
+    final closingTab = _tabs[idx];
+    final returnToTab = closingTab.isImageViewer
+        ? closingTab.returnToTab
+        : null;
     _tabs.removeAt(idx);
     if (closingSelectedTab) {
-      _selected = idx - 1;
+      final originIndex = returnToTab == null ? -1 : _tabs.indexOf(returnToTab);
+      _selected = originIndex >= 0 ? originIndex : (returnToTab != null ? 0 : idx - 1);
     } else if (idx < _selected) {
       _selected--;
     }
@@ -264,6 +356,7 @@ class TabsManager extends ChangeNotifier {
 
   void goTo(int idx) {
     if (idx < 0 || idx >= _tabs.length) return;
+    if (idx != _selected) _leaveFullscreenViewer();
     _selected = idx;
     debugPrint('[TabsManager] goTo -> idx=$idx selected=$_selected');
     notifyListeners();
@@ -302,6 +395,7 @@ class TabsManager extends ChangeNotifier {
       if (_pendingProgrammaticPage == idx) {
         _pendingProgrammaticPage = null;
         if (_selected == idx) return;
+        _leaveFullscreenViewer();
         _selected = idx;
         notifyListeners();
         unawaited(_persistTabs());
@@ -309,6 +403,7 @@ class TabsManager extends ChangeNotifier {
       return;
     }
     if (_selected == idx) return;
+    _leaveFullscreenViewer();
     debugPrint(
       '[TabsManager] setSelectedFromPage -> idx=$idx previousSelected=$_selected',
     );

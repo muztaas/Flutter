@@ -19,6 +19,8 @@ class _TopLevelShellState extends State<TopLevelShell> {
   final TabsManager tabs = TabsManager.instance;
   DateTime? _lastBackPress;
   bool _exitConfirmationInProgress = false;
+  TabEntry? _fullscreenViewer;
+  Timer? _statusBarTimer;
   // Storage paths can intentionally occur in multiple tabs, so tab ids are
   // not unique enough to identify header widgets.
   final Map<TabEntry, GlobalKey> _tabKeys = {};
@@ -32,12 +34,15 @@ class _TopLevelShellState extends State<TopLevelShell> {
 
   @override
   void dispose() {
+    _statusBarTimer?.cancel();
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     tabs.removeListener(_onTabsChanged);
     super.dispose();
   }
 
   void _onTabsChanged() {
     setState(() {});
+    _syncFullscreenSystemUi();
     debugPrint(
       '[TopLevelShell] _onTabsChanged selected=${tabs.selectedIndex} tabs=${tabs.tabs.map((t) => t.id).toList()}',
     );
@@ -54,6 +59,46 @@ class _TopLevelShellState extends State<TopLevelShell> {
           alignment: 0.5,
         );
       }
+    });
+  }
+
+  void _syncFullscreenSystemUi() {
+    final index = tabs.selectedIndex;
+    final selectedTab = index >= 0 && index < tabs.tabs.length
+        ? tabs.tabs[index]
+        : null;
+    final viewer =
+        selectedTab?.isImageViewer == true && selectedTab?.isFullscreen == true
+        ? selectedTab
+        : null;
+    if (identical(viewer, _fullscreenViewer)) return;
+
+    _statusBarTimer?.cancel();
+    _fullscreenViewer = viewer;
+    if (viewer == null) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+      return;
+    }
+
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(
+        SystemUiMode.manual,
+        overlays: const [SystemUiOverlay.top, SystemUiOverlay.bottom],
+      ),
+    );
+    _statusBarTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted ||
+          !identical(_fullscreenViewer, viewer) ||
+          tabs.selectedIndex >= tabs.tabs.length ||
+          !identical(tabs.tabs[tabs.selectedIndex], viewer)) {
+        return;
+      }
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(
+          SystemUiMode.manual,
+          overlays: const [SystemUiOverlay.bottom],
+        ),
+      );
     });
   }
 
@@ -134,110 +179,119 @@ class _TopLevelShellState extends State<TopLevelShell> {
           child: Stack(
             children: [
               Scaffold(
-                appBar: PreferredSize(
-                  preferredSize: const Size.fromHeight(44),
-                  child: SafeArea(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      color: Colors.lightBlue,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: SizedBox(
-                              height: 38,
-                              child: ListView.separated(
-                                scrollDirection: Axis.horizontal,
-                                itemCount: tabs.tabs.length,
-                                separatorBuilder: (_, _) =>
-                                    const SizedBox(width: 8),
-                                itemBuilder: (context, index) {
-                                  final t = tabs.tabs[index];
-                                  final selected = index == tabs.selectedIndex;
-                                  final key = _tabKeys.putIfAbsent(
-                                    t,
-                                    () => GlobalKey(),
-                                  );
-                                  return GestureDetector(
-                                    onTap: () => tabs.goTo(index),
-                                    child: SizedBox(
-                                      key: ValueKey('tab-header-item-${t.id}'),
-                                      width: index == 0 ? 60 : 100,
-                                      child: Container(
-                                        key: key,
-                                        padding: EdgeInsets.symmetric(
-                                          horizontal: index == 0 ? 0 : 8,
-                                          vertical: 4,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: selected
-                                              ? Theme.of(
-                                                  context,
-                                                ).colorScheme.secondaryContainer
-                                              : Colors.transparent,
-                                          borderRadius: BorderRadius.circular(
-                                            8,
-                                          ),
-                                        ),
-                                        child: Row(
-                                          children: [
-                                            Expanded(
-                                              child: MarqueeText(
-                                                t.title,
-                                                style: Theme.of(context)
-                                                    .textTheme
-                                                    .titleSmall
-                                                    ?.copyWith(
-                                                      fontSize: 14,
-                                                      color: selected
-                                                          ? Theme.of(context)
-                                                                .colorScheme
-                                                                .onSecondaryContainer
-                                                          : null,
+                appBar:
+                    tabs.tabs[tabs.selectedIndex].isImageViewer &&
+                        tabs.tabs[tabs.selectedIndex].isFullscreen
+                    ? null
+                    : PreferredSize(
+                        preferredSize: const Size.fromHeight(44),
+                        child: SafeArea(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            color: Colors.lightBlue,
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: SizedBox(
+                                    height: 38,
+                                    child: ListView.separated(
+                                      scrollDirection: Axis.horizontal,
+                                      itemCount: tabs.tabs.length,
+                                      separatorBuilder: (_, _) =>
+                                          const SizedBox(width: 8),
+                                      itemBuilder: (context, index) {
+                                        final t = tabs.tabs[index];
+                                        final selected =
+                                            index == tabs.selectedIndex;
+                                        final key = _tabKeys.putIfAbsent(
+                                          t,
+                                          () => GlobalKey(),
+                                        );
+                                        return GestureDetector(
+                                          onTap: () => tabs.goTo(index),
+                                          child: SizedBox(
+                                            key: ObjectKey(t),
+                                            width: index == 0 ? 60 : 100,
+                                            child: Container(
+                                              key: key,
+                                              padding: EdgeInsets.symmetric(
+                                                horizontal: index == 0 ? 0 : 8,
+                                                vertical: 4,
+                                              ),
+                                              decoration: BoxDecoration(
+                                                color: selected
+                                                    ? Theme.of(context)
+                                                          .colorScheme
+                                                          .secondaryContainer
+                                                    : Colors.transparent,
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                              ),
+                                              child: Row(
+                                                children: [
+                                                  Expanded(
+                                                    child: MarqueeText(
+                                                      t.title,
+                                                      style: Theme.of(context)
+                                                          .textTheme
+                                                          .titleSmall
+                                                          ?.copyWith(
+                                                            fontSize: 14,
+                                                            color: selected
+                                                                ? Theme.of(
+                                                                        context,
+                                                                      )
+                                                                      .colorScheme
+                                                                      .onSecondaryContainer
+                                                                : null,
+                                                          ),
+                                                      textAlign:
+                                                          TextAlign.center,
+                                                      styleMode: MarqueeStyle
+                                                          .pauseAndLoop,
+                                                      isActive: selected,
                                                     ),
-                                                textAlign: TextAlign.center,
-                                                styleMode:
-                                                    MarqueeStyle.pauseAndLoop,
-                                                isActive: selected,
+                                                  ),
+                                                  if (index != 0) ...[
+                                                    const SizedBox(width: 4),
+                                                    GestureDetector(
+                                                      onTap: () => unawaited(
+                                                        tabs.requestCloseTab(
+                                                          context,
+                                                          index,
+                                                        ),
+                                                      ),
+                                                      child: SizedBox(
+                                                        width: 24,
+                                                        height: 24,
+                                                        child: Icon(
+                                                          Icons.close,
+                                                          size: 16,
+                                                          color: selected
+                                                              ? Theme.of(
+                                                                      context,
+                                                                    )
+                                                                    .colorScheme
+                                                                    .onSecondaryContainer
+                                                              : null,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ],
                                               ),
                                             ),
-                                            if (index != 0) ...[
-                                              const SizedBox(width: 4),
-                                              GestureDetector(
-                                                onTap: () => unawaited(
-                                                  tabs.requestCloseTab(
-                                                    context,
-                                                    index,
-                                                  ),
-                                                ),
-                                                child: SizedBox(
-                                                  width: 24,
-                                                  height: 24,
-                                                  child: Icon(
-                                                    Icons.close,
-                                                    size: 16,
-                                                    color: selected
-                                                        ? Theme.of(context)
-                                                              .colorScheme
-                                                              .onSecondaryContainer
-                                                        : null,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ],
-                                        ),
-                                      ),
+                                          ),
+                                        );
+                                      },
                                     ),
-                                  );
-                                },
-                              ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                        ],
+                        ),
                       ),
-                    ),
-                  ),
-                ),
                 body: AnimatedBuilder(
                   animation: tabs.copyPanelNotifier,
                   builder: (context, _) {

@@ -2,8 +2,11 @@ package com.example.modi_file_explorer2
 
 import android.content.pm.PackageManager
 import android.content.Intent
+import android.content.ComponentName
 import android.content.ActivityNotFoundException
 import android.net.Uri
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Build
 import android.os.Bundle
 import android.os.storage.StorageManager
@@ -15,6 +18,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.io.ByteArrayOutputStream
 
 class MainActivity : FlutterActivity() {
 	private val channelName = "modi_file_explorer2/installed_apps"
@@ -45,6 +49,7 @@ class MainActivity : FlutterActivity() {
 		"Image" -> "image/*"
 		"Audio" -> "audio/*"
 		"Video" -> "video/*"
+		"Archives" -> "application/zip"
 		else -> "*/*"
 	}
 
@@ -61,6 +66,41 @@ class MainActivity : FlutterActivity() {
 	private fun viewIntent(mimeType: String, uri: Uri): Intent = Intent(Intent.ACTION_VIEW).apply {
 		setDataAndType(uri, mimeType)
 		addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+	}
+
+	private fun openWithActivity(resolveInfo: android.content.pm.ResolveInfo, mimeType: String): Map<String, Any?>? {
+		val activity = resolveInfo.activityInfo ?: return null
+		val appLabel = packageManager.getApplicationLabel(activity.applicationInfo).toString()
+		val activityLabel = resolveInfo.loadLabel(packageManager)?.toString()?.takeIf { it.isNotBlank() }
+			?: activity.name.substringAfterLast('.')
+		val featureLabel = if (activityLabel.equals(appLabel, ignoreCase = true)) {
+			"$appLabel — ${activity.name.substringAfterLast('.')}"
+		} else {
+			"$appLabel — $activityLabel"
+		}
+		val icon = try {
+			val drawable = resolveInfo.loadIcon(packageManager)
+			val size = 96
+			val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+			val canvas = Canvas(bitmap)
+			drawable.setBounds(0, 0, size, size)
+			drawable.draw(canvas)
+			ByteArrayOutputStream().use { output ->
+				bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+				bitmap.recycle()
+				output.toByteArray()
+			}
+		} catch (_: Exception) {
+			null
+		}
+		return mapOf(
+			"name" to featureLabel,
+			"applicationName" to appLabel,
+			"packageName" to activity.packageName,
+			"activityName" to activity.name,
+			"mimeType" to mimeType,
+			"icon" to icon,
+		)
 	}
 
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -143,24 +183,20 @@ class MainActivity : FlutterActivity() {
 								.getMimeTypeFromExtension(extension.lowercase())
 							val mimeTypes = linkedSetOf(categoryMimeType(category))
 							if (extensionMimeType != null) mimeTypes.add(extensionMimeType)
-							val apps = linkedMapOf<String, Map<String, String>>()
+							val apps = linkedMapOf<String, Map<String, Any?>>()
 							for (mimeType in mimeTypes) {
 								val intent = Intent(Intent.ACTION_VIEW).setType(mimeType)
 								for (resolveInfo in queryActivities(intent)) {
 									val appPackageName = resolveInfo.activityInfo?.packageName ?: continue
 									if (appPackageName == packageName) continue
-									val label = resolveInfo.loadLabel(packageManager)?.toString()
-										?.takeIf { it.isNotBlank() } ?: appPackageName
-									if (!apps.containsKey(appPackageName)) {
-										apps[appPackageName] = mapOf(
-											"name" to label,
-											"packageName" to appPackageName,
-											"mimeType" to mimeType,
-										)
+									val activity = resolveInfo.activityInfo ?: continue
+									val key = "${activity.packageName}/${activity.name}"
+									if (!apps.containsKey(key)) {
+										openWithActivity(resolveInfo, mimeType)?.let { apps[key] = it }
 									}
 								}
 							}
-							result.success(apps.values.sortedBy { it["name"]?.lowercase() })
+							result.success(apps.values.sortedBy { it["name"]?.toString()?.lowercase() })
 						}
 						"listOpenWithApps" -> {
 							val path = call.argument<String>("path")
@@ -179,23 +215,19 @@ class MainActivity : FlutterActivity() {
 							val appMimeType = MimeTypeMap.getSingleton()
 								.getMimeTypeFromExtension(file.extension.lowercase()) ?: "application/octet-stream"
 							val mimeTypes = linkedSetOf(categoryMimeType(category), appMimeType)
-							val apps = linkedMapOf<String, Map<String, String>>()
+							val apps = linkedMapOf<String, Map<String, Any?>>()
 							for (mimeType in mimeTypes) {
 								val intent = viewIntent(mimeType, uri)
 								for (resolveInfo in queryActivities(intent)) {
-									val packageName = resolveInfo.activityInfo?.packageName ?: continue
-									if (packageName == this.packageName) continue
-									val label = resolveInfo.loadLabel(packageManager)?.toString()?.takeIf { it.isNotBlank() } ?: packageName
-									if (!apps.containsKey(packageName)) {
-										apps[packageName] = mapOf(
-											"name" to label,
-											"packageName" to packageName,
-											"mimeType" to mimeType,
-										)
+									val activity = resolveInfo.activityInfo ?: continue
+									if (activity.packageName == this.packageName) continue
+									val key = "${activity.packageName}/${activity.name}"
+									if (!apps.containsKey(key)) {
+										openWithActivity(resolveInfo, mimeType)?.let { apps[key] = it }
 									}
 								}
 							}
-							result.success(apps.values.sortedBy { it["name"]?.lowercase() })
+							result.success(apps.values.sortedBy { it["name"]?.toString()?.lowercase() })
 						}
 						"resolveOpenWithAppName" -> {
 							val targetPackage = call.argument<String>("packageName")
@@ -210,10 +242,25 @@ class MainActivity : FlutterActivity() {
 							}
 							result.success(appInfo?.let { packageManager.getApplicationLabel(it).toString() })
 						}
+						"getOwnApplicationIcon" -> {
+							val drawable = packageManager.getApplicationIcon(packageName)
+							val size = 96
+							val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+							val canvas = Canvas(bitmap)
+							drawable.setBounds(0, 0, size, size)
+							drawable.draw(canvas)
+							val bytes = ByteArrayOutputStream().use { output ->
+								bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+								output.toByteArray()
+							}
+							bitmap.recycle()
+							result.success(bytes)
+						}
 						"openWithApp" -> {
 							val path = call.argument<String>("path")
 							val category = call.argument<String>("category")
 							val targetPackage = call.argument<String>("packageName")
+							val targetActivity = call.argument<String>("activityName")
 							val mimeType = call.argument<String>("mimeType")
 							if (path.isNullOrBlank() || category.isNullOrBlank() || targetPackage.isNullOrBlank() || mimeType.isNullOrBlank()) {
 								result.error("INVALID_ARGUMENT", "A file path, category, and app are required", null)
@@ -226,7 +273,11 @@ class MainActivity : FlutterActivity() {
 							}
 							val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
 							val intent = viewIntent(mimeType, uri).apply {
-								setPackage(targetPackage)
+								if (targetActivity.isNullOrBlank()) {
+									setPackage(targetPackage)
+								} else {
+									component = ComponentName(targetPackage, targetActivity)
+								}
 							}
 							if (intent.resolveActivity(packageManager) == null) {
 								result.error("APP_UNAVAILABLE", "The selected app is no longer available", null)

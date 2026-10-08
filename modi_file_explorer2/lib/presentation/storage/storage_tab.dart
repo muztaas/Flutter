@@ -9,14 +9,18 @@ import '../../core/providers/settings_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/providers/open_with_providers.dart';
 import '../../core/providers/default_file_apps_provider.dart';
+import '../../core/providers/file_type_categories_provider.dart';
 import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/sort_rules_provider.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../domain/entities/default_file_app.dart';
+import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/quick_access_item.dart';
 import '../../domain/entities/sort_rule.dart';
 import '../../domain/entities/open_with_app.dart';
 import '../../domain/usecases/resolve_effective_sort_rule.dart';
+import '../image_viewer/image_file_preview.dart';
+import '../common/open_with_label.dart' as open_with_label;
 import '../common/marquee_text.dart';
 
 enum _CopyPanelStep {
@@ -49,11 +53,29 @@ class _OpenWithSelection {
     required this.saveAsDefault,
     this.app,
     this.isTextEditor = false,
+    this.isImageViewer = false,
   });
 
   final OpenWithApp? app;
   final bool isTextEditor;
+  final bool isImageViewer;
   final bool saveAsDefault;
+}
+
+Widget _openWithAppIcon(OpenWithApp app) {
+  if (app.iconBytes != null) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: Image.memory(
+        app.iconBytes!,
+        width: 32,
+        height: 32,
+        fit: BoxFit.contain,
+        errorBuilder: (context, error, stackTrace) => const Icon(Icons.apps),
+      ),
+    );
+  }
+  return const Icon(Icons.apps);
 }
 
 class _BatchRenameEntry {
@@ -118,6 +140,7 @@ class StorageCopySession {
 
   final VoidCallback? onChanged;
   List<FileSystemEntity> _sources = const [];
+  bool _isCut = false;
   bool _isPasting = false;
   Directory? _destination;
   List<FileSystemEntity> _nonConflicting = const [];
@@ -135,6 +158,7 @@ class StorageCopySession {
   _CopyCancelMode _cancelMode = _CopyCancelMode.initial;
 
   List<FileSystemEntity> get sources => _sources;
+  bool get isCut => _isCut;
   bool get isPasting => _isPasting;
   Directory? get destination => _destination;
   List<FileSystemEntity> get nonConflicting => _nonConflicting;
@@ -162,8 +186,9 @@ class StorageCopySession {
 
   void notifyChanged() => onChanged?.call();
 
-  void setSources(List<FileSystemEntity> sources) {
+  void setSources(List<FileSystemEntity> sources, {bool cut = false}) {
     _sources = List.unmodifiable(sources);
+    _isCut = cut;
     _destination = null;
     _nonConflicting = const [];
     _conflicts = const [];
@@ -301,6 +326,7 @@ class StorageCopySession {
     _applyAllRenameSeries = false;
     _applyAllSeriesStyle = null;
     _sources = List.unmodifiable(failures);
+    if (failures.isEmpty) _isCut = false;
     onChanged?.call();
   }
 
@@ -329,6 +355,8 @@ class StorageTab extends ConsumerStatefulWidget {
 
 class StorageTabState extends ConsumerState<StorageTab>
     with AutomaticKeepAliveClientMixin {
+  static final Set<StorageTabState> _mountedStorageTabs = {};
+
   // Cache listings for this app session.  Keeping the cache by path means a
   // tab can be revisited without causing another filesystem read.
   static final Map<String, List<FileSystemEntity>> _directoryCache = {};
@@ -352,6 +380,7 @@ class StorageTabState extends ConsumerState<StorageTab>
   @override
   void initState() {
     super.initState();
+    _mountedStorageTabs.add(this);
     _copySession = widget.copySession ?? StorageCopySession();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _copySession.notifyChanged();
@@ -381,6 +410,7 @@ class StorageTabState extends ConsumerState<StorageTab>
 
   @override
   void dispose() {
+    _mountedStorageTabs.remove(this);
     _pressTimer?.cancel();
     _pressTimer = null;
     super.dispose();
@@ -513,7 +543,44 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
 
     if (e is File) {
-      _showOpenWithApplications(e, _categoryForFile(e));
+      unawaited(_openFileWithDetectedCategory(e));
+    }
+  }
+
+  Future<void> _openFileWithDetectedCategory(File file) async {
+    try {
+      await ref.read(fileTypeCategoriesProvider.notifier).ready;
+    } catch (error) {
+      if (mounted) _message('Could not load file type categories: $error');
+      return;
+    }
+    if (!mounted) return;
+    await _showOpenWithApplications(file, _categoryForFile(file));
+  }
+
+  Future<void> _openImageThumbnail(File file) async {
+    try {
+      await ref.read(fileTypeCategoriesProvider.notifier).ready;
+    } catch (error) {
+      if (mounted) _message('Could not load file type categories: $error');
+      return;
+    }
+    if (!mounted) return;
+    final category = _categoryForFile(file);
+    final extension = _fileExtension(_displayName(file.path)).toLowerCase();
+    try {
+      final savedDefault = ref.read(appSettingsProvider).useSavedDefaultApps
+          ? await ref
+                .read(defaultFileAppsProvider.notifier)
+                .find(extension, category: category)
+          : null;
+      if (savedDefault == null) {
+        TabsManager.instance.openImageViewer(file.path);
+      } else {
+        await _showOpenWithApplications(file, category);
+      }
+    } catch (error) {
+      if (mounted) _message('Could not load the default app: $error');
     }
   }
 
@@ -1876,10 +1943,11 @@ class StorageTabState extends ConsumerState<StorageTab>
   List<PopupMenuEntry<String>> _menuItems() {
     if (_selectionMode && _selected.isNotEmpty) {
       final entries = <PopupMenuEntry<String>>[
-        const PopupMenuItem(value: 'rename', child: Text('Rename')),
-        const PopupMenuItem(value: 'delete', child: Text('Delete')),
-        const PopupMenuItem(value: 'copy', child: Text('Copy')),
         const PopupMenuItem(value: 'select_all', child: Text('Select All')),
+        const PopupMenuItem(value: 'rename', child: Text('Rename')),
+        const PopupMenuItem(value: 'copy', child: Text('Copy')),
+        const PopupMenuItem(value: 'cut', child: Text('Cut')),
+        const PopupMenuItem(value: 'delete', child: Text('Delete')),
         const PopupMenuItem(value: 'properties', child: Text('Properties')),
       ];
       if (_selected.length == 1) {
@@ -1981,20 +2049,24 @@ class StorageTabState extends ConsumerState<StorageTab>
         _showOpenAsCategories();
         break;
       case 'copy':
+      case 'cut':
         final itemsByPath = {for (final item in _items) item.path: item};
         final sources = _selected
             .map((path) => itemsByPath[path])
             .whereType<FileSystemEntity>()
             .toList();
+        final isCut = value == 'cut';
         if (sources.isEmpty) {
-          _message('Copy is not available: no items are selected');
+          _message(
+            '${isCut ? 'Cut' : 'Copy'} is not available: no items are selected',
+          );
           break;
         }
         setState(() {
           _selected.clear();
           _selectionMode = false;
         });
-        _copySession.setSources(sources);
+        _copySession.setSources(sources, cut: isCut);
         break;
     }
   }
@@ -2046,13 +2118,18 @@ class StorageTabState extends ConsumerState<StorageTab>
     final category = await showDialog<String>(
       context: context,
       builder: (dialogContext) => SimpleDialog(
-        title: Text('Open ${_displayName(item.path)} as'),
+        title: Text(
+          open_with_label.shortenOpenWithHeading(
+            'Open as ${_displayName(item.path)}',
+          ),
+        ),
         children: [
           for (final choice in const [
             ('Text', Icons.description_outlined),
             ('Image', Icons.image_outlined),
             ('Audio', Icons.audiotrack_outlined),
             ('Video', Icons.video_file_outlined),
+            ('Archives', Icons.folder_zip_outlined),
             ('Others', Icons.insert_drive_file_outlined),
           ])
             SimpleDialogOption(
@@ -2074,73 +2151,11 @@ class StorageTabState extends ConsumerState<StorageTab>
 
   String _categoryForFile(File file) {
     final extension = _fileExtension(_displayName(file.path)).toLowerCase();
-    if (const {
-      '.txt',
-      '.text',
-      '.md',
-      '.markdown',
-      '.json',
-      '.csv',
-      '.tsv',
-      '.xml',
-      '.html',
-      '.htm',
-      '.css',
-      '.js',
-      '.ts',
-      '.dart',
-      '.kt',
-      '.java',
-      '.py',
-      '.yaml',
-      '.yml',
-      '.log',
-      '.ini',
-      '.cfg',
-      '.conf',
-      '.sh',
-      '.c',
-      '.h',
-      '.cpp',
-      '.sql',
-      '.toml',
-      '.properties',
-    }.contains(extension)) {
-      return 'Text';
-    }
-    if (const {
-      '.png',
-      '.jpg',
-      '.jpeg',
-      '.gif',
-      '.bmp',
-      '.webp',
-      '.heic',
-      '.svg',
-    }.contains(extension)) {
-      return 'Image';
-    }
-    if (const {
-      '.mp3',
-      '.wav',
-      '.ogg',
-      '.m4a',
-      '.flac',
-      '.aac',
-    }.contains(extension)) {
-      return 'Audio';
-    }
-    if (const {
-      '.mp4',
-      '.mkv',
-      '.mov',
-      '.avi',
-      '.webm',
-      '.3gp',
-    }.contains(extension)) {
-      return 'Video';
-    }
-    return 'Others';
+    return FileTypeCategory.categoryForExtension(
+          extension,
+          categories: ref.read(fileTypeCategoriesProvider),
+        ) ??
+        'Others';
   }
 
   Future<void> _showOpenWithApplications(
@@ -2150,19 +2165,26 @@ class StorageTabState extends ConsumerState<StorageTab>
   }) async {
     final extension = _fileExtension(_displayName(file.path));
     var effectiveCategory = category;
-    if (checkSavedDefault && extension.isNotEmpty) {
+    if (checkSavedDefault &&
+        extension.isNotEmpty &&
+        ref.read(appSettingsProvider).useSavedDefaultApps) {
       final DefaultFileApp? savedDefault;
       try {
         savedDefault = await ref
             .read(defaultFileAppsProvider.notifier)
-            .find(extension);
+            .find(extension, category: effectiveCategory);
       } catch (error) {
         if (mounted) _message('Could not load saved default apps: $error');
         return;
       }
       if (savedDefault != null) {
+        final selectedActivityName = savedDefault.activityName;
         if (savedDefault.isTextEditor) {
           TabsManager.instance.openTextEditor(file.path);
+          return;
+        }
+        if (savedDefault.isImageViewer) {
+          TabsManager.instance.openImageViewer(file.path);
           return;
         }
         final packageName = savedDefault.packageName;
@@ -2171,17 +2193,27 @@ class StorageTabState extends ConsumerState<StorageTab>
           try {
             final availableApps = await repository.listApps(
               path: file.path,
-              category: savedDefault.category,
+              category: savedDefault.category == 'Others'
+                  ? effectiveCategory
+                  : savedDefault.category,
             );
-            final isAvailable = availableApps.any(
-              (app) => app.packageName == packageName,
-            );
-            if (isAvailable) {
+            final availableApp = availableApps
+                .where(
+                  (app) =>
+                      app.packageName == packageName &&
+                      (selectedActivityName == null ||
+                          app.activityName == selectedActivityName),
+                )
+                .firstOrNull;
+            if (availableApp != null) {
               await repository.openFile(
                 path: file.path,
-                category: savedDefault.category,
+                category: savedDefault.category == 'Others'
+                    ? effectiveCategory
+                    : savedDefault.category,
                 packageName: packageName,
-                mimeType: savedDefault.mimeType,
+                activityName: selectedActivityName,
+                mimeType: availableApp.mimeType,
               );
               return;
             }
@@ -2234,13 +2266,29 @@ class StorageTabState extends ConsumerState<StorageTab>
       return;
     }
     if (!mounted) return;
-    final canUseTextEditor = effectiveCategory == 'Text';
-    if (apps.isEmpty && !canUseTextEditor) {
+    final canUseTextEditor =
+        effectiveCategory == 'Text' || effectiveCategory == 'Others';
+    final canUseImageViewer =
+        effectiveCategory == 'Image' || effectiveCategory == 'Others';
+    if (apps.isEmpty && !canUseTextEditor && !canUseImageViewer) {
       _message(
         'No installed applications can open this file as $effectiveCategory',
       );
       return;
     }
+
+    final Uint8List? builtInIcon;
+    try {
+      builtInIcon = await ref
+          .read(openWithRepositoryProvider)
+          .getOwnApplicationIcon();
+    } catch (error) {
+      if (mounted) {
+        _message('Could not load the built-in app icon: $error');
+      }
+      return;
+    }
+    if (!mounted) return;
 
     final selection = await showDialog<_OpenWithSelection>(
       context: context,
@@ -2250,16 +2298,65 @@ class StorageTabState extends ConsumerState<StorageTab>
           builder: (context, setDialogState) => SimpleDialog(
             title: Text('Open as $effectiveCategory'),
             children: [
+              if (canUseImageViewer)
+                SimpleDialogOption(
+                  onPressed: () => Navigator.pop(
+                    dialogContext,
+                    _OpenWithSelection(
+                      app: OpenWithApp(
+                        name: 'Image Viewer (built-in)',
+                        packageName: DefaultFileApp.imageViewerHandlerId,
+                        mimeType: 'image/*',
+                        iconBytes: builtInIcon,
+                      ),
+                      saveAsDefault: saveAsDefault,
+                      isImageViewer: true,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      _openWithAppIcon(
+                        OpenWithApp(
+                          name: 'Image Viewer (built-in)',
+                          packageName: DefaultFileApp.imageViewerHandlerId,
+                          mimeType: 'image/*',
+                          iconBytes: builtInIcon,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      const Text('Image Viewer (built-in)'),
+                    ],
+                  ),
+                ),
               if (canUseTextEditor)
                 SimpleDialogOption(
                   onPressed: () => Navigator.pop(
                     dialogContext,
                     _OpenWithSelection(
+                      app: OpenWithApp(
+                        name: 'Text Editor (built-in)',
+                        packageName: DefaultFileApp.textEditorHandlerId,
+                        mimeType: 'text/plain',
+                        iconBytes: builtInIcon,
+                      ),
                       isTextEditor: true,
                       saveAsDefault: saveAsDefault,
                     ),
                   ),
-                  child: const Text('Text Editor (built-in)'),
+                  child: Row(
+                    children: [
+                      _openWithAppIcon(
+                        OpenWithApp(
+                          name: 'Text Editor (built-in)',
+                          packageName: DefaultFileApp.textEditorHandlerId,
+                          mimeType: 'text/plain',
+                          iconBytes: builtInIcon,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      const Text('Text Editor (built-in)'),
+                    ],
+                  ),
                 ),
               for (final app in apps)
                 SimpleDialogOption(
@@ -2267,14 +2364,28 @@ class StorageTabState extends ConsumerState<StorageTab>
                     dialogContext,
                     _OpenWithSelection(app: app, saveAsDefault: saveAsDefault),
                   ),
-                  child: Text(app.name),
+                  child: Row(
+                    children: [
+                      _openWithAppIcon(app),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          open_with_label.shortenOpenWithAppName(app.name),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               if (extension.isNotEmpty)
                 CheckboxListTile(
                   contentPadding: const EdgeInsets.symmetric(horizontal: 16),
                   activeColor: const Color(0xFF0055FF),
                   title: Text(
-                    'Always use this app for $extension files',
+                    effectiveCategory == 'Others'
+                        ? 'Always use this app for $extension files'
+                        : 'Always use this app for all ${effectiveCategory.toLowerCase()} files',
                     style: const TextStyle(
                       fontSize: 12,
                       color: Color(0xFF0055FF),
@@ -2292,12 +2403,14 @@ class StorageTabState extends ConsumerState<StorageTab>
     if (!mounted || selection == null) return;
 
     if (selection.saveAsDefault && extension.isNotEmpty) {
-      final defaultApp = selection.isTextEditor
+      final defaultApp = selection.isTextEditor || selection.isImageViewer
           ? DefaultFileApp(
               extension: extension,
-              handlerId: DefaultFileApp.textEditorHandlerId,
+              handlerId: selection.isTextEditor
+                  ? DefaultFileApp.textEditorHandlerId
+                  : DefaultFileApp.imageViewerHandlerId,
               category: effectiveCategory,
-              mimeType: 'text/plain',
+              mimeType: selection.isTextEditor ? 'text/plain' : 'image/*',
             )
           : DefaultFileApp(
               extension: extension,
@@ -2306,6 +2419,7 @@ class StorageTabState extends ConsumerState<StorageTab>
               mimeType: selection.app!.mimeType,
               packageName: selection.app!.packageName,
               displayName: selection.app!.name,
+              activityName: selection.app!.activityName,
             );
       try {
         await ref.read(defaultFileAppsProvider.notifier).save(defaultApp);
@@ -2318,6 +2432,10 @@ class StorageTabState extends ConsumerState<StorageTab>
       TabsManager.instance.openTextEditor(file.path);
       return;
     }
+    if (selection.isImageViewer) {
+      TabsManager.instance.openImageViewer(file.path);
+      return;
+    }
     final selectedApp = selection.app;
     if (selectedApp == null) return;
     try {
@@ -2327,6 +2445,7 @@ class StorageTabState extends ConsumerState<StorageTab>
             path: file.path,
             category: effectiveCategory,
             packageName: selectedApp.packageName,
+            activityName: selectedApp.activityName,
             mimeType: selectedApp.mimeType,
           );
     } on PlatformException catch (error) {
@@ -2352,11 +2471,27 @@ class StorageTabState extends ConsumerState<StorageTab>
       return;
     }
     final destinationDirectory = _dir!;
+    final sources = _copySession.sources.where((source) {
+      if (!_copySession.isCut) return true;
+      final targetPath = _targetPath(
+        destinationDirectory.path,
+        _displayName(source.path),
+      );
+      return normalizeSortPath(source.path) != normalizeSortPath(targetPath);
+    }).toList();
+    if (sources.length != _copySession.sources.length) {
+      if (sources.isEmpty) {
+        _copySession.clear();
+        _message('The cut items are already in this folder');
+        return;
+      }
+      _copySession.setSources(sources, cut: true);
+    }
     _copySession.setPasting(true);
 
     final nonConflicting = <FileSystemEntity>[];
     final conflicts = <_CopyConflict>[];
-    for (final source in _copySession.sources) {
+    for (final source in sources) {
       final targetPath = _targetPath(
         destinationDirectory.path,
         _displayName(source.path),
@@ -2668,6 +2803,8 @@ class StorageTabState extends ConsumerState<StorageTab>
     String? renameTo,
   }) async {
     try {
+      final destination = _copySession.destination!;
+      var resolvedTargetPath = conflict.targetPath;
       switch (action) {
         case _CopyConflictAction.replace:
           await _replaceWithIncoming(conflict);
@@ -2676,20 +2813,31 @@ class StorageTabState extends ConsumerState<StorageTab>
           await _renameExistingAndCopy(conflict, renameTo);
         case _CopyConflictAction.renameNew:
           if (renameTo == null) return;
-          final destination = _copySession.destination!;
-          final target = _targetPath(destination.path, renameTo);
-          await _copyIncomingToPath(conflict.source, target, destination);
+          resolvedTargetPath = _targetPath(destination.path, renameTo);
+          await _copyIncomingToPath(
+            conflict.source,
+            resolvedTargetPath,
+            destination,
+          );
+      }
+      if (_copySession.isCut) {
+        await _moveCutSourceAfterTargetExists(
+          conflict.source,
+          resolvedTargetPath,
+        );
       }
       _copySession.setPastedCount(_copySession.pastedCount + 1);
     } on FileSystemException catch (error) {
       _copySession.addFailedSource(conflict.source);
       debugPrint(
-        'Failed to resolve copy conflict for ${conflict.source.path}: ${error.message}',
+        'Failed to resolve ${_copySession.isCut ? 'move' : 'copy'} '
+        'conflict for ${conflict.source.path}: ${error.message}',
       );
     } catch (error) {
       _copySession.addFailedSource(conflict.source);
       debugPrint(
-        'Failed to resolve copy conflict for ${conflict.source.path}: $error',
+        'Failed to resolve ${_copySession.isCut ? 'move' : 'copy'} '
+        'conflict for ${conflict.source.path}: $error',
       );
     }
   }
@@ -2733,37 +2881,80 @@ class StorageTabState extends ConsumerState<StorageTab>
     if (destination == null) return;
     for (final source in _copySession.nonConflicting) {
       try {
-        await _copyIncomingToPath(
-          source,
-          _targetPath(destination.path, _displayName(source.path)),
-          destination,
+        final targetPath = _targetPath(
+          destination.path,
+          _displayName(source.path),
         );
+        await _copyIncomingToPath(source, targetPath, destination);
+        if (_copySession.isCut) {
+          await _moveCutSourceAfterTargetExists(source, targetPath);
+        }
         _copySession.setPastedCount(_copySession.pastedCount + 1);
       } on FileSystemException catch (error) {
         _copySession.addFailedSource(source);
-        debugPrint('Failed to copy ${source.path}: ${error.message}');
+        debugPrint(
+          'Failed to ${_copySession.isCut ? 'move' : 'copy'} '
+          '${source.path}: ${error.message}',
+        );
       } catch (error) {
         _copySession.addFailedSource(source);
-        debugPrint('Failed to copy ${source.path}: $error');
+        debugPrint(
+          'Failed to ${_copySession.isCut ? 'move' : 'copy'} '
+          '${source.path}: $error',
+        );
       }
     }
+  }
+
+  Future<void> _moveCutSourceAfterTargetExists(
+    FileSystemEntity source,
+    String targetPath,
+  ) async {
+    final targetType = await FileSystemEntity.type(
+      targetPath,
+      followLinks: false,
+    );
+    if (targetType == FileSystemEntityType.notFound) {
+      throw FileSystemException(
+        'The destination item was not created; the cut source was kept',
+        targetPath,
+      );
+    }
+    await _deletePath(source.path);
   }
 
   Future<void> _completePaste({String? additionalMessage}) async {
     final destination = _copySession.destination;
     final pastedCount = _copySession.pastedCount;
     final failedCount = _copySession.failedSources.length;
-    if (destination != null) {
-      _directoryCache.remove(destination.path);
-      if (_dir?.path == destination.path && mounted) {
-        await _loadRoot(destination.path, forceRefresh: true);
-      }
+    final isCut = _copySession.isCut;
+    final affectedDirectories = <String>{
+      if (destination != null) destination.path,
+      if (isCut)
+        for (final source in _copySession.sources)
+          Directory(source.path).parent.path,
+    };
+    for (final path in affectedDirectories) {
+      _directoryCache.remove(path);
     }
+    await Future.wait(
+      _mountedStorageTabs
+          .where(
+            (state) =>
+                state._dir != null &&
+                affectedDirectories.contains(state._dir!.path),
+          )
+          .map(
+            (state) => state._loadRoot(state._dir!.path, forceRefresh: true),
+          ),
+    );
     if (!mounted) return;
     _copySession.finishPaste();
+    final completedAction = isCut ? 'Moved' : 'Pasted';
     final completionMessage = failedCount == 0
-        ? 'Pasted $pastedCount item${pastedCount == 1 ? '' : 's'}'
-        : 'Pasted $pastedCount item${pastedCount == 1 ? '' : 's'}; $failedCount could not be copied';
+        ? '$completedAction $pastedCount item${pastedCount == 1 ? '' : 's'}'
+        : '$completedAction $pastedCount item${pastedCount == 1 ? '' : 's'}; '
+              '$failedCount could not be ${isCut ? 'moved' : 'copied'}';
     _message(
       additionalMessage == null
           ? completionMessage
@@ -3157,6 +3348,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     final Widget panelContent;
     switch (_copySession.step) {
       case _CopyPanelStep.standard:
+        final actionName = _copySession.isCut ? 'Move' : 'Copy';
         panelContent = SizedBox(
           height: _copySession.panelHeight,
           child: Padding(
@@ -3166,7 +3358,7 @@ class StorageTabState extends ConsumerState<StorageTab>
                 Expanded(
                   flex: 3,
                   child: MarqueeText(
-                    'Copy: ${sources.whereType<Directory>().length} folders and ${sources.whereType<File>().length} files',
+                    '$actionName: ${sources.whereType<Directory>().length} folders and ${sources.whereType<File>().length} files',
                     style: theme.textTheme.bodySmall?.copyWith(fontSize: 12),
                     styleMode: MarqueeStyle.pauseAndLoop,
                   ),
@@ -3260,9 +3452,12 @@ class StorageTabState extends ConsumerState<StorageTab>
         final conflict = _copySession.currentConflict;
         final name = conflict == null ? '' : _displayName(conflict.targetPath);
         final isMultiConflictFlow = _copySession.startedWithMultipleConflicts;
+        final incomingItemName = _copySession.isCut
+            ? 'moved item'
+            : 'copied item';
         panelContent = actionPanel(
           message:
-              "'$name' already exists here. Replace it with the copied item, rename the copied item, or cancel this single conflict.",
+              "'$name' already exists here. Replace it with the $incomingItemName, rename the $incomingItemName, or cancel this single conflict.",
           actions: [
             button(
               'Replace',
@@ -3292,7 +3487,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         final name = conflict == null ? '' : _displayName(conflict.targetPath);
         panelContent = actionPanel(
           message:
-              "Rename '$name' to keep both items. Choose whether to rename the existing item or the copied item.",
+              "Rename '$name' to keep both items. Choose whether to rename the existing item or the incoming item.",
           actions: [
             button(
               'Rename existing',
@@ -3515,16 +3710,10 @@ class StorageTabState extends ConsumerState<StorageTab>
                     : Icons.check_box_outline_blank,
               ),
               const SizedBox(width: 8),
-              Icon(
-                entity is Directory ? Icons.folder : Icons.insert_drive_file,
-                size: 24,
-              ),
+              _storageItemLeading(entity),
             ],
           )
-        : Icon(
-            entity is Directory ? Icons.folder : Icons.insert_drive_file,
-            size: 24,
-          );
+        : _storageItemLeading(entity);
     final text = _storageItemText(entity, name, settings, detailsEnabled);
 
     final Widget content = grid
@@ -3552,20 +3741,7 @@ class StorageTabState extends ConsumerState<StorageTab>
             minVerticalPadding: 2,
             horizontalTitleGap: 12,
             leading: leading,
-            title: detailsEnabled
-                ? SizedBox(height: 52, child: text)
-                : Text(
-                    name,
-                    textAlign: TextAlign.left,
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontSize: (Theme.of(context)
-                              .textTheme
-                              .titleMedium
-                              ?.fontSize ??
-                          16) +
-                          1,
-                    ),
-                  ),
+            title: detailsEnabled ? SizedBox(height: 52, child: text) : text,
           );
 
     return GestureDetector(
@@ -3594,6 +3770,39 @@ class StorageTabState extends ConsumerState<StorageTab>
     );
   }
 
+  Widget _storageItemLeading(FileSystemEntity entity) {
+    if (entity is File &&
+        FileTypeCategory.categoryForExtension(
+              _fileExtension(_displayName(entity.path)).toLowerCase(),
+              categories: ref.read(fileTypeCategoriesProvider),
+            ) ==
+            'Image') {
+      return GestureDetector(
+        onTap: _selectionMode
+            ? null
+            : () => unawaited(_openImageThumbnail(entity)),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: SizedBox(
+            width: 36,
+            height: 36,
+            child: ImageFilePreview(
+              path: entity.path,
+              fit: BoxFit.cover,
+              loadingBuilder: (_) => const Icon(Icons.image_outlined, size: 24),
+              errorBuilder: (_, _, _) =>
+                  const Icon(Icons.image_outlined, size: 24),
+            ),
+          ),
+        ),
+      );
+    }
+    return Icon(
+      entity is Directory ? Icons.folder : Icons.insert_drive_file,
+      size: 24,
+    );
+  }
+
   Widget _storageItemText(
     FileSystemEntity entity,
     String name,
@@ -3609,23 +3818,13 @@ class StorageTabState extends ConsumerState<StorageTab>
       fontSize: (Theme.of(context).textTheme.titleMedium?.fontSize ?? 16) + 1,
     );
     if (!detailsEnabled) {
-      return Text(
-        name,
-        textAlign: TextAlign.left,
-        style: itemNameStyle,
-      );
+      return _storageItemName(name, itemNameStyle);
     }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        Text(
-          name,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          textAlign: TextAlign.left,
-          style: itemNameStyle,
-        ),
+        _storageItemName(name, itemNameStyle),
         const SizedBox(height: 2),
         Row(
           children: [
@@ -3667,6 +3866,16 @@ class StorageTabState extends ConsumerState<StorageTab>
           ],
         ),
       ],
+    );
+  }
+
+  Widget _storageItemName(String name, TextStyle? style) {
+    return MarqueeText(
+      name,
+      style: style,
+      textAlign: TextAlign.left,
+      styleMode: MarqueeStyle.pauseAndLoop,
+      isActive: MarqueeVisibility.isVisibleOf(context),
     );
   }
 

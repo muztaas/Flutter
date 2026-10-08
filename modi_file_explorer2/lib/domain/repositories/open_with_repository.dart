@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import '../entities/open_with_app.dart';
 
 abstract class OpenWithRepository {
@@ -15,8 +17,11 @@ abstract class OpenWithRepository {
     required String path,
     required String category,
     required String packageName,
+    String? activityName,
     required String mimeType,
   });
 
   Future<String?> resolveAppName(String packageName);
+
+  Future<Uint8List?> getOwnApplicationIcon();
 }

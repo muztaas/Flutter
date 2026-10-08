@@ -4,16 +4,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
 import '../../core/providers/default_file_apps_provider.dart';
+import '../../core/providers/file_type_categories_provider.dart';
 import '../../core/providers/open_with_providers.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../domain/entities/default_file_app.dart';
+import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/open_with_app.dart';
 import '../../domain/entities/quick_access_item.dart';
 import '../../domain/entities/storage_device.dart';
 import '../common/marquee_text.dart';
+import '../common/open_with_label.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -478,13 +481,29 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
     final extension = item.name.contains('.')
         ? '.${item.name.split('.').last.toLowerCase()}'
         : '';
-    var category = _categoryForExtension(extension);
-    if (extension.isNotEmpty) {
+    try {
+      await ref.read(fileTypeCategoriesProvider.notifier).ready;
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not load file type categories: $error'),
+          ),
+        );
+      }
+      return;
+    }
+    var category = _categoryForExtension(
+      extension,
+      ref.read(fileTypeCategoriesProvider),
+    );
+    if (extension.isNotEmpty &&
+        ref.read(appSettingsProvider).useSavedDefaultAppsForQuickAccess) {
       final DefaultFileApp? savedDefault;
       try {
         savedDefault = await ref
             .read(defaultFileAppsProvider.notifier)
-            .find(extension);
+            .find(extension, category: category);
       } catch (error) {
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -497,9 +516,16 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
       }
 
       if (savedDefault != null) {
-        category = savedDefault.category;
+        final selectedActivityName = savedDefault.activityName;
+        if (savedDefault.category != 'Others') {
+          category = savedDefault.category;
+        }
         if (savedDefault.isTextEditor) {
           TabsManager.instance.openTextEditor(item.path);
+          return;
+        }
+        if (savedDefault.isImageViewer) {
+          TabsManager.instance.openImageViewer(item.path);
           return;
         }
 
@@ -509,17 +535,23 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
           try {
             final availableApps = await repository.listApps(
               path: item.path,
-              category: savedDefault.category,
+              category: category,
             );
-            final isAvailable = availableApps.any(
-              (app) => app.packageName == packageName,
-            );
-            if (isAvailable) {
+            final availableApp = availableApps
+                .where(
+                  (app) =>
+                      app.packageName == packageName &&
+                      (selectedActivityName == null ||
+                          app.activityName == selectedActivityName),
+                )
+                .firstOrNull;
+            if (availableApp != null) {
               await repository.openFile(
                 path: item.path,
-                category: savedDefault.category,
+                category: category,
                 packageName: packageName,
-                mimeType: savedDefault.mimeType,
+                activityName: selectedActivityName,
+                mimeType: availableApp.mimeType,
               );
               return;
             }
@@ -584,8 +616,9 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
     }
 
     final canUseTextEditor = category == 'Text';
+    final canUseImageViewer = category == 'Image';
 
-    if (apps.isEmpty && !canUseTextEditor) {
+    if (apps.isEmpty && !canUseTextEditor && !canUseImageViewer) {
       TabsManager.instance.openStorageTab(file.parent.path);
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -600,11 +633,52 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
     }
     if (!context.mounted) return;
 
+    final Uint8List? builtInIcon;
+    try {
+      builtInIcon = await ref
+          .read(openWithRepositoryProvider)
+          .getOwnApplicationIcon();
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load the built-in app icon: $error')),
+        );
+      }
+      return;
+    }
+    if (!context.mounted) return;
+
     final selection = await showDialog<OpenWithApp?>(
       context: context,
       builder: (dialogContext) => SimpleDialog(
-        title: Text('Open ${item.name} with'),
+        title: Text(shortenOpenWithHeading('Open ${item.name} with')),
         children: [
+          if (canUseImageViewer)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(
+                dialogContext,
+                OpenWithApp(
+                  name: 'Image Viewer (built-in)',
+                  packageName: DefaultFileApp.imageViewerHandlerId,
+                  mimeType: 'image/*',
+                  iconBytes: builtInIcon,
+                ),
+              ),
+                child: Row(
+                children: [
+                  _openWithAppIcon(
+                    OpenWithApp(
+                      name: 'Image Viewer (built-in)',
+                      packageName: DefaultFileApp.imageViewerHandlerId,
+                      mimeType: 'image/*',
+                      iconBytes: builtInIcon,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Text('Image Viewer (built-in)'),
+                ],
+              ),
+            ),
           if (canUseTextEditor)
             SimpleDialogOption(
               onPressed: () => Navigator.pop(
@@ -613,14 +687,40 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
                   name: 'Text Editor (built-in)',
                   packageName: DefaultFileApp.textEditorHandlerId,
                   mimeType: 'text/plain',
+                  iconBytes: builtInIcon,
                 ),
               ),
-              child: const Text('Text Editor (built-in)'),
+              child: Row(
+                children: [
+                  _openWithAppIcon(
+                    OpenWithApp(
+                      name: 'Text Editor (built-in)',
+                      packageName: DefaultFileApp.textEditorHandlerId,
+                      mimeType: 'text/plain',
+                      iconBytes: builtInIcon,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Text('Text Editor (built-in)'),
+                ],
+              ),
             ),
           for (final app in apps)
             SimpleDialogOption(
               onPressed: () => Navigator.pop(dialogContext, app),
-              child: Text(app.name),
+              child: Row(
+                children: [
+                  _openWithAppIcon(app),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      shortenOpenWithAppName(app.name),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
             ),
         ],
       ),
@@ -632,6 +732,11 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
       return;
     }
 
+    if (selection.packageName == DefaultFileApp.imageViewerHandlerId) {
+      TabsManager.instance.openImageViewer(item.path);
+      return;
+    }
+
     try {
       await ref
           .read(openWithRepositoryProvider)
@@ -639,6 +744,7 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
             path: item.path,
             category: category,
             packageName: selection.packageName,
+            activityName: selection.activityName,
             mimeType: selection.mimeType,
           );
     } on PlatformException catch (error) {
@@ -654,74 +760,32 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
     }
   }
 
-  String _categoryForExtension(String extension) {
-    if (const {
-      '.txt',
-      '.md',
-      '.markdown',
-      '.json',
-      '.csv',
-      '.tsv',
-      '.xml',
-      '.html',
-      '.htm',
-      '.css',
-      '.js',
-      '.ts',
-      '.dart',
-      '.kt',
-      '.java',
-      '.py',
-      '.yaml',
-      '.yml',
-      '.log',
-      '.ini',
-      '.cfg',
-      '.conf',
-      '.sh',
-      '.c',
-      '.h',
-      '.cpp',
-      '.sql',
-      '.toml',
-      '.properties',
-    }.contains(extension)) {
-      return 'Text';
-    }
-    if (const {
-      '.png',
-      '.jpg',
-      '.jpeg',
-      '.gif',
-      '.bmp',
-      '.webp',
-      '.heic',
-      '.svg',
-    }.contains(extension)) {
-      return 'Image';
-    }
-    if (const {
-      '.mp3',
-      '.wav',
-      '.ogg',
-      '.m4a',
-      '.flac',
-      '.aac',
-    }.contains(extension)) {
-      return 'Audio';
-    }
-    if (const {
-      '.mp4',
-      '.mkv',
-      '.mov',
-      '.avi',
-      '.webm',
-      '.3gp',
-    }.contains(extension)) {
-      return 'Video';
-    }
-    return 'Others';
+  String _categoryForExtension(
+    String extension,
+    List<FileTypeCategory> categories,
+  ) {
+    return FileTypeCategory.categoryForExtension(
+          extension,
+          categories: categories,
+        ) ??
+        'Others';
   }
+}
+
+Widget _openWithAppIcon(OpenWithApp app) {
+  if (app.iconBytes != null) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: Image.memory(
+        app.iconBytes!,
+        width: 32,
+        height: 32,
+        fit: BoxFit.contain,
+        errorBuilder: (context, error, stackTrace) => const Icon(Icons.apps),
+      ),
+    );
+  }
+  return const Icon(Icons.apps);
 }
 
 class _AvailableStorageSection extends StatefulWidget {
