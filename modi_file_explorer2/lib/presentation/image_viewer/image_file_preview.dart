@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -14,12 +15,14 @@ class ImageFilePreview extends ConsumerStatefulWidget {
     required this.fit,
     required this.loadingBuilder,
     required this.errorBuilder,
+    this.decodeWidth,
   });
 
   final String path;
   final BoxFit fit;
   final WidgetBuilder loadingBuilder;
   final ImageErrorWidgetBuilder errorBuilder;
+  final int? decodeWidth;
 
   @override
   ConsumerState<ImageFilePreview> createState() => _ImageFilePreviewState();
@@ -27,6 +30,7 @@ class ImageFilePreview extends ConsumerStatefulWidget {
 
 class _ImageFilePreviewState extends ConsumerState<ImageFilePreview> {
   late Future<Uint8List> _imageBytes;
+  Uint8List? _loadedBytes;
 
   @override
   void initState() {
@@ -46,6 +50,20 @@ class _ImageFilePreviewState extends ConsumerState<ImageFilePreview> {
       ref.read(imageRepositoryProvider).readFileBytes(widget.path);
 
   @override
+  void dispose() {
+    final bytes = _loadedBytes;
+    if (bytes != null && !ImageFileTypes.isSvgPath(widget.path)) {
+      final provider = ResizeImage.resizeIfNeeded(
+        widget.decodeWidth,
+        null,
+        MemoryImage(bytes),
+      );
+      unawaited(provider.evict().then<void>((_) {}));
+    }
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return FutureBuilder<Uint8List>(
       future: _imageBytes,
@@ -59,6 +77,7 @@ class _ImageFilePreviewState extends ConsumerState<ImageFilePreview> {
         }
         final bytes = snapshot.data;
         if (bytes == null) return widget.loadingBuilder(context);
+        _loadedBytes = bytes;
 
         return ImageFileTypes.isSvgPath(widget.path)
             ? SvgPicture.memory(
@@ -69,6 +88,7 @@ class _ImageFilePreviewState extends ConsumerState<ImageFilePreview> {
             : Image.memory(
                 bytes,
                 fit: widget.fit,
+                cacheWidth: widget.decodeWidth,
                 errorBuilder: widget.errorBuilder,
               );
       },

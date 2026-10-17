@@ -246,6 +246,23 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel>
                                               ),
                                             ),
                                             _SettingsSwitch(
+                                              title:
+                                                  'Show time in 24-hour format',
+                                              value: settings.use24HourTime,
+                                              onChanged: (value) =>
+                                                  _saveSetting(
+                                                    context,
+                                                    () => ref
+                                                        .read(
+                                                          appSettingsProvider
+                                                              .notifier,
+                                                        )
+                                                        .setUse24HourTime(
+                                                          value,
+                                                        ),
+                                                  ),
+                                            ),
+                                            _SettingsSwitch(
                                               title: 'Show modified date',
                                               value: settings.showModifiedDate,
                                               enabled:

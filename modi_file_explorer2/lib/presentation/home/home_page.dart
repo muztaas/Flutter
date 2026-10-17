@@ -13,6 +13,7 @@ import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../core/utils/format_bytes.dart';
+import '../../core/utils/time_format.dart';
 import '../../domain/entities/default_file_app.dart';
 import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/open_with_app.dart';
@@ -650,6 +651,7 @@ class _CategoryCardsState extends ConsumerState<_CategoryCards> {
                   final downloadsDirectory = name.contains('download')
                       ? await _findDownloadsDirectory(base)
                       : null;
+                  if (!context.mounted) return;
                   if (name.contains('download') && downloadsDirectory == null) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
@@ -765,6 +767,7 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
   Widget build(BuildContext context) {
     final ref = this.ref;
     final quickAccess = ref.watch(quickAccessProvider);
+    final use24HourTime = ref.watch(appSettingsProvider).use24HourTime;
     return Padding(
       padding: const EdgeInsets.only(left: 16, right: 16, top: 4),
       child: Column(
@@ -778,7 +781,7 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
           Container(height: 2, color: const Color(0xFF29B6F6)),
           Expanded(
             child: _showRecent
-                ? _buildRecentList(context, ref)
+                ? _buildRecentList(context, ref, use24HourTime)
                 : quickAccess.when(
                     loading: () =>
                         const Center(child: CircularProgressIndicator()),
@@ -914,7 +917,11 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
     );
   }
 
-  Widget _buildRecentList(BuildContext context, WidgetRef ref) {
+  Widget _buildRecentList(
+    BuildContext context,
+    WidgetRef ref,
+    bool use24HourTime,
+  ) {
     if (!widget.storagePermissionAvailable) {
       return const Center(child: Text('Storage permission required'));
     }
@@ -934,11 +941,21 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
       itemBuilder: (context, index) {
         final file = widget.recentFiles[index];
         final date = file.modified;
-        final dateText =
-            '${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
-        final timeText =
-            '${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
+        const months = [
+          'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+        ];
+        final dateText = '${date.day} ${months[date.month - 1]} ${date.year}';
+        final timeText = formatClockTime(
+          date,
+          use24HourTime: use24HourTime,
+        );
         final detailStyle = Theme.of(context).textTheme.labelSmall;
+        final datePainter = TextPainter(
+          text: TextSpan(text: dateText, style: detailStyle),
+          textDirection: Directionality.of(context),
+          maxLines: 1,
+        )..layout();
         return ListTile(
           dense: true,
           contentPadding: const EdgeInsets.only(left: 16, right: 0),
@@ -956,7 +973,7 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
             isActive: widget.isHomeVisible && _showRecent,
           ),
           trailing: SizedBox(
-            width: 48,
+            width: datePainter.width.ceilToDouble(),
             height: 48,
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,

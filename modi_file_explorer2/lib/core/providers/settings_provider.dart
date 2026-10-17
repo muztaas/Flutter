@@ -5,6 +5,7 @@ class AppSettings {
   const AppSettings({
     this.darkTheme = false,
     this.fontSize = 'medium',
+    this.use24HourTime = false,
     this.defaultViewMode = 'list',
     this.showHiddenFiles = false,
     this.showNomediaFiles = true,
@@ -20,6 +21,7 @@ class AppSettings {
 
   final bool darkTheme;
   final String fontSize;
+  final bool use24HourTime;
   final String defaultViewMode;
   final bool showHiddenFiles;
   final bool showNomediaFiles;
@@ -41,6 +43,7 @@ class AppSettings {
   AppSettings copyWith({
     bool? darkTheme,
     String? fontSize,
+    bool? use24HourTime,
     String? defaultViewMode,
     bool? showHiddenFiles,
     bool? showNomediaFiles,
@@ -55,6 +58,7 @@ class AppSettings {
   }) => AppSettings(
     darkTheme: darkTheme ?? this.darkTheme,
     fontSize: fontSize ?? this.fontSize,
+    use24HourTime: use24HourTime ?? this.use24HourTime,
     defaultViewMode: defaultViewMode ?? this.defaultViewMode,
     showHiddenFiles: showHiddenFiles ?? this.showHiddenFiles,
     showNomediaFiles: showNomediaFiles ?? this.showNomediaFiles,
@@ -85,6 +89,8 @@ class AppSettings {
     return AppSettings(
       darkTheme: preferences.getString('theme.mode') == 'dark',
       fontSize: fontSize,
+      use24HourTime:
+          preferences.getBool('settings.use24HourTime') ?? false,
       defaultViewMode:
           preferences.getString('settings.defaultViewMode') ?? 'list',
       showHiddenFiles: preferences.getBool('settings.showHiddenFiles') ?? false,
@@ -127,6 +133,12 @@ class AppSettingsController extends StateNotifier<AppSettings> {
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString('theme.fontSize', value);
     await preferences.setDouble('theme.textScale', state.textSizeOffset);
+  }
+
+  Future<void> setUse24HourTime(bool value) async {
+    state = state.copyWith(use24HourTime: value);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool('settings.use24HourTime', value);
   }
 
   Future<void> setDefaultViewMode(String value) async {

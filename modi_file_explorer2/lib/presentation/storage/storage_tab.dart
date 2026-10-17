@@ -16,6 +16,7 @@ import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/sort_rules_provider.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../core/utils/format_bytes.dart';
+import '../../core/utils/time_format.dart';
 import '../../core/utils/file_name_comparator.dart';
 import '../../domain/entities/default_file_app.dart';
 import '../../domain/entities/file_type_category.dart';
@@ -801,6 +802,12 @@ class StorageTabState extends ConsumerState<StorageTab>
         'Image';
   }
 
+  List<String> _visibleImagePaths() => _items
+      .whereType<File>()
+      .where(_isImageFile)
+      .map((file) => file.path)
+      .toList();
+
   Future<bool> _containsImage(Directory directory) async {
     final cached = _imageContentCache[directory.path];
     if (cached != null) return cached;
@@ -992,7 +999,10 @@ class StorageTabState extends ConsumerState<StorageTab>
                 .find(extension, category: category)
           : null;
       if (savedDefault == null) {
-        TabsManager.instance.openImageViewer(file.path);
+        TabsManager.instance.openImageViewer(
+          file.path,
+          imagePaths: _visibleImagePaths(),
+        );
       } else {
         await _showOpenWithApplications(file, category);
       }
@@ -1528,7 +1538,7 @@ class StorageTabState extends ConsumerState<StorageTab>
           builder: (ctx) => AlertDialog(
             title: const Text('Properties'),
             content: Text(
-              'Name: ${_displayName(item.path)}\nPath: ${item.path}\nItem count: $itemCount\nTotal size: ${formatBytes(bytes)}\nLast modified: ${modified ?? 'Unavailable'}',
+              'Name: ${_displayName(item.path)}\nPath: ${item.path}\nItem count: $itemCount\nTotal size: ${formatBytes(bytes)}\nLast modified: ${modified == null ? 'Unavailable' : '${_dateLabel(modified!)} ${_timeLabel(modified!)}'}',
             ),
             actions: [
               TextButton(
@@ -2733,7 +2743,10 @@ class StorageTabState extends ConsumerState<StorageTab>
           return;
         }
         if (savedDefault.isImageViewer) {
-          TabsManager.instance.openImageViewer(file.path);
+          TabsManager.instance.openImageViewer(
+            file.path,
+            imagePaths: _visibleImagePaths(),
+          );
           return;
         }
         final packageName = savedDefault.packageName;
@@ -2984,7 +2997,10 @@ class StorageTabState extends ConsumerState<StorageTab>
       return;
     }
     if (selection.isImageViewer) {
-      TabsManager.instance.openImageViewer(file.path);
+      TabsManager.instance.openImageViewer(
+        file.path,
+        imagePaths: _visibleImagePaths(),
+      );
       return;
     }
     final selectedApp = selection.app;
@@ -4808,9 +4824,10 @@ class StorageTabState extends ConsumerState<StorageTab>
       '${modified.month.toString().padLeft(2, '0')}-'
       '${modified.day.toString().padLeft(2, '0')}';
 
-  String _timeLabel(DateTime modified) =>
-      '${modified.hour.toString().padLeft(2, '0')}:'
-      '${modified.minute.toString().padLeft(2, '0')}';
+  String _timeLabel(DateTime modified) => formatClockTime(
+    modified,
+    use24HourTime: ref.read(appSettingsProvider).use24HourTime,
+  );
 
   @override
   bool get wantKeepAlive => true;

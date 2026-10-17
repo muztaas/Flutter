@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/providers/search_provider.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/utils/format_bytes.dart';
+import '../../core/utils/time_format.dart';
 import '../../core/utils/extension_parser.dart';
 import '../../core/providers/file_type_categories_provider.dart';
 import '../../domain/entities/file_type_category.dart';
@@ -1004,7 +1005,7 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
       if (result.modified != null && settings.showModifiedDate)
         _dateLabel(result.modified!),
       if (result.modified != null && settings.showModifiedTime)
-        _timeLabel(result.modified!),
+        _timeLabel(result.modified!, settings.use24HourTime),
     ];
     return StorageEntryRow(
       leading: _resultLeading(context, result),
@@ -1093,9 +1094,8 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
       '${modified.month.toString().padLeft(2, '0')}-'
       '${modified.day.toString().padLeft(2, '0')}';
 
-  String _timeLabel(DateTime modified) =>
-      '${modified.hour.toString().padLeft(2, '0')}:'
-      '${modified.minute.toString().padLeft(2, '0')}';
+  String _timeLabel(DateTime modified, bool use24HourTime) =>
+      formatClockTime(modified, use24HourTime: use24HourTime);
 }
 
 enum _SearchFilterDefinition {

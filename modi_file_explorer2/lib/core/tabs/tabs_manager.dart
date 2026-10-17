@@ -19,7 +19,10 @@ String _newTabInstanceId() =>
 class TabEntry {
   final String id;
   final String sessionId;
-  final String title;
+  String title;
+  final String? initialImagePath;
+  final List<String>? initialImagePaths;
+  String? currentImagePath;
   // builder used to create the page widget when requested by the UI
   final Widget Function() pageBuilder;
   final Widget? Function()? bottomPanelBuilder;
@@ -58,6 +61,9 @@ class TabEntry {
     this.saveChanges,
     this.returnToTab,
     this.isImageViewer = false,
+    this.initialImagePath,
+    this.initialImagePaths,
+    this.currentImagePath,
   }) : sessionId = sessionId ?? _newTabInstanceId();
 }
 
@@ -463,6 +469,7 @@ class TabsManager extends ChangeNotifier {
     String path, {
     required String sessionId,
     required bool isDeferred,
+    List<String>? imagePaths,
     TabEntry? originTab,
   }) {
     late final TabEntry entry;
@@ -471,17 +478,28 @@ class TabsManager extends ChangeNotifier {
       title: _lastPathSegment(path, fallback: 'Image'),
       sessionId: sessionId,
       isImageViewer: true,
+      initialImagePath: path,
+      initialImagePaths: imagePaths == null
+          ? null
+          : List<String>.unmodifiable(imagePaths),
+      currentImagePath: path,
       isDeferred: isDeferred,
       returnToTab: originTab,
       pageBuilder: () => entry.isDeferred
           ? const _DeferredRestoredTab()
           : ImageViewerTab(
-              path: path,
-              isFullscreen: entry.isFullscreen,
-              onFullscreenChanged: (isFullscreen) =>
-                  setImageViewerFullscreen(entry, isFullscreen),
-              onZoomChanged: (isZoomed) =>
-                  setImageViewerZoomed(entry, isZoomed),
+          initialPath: entry.initialImagePath ?? path,
+          initialImagePaths: entry.initialImagePaths,
+          currentPath: entry.currentImagePath ?? path,
+          isFullscreen: entry.isFullscreen,
+          onFullscreenChanged: (isFullscreen) =>
+              setImageViewerFullscreen(entry, isFullscreen),
+          onZoomChanged: (isZoomed) =>
+              setImageViewerZoomed(entry, isZoomed),
+          onCurrentPathChanged: (currentPath) =>
+              updateImageViewerPath(entry, currentPath),
+          onBoundaryHandoff: (direction) =>
+              handOffImageViewerSwipe(entry, direction),
             ),
       onWillPop: () async {
         final index = _tabs.indexOf(entry);
@@ -496,6 +514,55 @@ class TabsManager extends ChangeNotifier {
   String _lastPathSegment(String path, {required String fallback}) {
     final parts = path.split(RegExp(r'[/\\]')).where((part) => part.isNotEmpty);
     return parts.isEmpty ? fallback : parts.last;
+  }
+
+  void updateImageViewerPath(TabEntry entry, String path) {
+    if (!_tabs.contains(entry) ||
+        !entry.isImageViewer ||
+        entry.currentImagePath == path) {
+      return;
+    }
+    entry
+      ..currentImagePath = path
+      ..title = _lastPathSegment(path, fallback: 'Image');
+    notifyListeners();
+    _schedulePersistTabs();
+  }
+
+  void handOffImageViewerSwipe(TabEntry entry, int direction) {
+    final selectedIndex = _selected;
+    if (!_tabs.contains(entry) ||
+        !entry.isImageViewer ||
+        !identical(_tabs[selectedIndex], entry) ||
+        entry.isImageZoomed) {
+      return;
+    }
+    final targetIndex = selectedIndex + direction;
+    if (targetIndex < 0 || targetIndex >= _tabs.length) return;
+    if (!_pageController.hasClients) {
+      goTo(targetIndex);
+      return;
+    }
+
+    _leaveFullscreenViewer();
+    _pendingProgrammaticPage = targetIndex;
+    unawaited(
+      _pageController
+          .animateToPage(
+            targetIndex,
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOutCubic,
+          )
+          .then((_) {
+            if (_pendingProgrammaticPage != targetIndex) return;
+            _pendingProgrammaticPage = null;
+            if (_selected == targetIndex) return;
+            _selected = targetIndex;
+            _activateTab(_tabs[targetIndex]);
+            notifyListeners();
+            _schedulePersistTabs();
+          }),
+    );
   }
 
   void updateStorageLocation(TabEntry entry, StorageTabLocation location) {
@@ -567,7 +634,9 @@ class TabsManager extends ChangeNotifier {
           return {
             'type': 'imageViewer',
             ...common,
-            ..._fileLocationRecord(tab.id.substring('imageViewer:'.length)),
+            ..._fileLocationRecord(
+              tab.currentImagePath ?? tab.id.substring('imageViewer:'.length),
+            ),
             'originTabId': tab.returnToTab?.sessionId,
           };
         }
@@ -694,7 +763,11 @@ class TabsManager extends ChangeNotifier {
     _schedulePageJump(target);
   }
 
-  TabEntry? openImageViewer(String path, {bool allowDuplicate = false}) {
+  TabEntry? openImageViewer(
+    String path, {
+    bool allowDuplicate = false,
+    List<String>? imagePaths,
+  }) {
     final id = 'imageViewer:$path';
     if (!allowDuplicate) {
       final existing = _tabs.indexWhere((tab) => tab.id == id);
@@ -715,6 +788,7 @@ class TabsManager extends ChangeNotifier {
       path,
       sessionId: _newTabInstanceId(),
       isDeferred: false,
+      imagePaths: imagePaths,
       originTab: originTab,
     );
     _tabs.add(entry);
