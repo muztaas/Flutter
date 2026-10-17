@@ -3,6 +3,7 @@ import '../entities/sort_rule.dart';
 SortRule? resolveEffectiveSortRule({
   required Iterable<SortRule> rules,
   required String drivePath,
+  String? driveId,
   required String folderPath,
 }) {
   final normalizedDrive = normalizeSortPath(drivePath);
@@ -22,6 +23,13 @@ SortRule? resolveEffectiveSortRule({
       );
   if (folderRules.isNotEmpty) return folderRules.first;
 
+  if (driveId != null) {
+    for (final rule in rules) {
+      if (rule.scope == SortScope.drive && rule.targetDriveId == driveId) {
+        return rule;
+      }
+    }
+  }
   for (final rule in rules) {
     if (rule.scope == SortScope.drive &&
         rule.targetPath != null &&

@@ -5,6 +5,7 @@ import '../../core/providers/default_file_apps_provider.dart';
 import '../../core/providers/file_type_categories_provider.dart';
 import '../../core/providers/open_with_providers.dart';
 import '../../core/providers/settings_provider.dart';
+import '../../core/utils/extension_parser.dart';
 import '../../domain/entities/default_file_app.dart';
 import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/open_with_app.dart';
@@ -374,6 +375,47 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel>
                                               ),
                                               subtitle: const Text(
                                                 'Internal Storage',
+                                              ),
+                                            ),
+                                            ListTile(
+                                              title: const Text(
+                                                'Close all tabs on exit',
+                                              ),
+                                              trailing: Switch.adaptive(
+                                                value:
+                                                    settings.closeAllTabsOnExit,
+                                                onChanged: (value) =>
+                                                    _saveSetting(
+                                                      context,
+                                                      () => ref
+                                                          .read(
+                                                            appSettingsProvider
+                                                                .notifier,
+                                                          )
+                                                          .setCloseAllTabsOnExit(
+                                                            value,
+                                                          ),
+                                                    ),
+                                              ),
+                                            ),
+                                            ListTile(
+                                              title: const Text(
+                                                'Include other storage drives in Recent',
+                                              ),
+                                              trailing: Switch.adaptive(
+                                                value: settings
+                                                    .includeOtherStorageDrivesInRecent,
+                                                onChanged: (value) => _saveSetting(
+                                                  context,
+                                                  () => ref
+                                                      .read(
+                                                        appSettingsProvider
+                                                            .notifier,
+                                                      )
+                                                      .setIncludeOtherStorageDrivesInRecent(
+                                                        value,
+                                                      ),
+                                                ),
                                               ),
                                             ),
                                             ListTile(
@@ -792,9 +834,7 @@ class _DefaultAppsSection extends ConsumerWidget {
                 children: [
                   _openWithLeadingIcon(app),
                   const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(app.name),
-                  ),
+                  Expanded(child: Text(app.name)),
                 ],
               ),
             ),
@@ -920,9 +960,15 @@ class _FileTypeCategoriesSection extends ConsumerWidget {
       for (final current in currentCategories.where(
         (current) => current.name != category.name,
       ))
-        ...current.extensions,
+        for (final extension in current.extensions) extension: current.name,
     };
-    final conflicts = extensions.where(ownedByOtherCategory.contains).toList();
+    final conflicts = extensions.where((extension) {
+      final owner = ownedByOtherCategory[extension];
+      final textDocumentsOverlap =
+          (category.name == 'Text' && owner == 'Documents') ||
+          (category.name == 'Documents' && owner == 'Text');
+      return owner != null && !textDocumentsOverlap;
+    }).toList();
     if (conflicts.isNotEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1043,7 +1089,7 @@ class _CustomExtensionsDialogState extends State<_CustomExtensionsDialog> {
   }
 
   void _submit() {
-    final parsed = _parseExtensions(
+    final parsed = parseExtensions(
       _controller.text,
       allowSemicolon: widget.allowDelete,
     );
@@ -1117,50 +1163,6 @@ class _CustomExtensionsDialogState extends State<_CustomExtensionsDialog> {
       FilledButton(onPressed: _submit, child: Text(widget.actionLabel)),
     ],
   );
-}
-
-class _ExtensionParseResult {
-  const _ExtensionParseResult({required this.extensions, required this.errors});
-
-  final List<String> extensions;
-  final List<String> errors;
-}
-
-_ExtensionParseResult _parseExtensions(
-  String input, {
-  bool allowSemicolon = false,
-}) {
-  final errors = <String>[];
-  if (input.trim().isEmpty) {
-    return const _ExtensionParseResult(
-      extensions: [],
-      errors: ['Rejected empty input: enter at least one extension.'],
-    );
-  }
-  if (RegExp(r'(^\s*,|,\s*,|,\s*$)').hasMatch(input)) {
-    errors.add('Rejected an empty extension entry around a comma.');
-  }
-
-  final extensions = <String>{};
-  final separators = allowSemicolon ? r'[;,\s]+' : r'[,\s]+';
-  for (final token in input.split(RegExp(separators))) {
-    if (token.isEmpty) continue;
-    final body = token.toLowerCase().replaceFirst(RegExp(r'^\.+'), '');
-    if (body.isEmpty) {
-      errors.add('Rejected "$token": it does not contain an extension name.');
-    } else if (!RegExp(r'^[a-z0-9][a-z0-9_-]*$').hasMatch(body)) {
-      errors.add(
-        'Rejected "$token": use only letters, numbers, hyphens, and underscores.',
-      );
-    } else {
-      extensions.add('.$body');
-    }
-  }
-  final normalized = extensions.toList()..sort();
-  if (normalized.isEmpty && errors.isEmpty) {
-    errors.add('Rejected empty input: enter at least one extension.');
-  }
-  return _ExtensionParseResult(extensions: normalized, errors: errors);
 }
 
 String _defaultAppName(DefaultFileApp defaultApp) {

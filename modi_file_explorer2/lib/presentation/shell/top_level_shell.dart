@@ -1,12 +1,17 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../text_editor/text_editor_tab.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../settings/settings_panel.dart';
 import '../../core/providers/settings_provider.dart';
+import '../../core/providers/search_provider.dart';
+import '../../core/providers/storage_providers.dart';
 import '../common/marquee_text.dart';
+import '../search/search_overlay.dart';
 
 class TopLevelShell extends StatefulWidget {
   const TopLevelShell({super.key});
@@ -15,51 +20,149 @@ class TopLevelShell extends StatefulWidget {
   State<TopLevelShell> createState() => _TopLevelShellState();
 }
 
-class _TopLevelShellState extends State<TopLevelShell> {
+class _TopLevelShellState extends State<TopLevelShell>
+    with WidgetsBindingObserver {
   final TabsManager tabs = TabsManager.instance;
   DateTime? _lastBackPress;
   bool _exitConfirmationInProgress = false;
+  bool _startupReady = false;
+  bool _restoreInProgress = false;
   TabEntry? _fullscreenViewer;
   Timer? _statusBarTimer;
   // Storage paths can intentionally occur in multiple tabs, so tab ids are
   // not unique enough to identify header widgets.
   final Map<TabEntry, GlobalKey> _tabKeys = {};
+  Set<String> _knownSearchSessionIds = {'home'};
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     tabs.addListener(_onTabsChanged);
-    unawaited(tabs.restorePersistedTabs());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_restoreSessionWhenReady());
+    });
   }
 
   @override
   void dispose() {
     _statusBarTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     tabs.removeListener(_onTabsChanged);
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      unawaited(tabs.flushPersistedTabs());
+    } else if (state == AppLifecycleState.resumed && !tabs.restoreAttempted) {
+      unawaited(_restoreSessionWhenReady());
+    }
+  }
+
+  Future<void> _restoreSessionWhenReady() async {
+    if (_restoreInProgress || tabs.restoreAttempted) return;
+    _restoreInProgress = true;
+    try {
+      if (Platform.isAndroid) {
+        final storage = await Permission.storage.status;
+        final manage = await Permission.manageExternalStorage.status;
+        if (!storage.isGranted && !storage.isLimited && !manage.isGranted) {
+          if (mounted) setState(() => _startupReady = true);
+          return;
+        }
+      }
+      if (!mounted) return;
+      final container = ProviderScope.containerOf(context, listen: false);
+      final devices = await container
+          .read(storageRepositoryProvider)
+          .listStorageDevices();
+      final settings = container.read(appSettingsProvider);
+      final failures = await tabs.restorePersistedTabs(
+        devices: devices,
+        closeAllTabsOnExit: settings.closeAllTabsOnExit,
+      );
+      if (!mounted) return;
+      setState(() => _startupReady = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _ensureSelectedTabVisible();
+      });
+      if (failures.isNotEmpty) {
+        final summary = failures.take(3).join(' ');
+        final more = failures.length > 3
+            ? ' ${failures.length - 3} more tab(s) could not be restored.'
+            : '';
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('$summary$more')));
+        });
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _startupReady = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not restore the previous session: $error'),
+          ),
+        );
+      });
+    } finally {
+      _restoreInProgress = false;
+    }
+  }
+
   void _onTabsChanged() {
+    final currentSearchSessionIds = tabs.tabs
+        .where(_canSearch)
+        .map((tab) => tab.sessionId)
+        .toSet();
+    final removedSearchSessionIds = _knownSearchSessionIds.difference(
+      currentSearchSessionIds,
+    );
+    _knownSearchSessionIds = currentSearchSessionIds;
     setState(() {});
     _syncFullscreenSystemUi();
+    final notice = tabs.takePendingNotice();
     debugPrint(
       '[TopLevelShell] _onTabsChanged selected=${tabs.selectedIndex} tabs=${tabs.tabs.map((t) => t.id).toList()}',
     );
     // After the header rebuilds, ensure the selected tab is visible in the
     // horizontal ListView. Use the tab entry to find the per-item key.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (tabs.tabs.isEmpty) return;
-      final entry = tabs.tabs[tabs.selectedIndex];
-      final key = _tabKeys[entry];
-      if (key?.currentContext != null) {
-        Scrollable.ensureVisible(
-          key!.currentContext!,
-          duration: const Duration(milliseconds: 200),
-          alignment: 0.5,
-        );
+      if (mounted && removedSearchSessionIds.isNotEmpty) {
+        final container = ProviderScope.containerOf(context, listen: false);
+        for (final sessionId in removedSearchSessionIds) {
+          container.invalidate(fileSearchProvider(sessionId));
+        }
       }
+      if (notice != null && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(notice)));
+      }
+      _ensureSelectedTabVisible();
     });
+  }
+
+  bool _canSearch(TabEntry tab) =>
+      tab.id == 'home' || (!tab.isImageViewer && tab.storagePath != null);
+
+  void _ensureSelectedTabVisible() {
+    if (tabs.tabs.isEmpty) return;
+    final entry = tabs.tabs[tabs.selectedIndex];
+    final key = _tabKeys[entry];
+    if (key?.currentContext == null) return;
+    Scrollable.ensureVisible(
+      key!.currentContext!,
+      duration: const Duration(milliseconds: 200),
+      alignment: 0.5,
+    );
   }
 
   void _syncFullscreenSystemUi() {
@@ -138,11 +241,26 @@ class _TopLevelShellState extends State<TopLevelShell> {
   Widget build(BuildContext context) {
     return Consumer(
       builder: (context, ref, _) {
+        if (!_startupReady) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        final selectedTab = tabs.tabs[tabs.selectedIndex];
         final open = ref.watch(settingsPanelProvider);
+        final searchOpen =
+            _canSearch(selectedTab) &&
+            ref.watch(fileSearchProvider(selectedTab.sessionId)).isOpen;
         return PopScope(
           canPop: false,
           onPopInvokedWithResult: (didPop, result) async {
             if (didPop) return;
+            if (searchOpen) {
+              ref
+                  .read(fileSearchProvider(selectedTab.sessionId).notifier)
+                  .close();
+              return;
+            }
             // If settings panel is open, close it first.
             if (open) {
               ref.read(settingsPanelProvider.notifier).close();
@@ -181,7 +299,8 @@ class _TopLevelShellState extends State<TopLevelShell> {
               Scaffold(
                 appBar:
                     tabs.tabs[tabs.selectedIndex].isImageViewer &&
-                        tabs.tabs[tabs.selectedIndex].isFullscreen
+                        tabs.tabs[tabs.selectedIndex].isFullscreen &&
+                        !searchOpen
                     ? null
                     : PreferredSize(
                         preferredSize: const Size.fromHeight(44),
@@ -192,30 +311,27 @@ class _TopLevelShellState extends State<TopLevelShell> {
                             child: Row(
                               children: [
                                 Expanded(
-                                  child: SizedBox(
-                                    height: 38,
-                                    child: ListView.separated(
-                                      scrollDirection: Axis.horizontal,
-                                      itemCount: tabs.tabs.length,
-                                      separatorBuilder: (_, _) =>
-                                          const SizedBox(width: 8),
-                                      itemBuilder: (context, index) {
-                                        final t = tabs.tabs[index];
+                                  child: Builder(
+                                    builder: (context) {
+                                      Widget buildTabChip(
+                                        TabEntry tab, {
+                                        required int tabIndex,
+                                        required bool isHome,
+                                      }) {
                                         final selected =
-                                            index == tabs.selectedIndex;
+                                            tabIndex == tabs.selectedIndex;
                                         final key = _tabKeys.putIfAbsent(
-                                          t,
+                                          tab,
                                           () => GlobalKey(),
                                         );
                                         return GestureDetector(
-                                          onTap: () => tabs.goTo(index),
+                                          onTap: () => tabs.goTo(tabIndex),
                                           child: SizedBox(
-                                            key: ObjectKey(t),
-                                            width: index == 0 ? 60 : 100,
+                                            width: isHome ? 60 : 100,
                                             child: Container(
                                               key: key,
                                               padding: EdgeInsets.symmetric(
-                                                horizontal: index == 0 ? 0 : 8,
+                                                horizontal: isHome ? 0 : 8,
                                                 vertical: 4,
                                               ),
                                               decoration: BoxDecoration(
@@ -231,7 +347,7 @@ class _TopLevelShellState extends State<TopLevelShell> {
                                                 children: [
                                                   Expanded(
                                                     child: MarqueeText(
-                                                      t.title,
+                                                      tab.title,
                                                       style: Theme.of(context)
                                                           .textTheme
                                                           .titleSmall
@@ -252,13 +368,15 @@ class _TopLevelShellState extends State<TopLevelShell> {
                                                       isActive: selected,
                                                     ),
                                                   ),
-                                                  if (index != 0) ...[
+                                                  if (!isHome) ...[
                                                     const SizedBox(width: 4),
                                                     GestureDetector(
                                                       onTap: () => unawaited(
                                                         tabs.requestCloseTab(
                                                           context,
-                                                          index,
+                                                          tabs.tabs.indexOf(
+                                                            tab,
+                                                          ),
                                                         ),
                                                       ),
                                                       child: SizedBox(
@@ -283,8 +401,62 @@ class _TopLevelShellState extends State<TopLevelShell> {
                                             ),
                                           ),
                                         );
-                                      },
-                                    ),
+                                      }
+
+                                      final homeTab = tabs.tabs.first;
+                                      return Row(
+                                        children: [
+                                          buildTabChip(
+                                            homeTab,
+                                            tabIndex: 0,
+                                            isHome: true,
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: SizedBox(
+                                              height: 38,
+                                              child: DragBoundary(
+                                                child: ReorderableListView.builder(
+                                                  scrollDirection:
+                                                      Axis.horizontal,
+                                                  padding: EdgeInsets.zero,
+                                                  buildDefaultDragHandles:
+                                                      false,
+                                                  dragBoundaryProvider:
+                                                      (context) =>
+                                                          DragBoundary.forRectOf(
+                                                            context,
+                                                          ),
+                                                  itemCount:
+                                                      tabs.tabs.length - 1,
+                                                  onReorderItem:
+                                                      (oldIndex, newIndex) {
+                                                        tabs.reorderTab(
+                                                          oldIndex + 1,
+                                                          newIndex + 1,
+                                                        );
+                                                      },
+                                                  itemBuilder: (context, index) {
+                                                    final tabIndex = index + 1;
+                                                    final tab =
+                                                        tabs.tabs[tabIndex];
+                                                    return ReorderableDelayedDragStartListener(
+                                                      key: ObjectKey(tab),
+                                                      index: index,
+                                                      child: buildTabChip(
+                                                        tab,
+                                                        tabIndex: tabIndex,
+                                                        isHome: false,
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      );
+                                    },
                                   ),
                                 ),
                               ],
@@ -314,15 +486,33 @@ class _TopLevelShellState extends State<TopLevelShell> {
                           ),
                           child: PageView.builder(
                             controller: tabs.pageController,
+                            physics:
+                                selectedTab.isImageViewer &&
+                                    selectedTab.isImageZoomed
+                                ? const NeverScrollableScrollPhysics()
+                                : null,
                             itemCount: tabs.tabs.length,
+                            findChildIndexCallback: (key) {
+                              if (key is! ObjectKey) return null;
+                              final index = tabs.tabs.indexWhere(
+                                (tab) => identical(tab, key.value),
+                              );
+                              return index < 0 ? null : index;
+                            },
                             // When PageView reports a page change, update the selected index
                             // without asking the PageController to jump again (prevents a
                             // feedback loop that could revert the selection).
                             onPageChanged: (i) => tabs.setSelectedFromPage(i),
-                            itemBuilder: (context, index) => MarqueeVisibility(
-                              isVisible: index == tabs.selectedIndex,
-                              child: tabs.tabs[index].pageBuilder(),
-                            ),
+                            itemBuilder: (context, index) {
+                              final tab = tabs.tabs[index];
+                              return KeyedSubtree(
+                                key: ObjectKey(tab),
+                                child: MarqueeVisibility(
+                                  isVisible: index == tabs.selectedIndex,
+                                  child: tab.pageBuilder(),
+                                ),
+                              );
+                            },
                           ),
                         ),
                         if (panel != null)
@@ -332,6 +522,21 @@ class _TopLevelShellState extends State<TopLevelShell> {
                               width: double.infinity,
                               child: panel,
                             ),
+                          ),
+                        for (final tab in tabs.tabs.where(
+                          (tab) =>
+                              _canSearch(tab) && !identical(tab, selectedTab),
+                        ))
+                          SearchOverlay(
+                            key: ValueKey(tab.sessionId),
+                            sessionId: tab.sessionId,
+                            isActive: false,
+                          ),
+                        if (_canSearch(selectedTab))
+                          SearchOverlay(
+                            key: ValueKey(selectedTab.sessionId),
+                            sessionId: selectedTab.sessionId,
+                            isActive: true,
                           ),
                       ],
                     );

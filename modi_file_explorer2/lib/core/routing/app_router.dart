@@ -5,16 +5,16 @@ import '../../presentation/storage/storage_tab.dart';
 final appRouter = GoRouter(
   initialLocation: '/',
   routes: [
-    GoRoute(
-      path: '/',
-      builder: (context, state) => const HomePage(),
-    ),
+    GoRoute(path: '/', builder: (context, state) => const HomePage()),
     GoRoute(
       path: '/storage',
       builder: (context, state) {
         final raw = state.uri.queryParameters['path'];
         final initial = raw == null ? null : Uri.decodeComponent(raw);
-        return StorageTab(initialPath: initial);
+        return StorageTab(
+          initialPath: initial,
+          searchSessionId: 'route-storage:${initial ?? 'root'}',
+        );
       },
     ),
   ],

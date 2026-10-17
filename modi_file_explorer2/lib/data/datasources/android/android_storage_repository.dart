@@ -10,9 +10,15 @@ import '../../../domain/repositories/storage_repository.dart';
 
 class AndroidStorageRepositoryImpl implements StorageRepository {
   AndroidStorageRepositoryImpl();
-  static const _storageChannel = MethodChannel('modi_file_explorer2/storage_volumes');
+  static const _storageChannel = MethodChannel(
+    'modi_file_explorer2/storage_volumes',
+  );
 
-  Future<StorageDevice> _deviceForPath({required String id, required String name, required String path}) async {
+  Future<StorageDevice> _deviceForPath({
+    required String id,
+    required String name,
+    required String path,
+  }) async {
     final freeForPath = await DiskSpace.getFreeDiskSpaceForPath(path);
     final totalMb = await DiskSpace.getTotalDiskSpace;
     final totalBytes = ((totalMb ?? 0) * 1024 * 1024).round();
@@ -32,7 +38,11 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
 
     try {
       if (Platform.isAndroid) {
-        final rawVolumes = await _storageChannel.invokeMethod<List<dynamic>>('listStorageVolumes') ?? [];
+        final rawVolumes =
+            await _storageChannel.invokeMethod<List<dynamic>>(
+              'listStorageVolumes',
+            ) ??
+            [];
         var externalIndex = 0;
         for (final raw in rawVolumes) {
           final volume = Map<String, dynamic>.from(raw as Map);
@@ -42,13 +52,18 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
           final isRemovable = volume['isRemovable'] == true;
           if (!isPrimary && !isRemovable) continue;
 
-              final currentExternalIndex = isPrimary ? null : externalIndex++;
-              final name = isPrimary
-                ? 'Internal Storage'
-                : ((volume['description'] as String?)?.trim().isNotEmpty == true
-                  ? volume['description'] as String
-                  : 'USB Drive ${(currentExternalIndex ?? 0) + 1}');
-              final id = isPrimary ? 'internal' : 'external_${currentExternalIndex ?? 0}';
+          final currentExternalIndex = isPrimary ? null : externalIndex++;
+          final name = isPrimary
+              ? 'Internal Storage'
+              : ((volume['description'] as String?)?.trim().isNotEmpty == true
+                    ? volume['description'] as String
+                    : 'USB Drive ${(currentExternalIndex ?? 0) + 1}');
+          final uuid = (volume['uuid'] as String?)?.trim();
+          final id = isPrimary
+              ? 'internal'
+              : uuid != null && uuid.isNotEmpty
+              ? 'volume:${uuid.toLowerCase()}'
+              : 'path:${path.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '')}';
           try {
             devices.add(await _deviceForPath(id: id, name: name, path: path));
           } catch (_) {
@@ -61,7 +76,13 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
         if (devices.isEmpty) {
           final internal = Directory('/storage/emulated/0');
           if (await internal.exists()) {
-            devices.add(StorageDevice(id: 'internal', name: 'Internal Storage', path: internal.path));
+            devices.add(
+              StorageDevice(
+                id: 'internal',
+                name: 'Internal Storage',
+                path: internal.path,
+              ),
+            );
           }
         }
       }
@@ -80,13 +101,17 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
     try {
       await for (var entity in dir.list()) {
         final stat = await entity.stat();
-        children.add(FileSystemEntry(
-          name: entity.uri.pathSegments.isNotEmpty ? entity.uri.pathSegments.last : entity.path,
-          path: entity.path,
-          isDirectory: stat.type == FileSystemEntityType.directory,
-          size: stat.size,
-          modified: stat.modified,
-        ));
+        children.add(
+          FileSystemEntry(
+            name: entity.uri.pathSegments.isNotEmpty
+                ? entity.uri.pathSegments.last
+                : entity.path,
+            path: entity.path,
+            isDirectory: stat.type == FileSystemEntityType.directory,
+            size: stat.size,
+            modified: stat.modified,
+          ),
+        );
       }
     } catch (e) {
       // ignore

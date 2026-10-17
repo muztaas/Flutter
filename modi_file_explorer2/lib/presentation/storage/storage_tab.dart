@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/providers/open_with_providers.dart';
@@ -13,18 +15,24 @@ import '../../core/providers/file_type_categories_provider.dart';
 import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/sort_rules_provider.dart';
 import '../../core/tabs/tabs_manager.dart';
+import '../../core/utils/format_bytes.dart';
+import '../../core/utils/file_name_comparator.dart';
 import '../../domain/entities/default_file_app.dart';
 import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/quick_access_item.dart';
+import '../../domain/entities/search_scope.dart';
 import '../../domain/entities/sort_rule.dart';
 import '../../domain/entities/open_with_app.dart';
 import '../../domain/usecases/resolve_effective_sort_rule.dart';
 import '../image_viewer/image_file_preview.dart';
 import '../common/open_with_label.dart' as open_with_label;
 import '../common/marquee_text.dart';
+import '../common/search_action_button.dart';
+import '../common/storage_entry_row.dart';
 
 enum _CopyPanelStep {
   standard,
+  chooseNonConflicting,
   chooseConflictScope,
   resolveConflict,
   chooseRename,
@@ -75,6 +83,7 @@ Widget _openWithAppIcon(OpenWithApp app) {
       ),
     );
   }
+
   return const Icon(Icons.apps);
 }
 
@@ -116,6 +125,25 @@ class _BatchRenameResult {
   final String? error;
 }
 
+class StorageTabLocation {
+  const StorageTabLocation({
+    required this.path,
+    required this.driveId,
+    required this.driveRoot,
+  });
+
+  final String path;
+  final String driveId;
+  final String driveRoot;
+}
+
+class _ListScrollRestore {
+  const _ListScrollRestore({this.itemPath, required this.fallbackOffset});
+
+  final String? itemPath;
+  final double fallbackOffset;
+}
+
 class _CopyConflict {
   const _CopyConflict({required this.source, required this.targetPath});
 
@@ -142,6 +170,9 @@ class StorageCopySession {
   List<FileSystemEntity> _sources = const [];
   bool _isCut = false;
   bool _isPasting = false;
+  bool _includeNonConflicting = true;
+  Object? _pasteOwner;
+  Set<String> _sourceDirectories = {};
   Directory? _destination;
   List<FileSystemEntity> _nonConflicting = const [];
   List<_CopyConflict> _conflicts = [];
@@ -160,6 +191,10 @@ class StorageCopySession {
   List<FileSystemEntity> get sources => _sources;
   bool get isCut => _isCut;
   bool get isPasting => _isPasting;
+  bool isPanelVisibleFor(Object? owner) =>
+      _step == _CopyPanelStep.cancelChoice ||
+      _pasteOwner == null ||
+      identical(_pasteOwner, owner);
   Directory? get destination => _destination;
   List<FileSystemEntity> get nonConflicting => _nonConflicting;
   List<_CopyConflict> get conflicts => _conflicts;
@@ -175,7 +210,8 @@ class StorageCopySession {
       _conflictIndex < _conflicts.length ? _conflicts[_conflictIndex] : null;
   double get panelHeight => switch (_step) {
     _CopyPanelStep.standard => 72,
-    _CopyPanelStep.chooseConflictScope => 128,
+    _CopyPanelStep.chooseConflictScope ||
+    _CopyPanelStep.chooseNonConflicting => 128,
     _CopyPanelStep.resolveConflict ||
     _CopyPanelStep.chooseRename ||
     _CopyPanelStep.chooseApplyAllRenameTarget ||
@@ -189,6 +225,11 @@ class StorageCopySession {
   void setSources(List<FileSystemEntity> sources, {bool cut = false}) {
     _sources = List.unmodifiable(sources);
     _isCut = cut;
+    _includeNonConflicting = true;
+    _pasteOwner = null;
+    _sourceDirectories = {
+      for (final source in sources) Directory(source.path).parent.path,
+    };
     _destination = null;
     _nonConflicting = const [];
     _conflicts = const [];
@@ -211,6 +252,16 @@ class StorageCopySession {
     onChanged?.call();
   }
 
+  void includeNonConflicting(bool include) {
+    _includeNonConflicting = include;
+    onChanged?.call();
+  }
+
+  void setPasteOwner(Object? owner) {
+    _pasteOwner = owner;
+    onChanged?.call();
+  }
+
   void setPastedCount(int count) {
     _pastedCount = count;
   }
@@ -227,6 +278,7 @@ class StorageCopySession {
     _pastedCount = 0;
     _failedSources.clear();
     _isPasting = false;
+    _includeNonConflicting = true;
     _panelHistory.clear();
     _startedWithMultipleConflicts = conflicts.length > 1;
     _applyAllRenameAction = null;
@@ -235,7 +287,9 @@ class StorageCopySession {
     _mode = conflicts.length <= 1
         ? _CopyConflictMode.single
         : _CopyConflictMode.separate;
-    _step = conflicts.length > 1
+    _step = conflicts.isNotEmpty && nonConflicting.isNotEmpty
+        ? _CopyPanelStep.chooseNonConflicting
+        : conflicts.length > 1
         ? _CopyPanelStep.chooseConflictScope
         : conflicts.isEmpty
         ? _CopyPanelStep.standard
@@ -274,6 +328,16 @@ class StorageCopySession {
 
   void addFailedSource(FileSystemEntity source) {
     _failedSources.add(source);
+  }
+
+  void markSourceCompleted(FileSystemEntity source) {
+    _sources = List.unmodifiable(
+      _sources.where((item) => item.path != source.path),
+    );
+    _nonConflicting = List.unmodifiable(
+      _nonConflicting.where((item) => item.path != source.path),
+    );
+    onChanged?.call();
   }
 
   void setCancelMode(_CopyCancelMode mode) {
@@ -326,6 +390,10 @@ class StorageCopySession {
     _applyAllRenameSeries = false;
     _applyAllSeriesStyle = null;
     _sources = List.unmodifiable(failures);
+    if (failures.isEmpty) {
+      _pasteOwner = null;
+      _sourceDirectories = {};
+    }
     if (failures.isEmpty) _isCut = false;
     onChanged?.call();
   }
@@ -340,13 +408,25 @@ class StorageCopySession {
 
 class StorageTab extends ConsumerStatefulWidget {
   final String? initialPath;
+  final String searchSessionId;
   final String? displayName;
+  final bool imageOnly;
+  final bool documentOnly;
   final StorageCopySession? copySession;
+  final Object? copySessionOwner;
+  final ValueChanged<StorageTabLocation>? onPathChanged;
+  final String? restoreRootPath;
   const StorageTab({
     super.key,
     this.initialPath,
+    this.searchSessionId = 'standalone-storage',
     this.displayName,
+    this.imageOnly = false,
+    this.documentOnly = false,
     this.copySession,
+    this.copySessionOwner,
+    this.onPathChanged,
+    this.restoreRootPath,
   });
 
   @override
@@ -355,6 +435,7 @@ class StorageTab extends ConsumerStatefulWidget {
 
 class StorageTabState extends ConsumerState<StorageTab>
     with AutomaticKeepAliveClientMixin {
+  static const _imageSortPreferenceKey = 'images.sort';
   static final Set<StorageTabState> _mountedStorageTabs = {};
 
   // Cache listings for this app session.  Keeping the cache by path means a
@@ -363,16 +444,27 @@ class StorageTabState extends ConsumerState<StorageTab>
   static final Map<String, bool> _subfolderCache = {};
   static final Map<String, Future<FileStat>> _statCache = {};
   static final Map<String, Future<int>> _itemCountCache = {};
+  static final Map<String, bool> _imageContentCache = {};
   Directory? _dir;
   String? _anchorPath;
   List<String> _storageRootPaths = const [];
+  Map<String, String> _storageIdsByRoot = const {};
+  Map<String, String> _storageNamesByRoot = const {};
   List<FileSystemEntity> _items = [];
+  final ScrollController _listScrollController = ScrollController();
+  final Map<String, double> _lastKnownScrollOffsets = {};
+  _ListScrollRestore? _pendingScrollRestore;
+  int _gridColumnCount = 1;
   bool _selectionMode = false;
+  bool _showBreadcrumbPath = false;
+  final List<String> _breadcrumbReturnPaths = [];
   final Set<String> _selected = {};
   late final StorageCopySession _copySession;
   String _sortBy = 'Name';
   bool _sortAscending = true;
   final GlobalKey _menuKey = GlobalKey();
+
+  List<FileSystemEntity> get _displayItems => _items;
 
   Timer? _pressTimer;
   bool _longPressTriggered = false;
@@ -381,6 +473,7 @@ class StorageTabState extends ConsumerState<StorageTab>
   void initState() {
     super.initState();
     _mountedStorageTabs.add(this);
+    _listScrollController.addListener(_rememberScrollOffset);
     _copySession = widget.copySession ?? StorageCopySession();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _copySession.notifyChanged();
@@ -398,14 +491,54 @@ class StorageTabState extends ConsumerState<StorageTab>
     try {
       await ref.read(sortRulesProvider.notifier).ready;
     } catch (_) {}
+    if (widget.imageOnly || widget.documentOnly) {
+      try {
+        await ref.read(fileTypeCategoriesProvider.notifier).ready;
+      } catch (_) {}
+    }
+    if (widget.imageOnly) {
+      try {
+        final preferences = await SharedPreferences.getInstance();
+        final savedSort = preferences.getString(_imageSortPreferenceKey);
+        if (savedSort != null) {
+          final parts = savedSort.split('|');
+          if (parts.length == 2 &&
+              const {'Name', 'Date modified', 'Size'}.contains(parts[0]) &&
+              const {'ascending', 'descending'}.contains(parts[1])) {
+            _sortBy = parts[0];
+            _sortAscending = parts[1] == 'ascending';
+          } else {
+            _message('Saved Images sorting is invalid');
+          }
+        }
+      } catch (error) {
+        if (mounted) _message('Could not load saved Images sorting: $error');
+      }
+    }
     try {
       final devices = await ref
           .read(storageRepositoryProvider)
           .listStorageDevices();
       _storageRootPaths = devices.map((device) => device.path).toList();
+      _storageIdsByRoot = {
+        for (final device in devices) normalizeSortPath(device.path): device.id,
+      };
+      _storageNamesByRoot = {
+        for (final device in devices)
+          normalizeSortPath(device.path): device.name,
+      };
+      try {
+        await ref
+            .read(sortRulesProvider.notifier)
+            .migrateDriveIds(_storageIdsByRoot);
+      } catch (error) {
+        if (mounted) {
+          _message('Could not migrate storage sorting rules: $error');
+        }
+      }
     } catch (_) {}
     if (!mounted) return;
-    _loadRoot(path);
+    _loadRoot(path, forceRefresh: true);
   }
 
   @override
@@ -413,10 +546,80 @@ class StorageTabState extends ConsumerState<StorageTab>
     _mountedStorageTabs.remove(this);
     _pressTimer?.cancel();
     _pressTimer = null;
+    _listScrollController
+      ..removeListener(_rememberScrollOffset)
+      ..dispose();
     super.dispose();
   }
 
-  Future<void> _loadRoot(String? path, {bool forceRefresh = false}) async {
+  void _rememberScrollOffset() {
+    final currentPath = _dir?.path;
+    if (currentPath == null || !_listScrollController.hasClients) return;
+    _lastKnownScrollOffsets[_normalizedPath(currentPath)] =
+        _listScrollController.offset;
+  }
+
+  void _beginScrollRestore(_ListScrollRestore restore) {
+    _pendingScrollRestore = restore;
+    setState(() {});
+  }
+
+  void _scheduleScrollRestoreAfterLayout() {
+    final restore = _pendingScrollRestore;
+    if (restore == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !identical(_pendingScrollRestore, restore)) return;
+      if (!_listScrollController.hasClients) {
+        _pendingScrollRestore = null;
+        setState(() {});
+        return;
+      }
+
+      var requestedOffset = restore.fallbackOffset;
+      final itemPath = restore.itemPath;
+      if (itemPath != null) {
+        final targetIndex = _items.indexWhere(
+          (item) => _normalizedPath(item.path) == _normalizedPath(itemPath),
+        );
+        if (targetIndex >= 0) {
+          final settings = ref.read(appSettingsProvider);
+          if (settings.defaultViewMode == 'grid') {
+            requestedOffset =
+                8 + (targetIndex ~/ _gridColumnCount) * (70.4 + 8);
+          } else {
+            requestedOffset =
+                targetIndex * (_detailsEnabled(settings) ? 56 : 44);
+          }
+        }
+      }
+
+      final position = _listScrollController.position;
+      final clampedOffset = requestedOffset
+          .clamp(position.minScrollExtent, position.maxScrollExtent)
+          .toDouble();
+      _listScrollController.jumpTo(clampedOffset);
+      _rememberScrollOffset();
+      _pendingScrollRestore = null;
+      setState(() {});
+    });
+  }
+
+  Future<void> _loadRoot(
+    String? path, {
+    bool forceRefresh = false,
+    bool userInitiatedRefresh = false,
+  }) async {
+    if ((widget.imageOnly || widget.documentOnly) &&
+        forceRefresh &&
+        !userInitiatedRefresh &&
+        path != null &&
+        _dir != null &&
+        _normalizedPath(path) == _normalizedPath(_dir!.path)) {
+      return;
+    }
+    if (path != null && widget.restoreRootPath != null) {
+      path = await _nearestExistingPath(path, widget.restoreRootPath!);
+    }
     Directory dir;
     try {
       final sharedStorage = <Directory>[
@@ -441,18 +644,22 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
 
     // set anchor path on first load so this tab won't navigate above it
-    _anchorPath ??= dir.path;
-    _syncSortChoice(_currentRules(), dir.path);
+    _anchorPath ??= widget.restoreRootPath ?? dir.path;
+    if (!widget.imageOnly) _syncSortChoice(_currentRules(), dir.path);
     if (forceRefresh) _invalidateMetadataCache(dir.path);
 
-    final cachedItems = _directoryCache[dir.path];
+    final cacheKey = _directoryCacheKey(dir.path);
+    final cachedItems = _directoryCache[cacheKey];
     if (!forceRefresh && cachedItems != null) {
-      _sortList(cachedItems, _sortBy, _sortAscending);
+      final items = List<FileSystemEntity>.of(cachedItems);
+      _sortList(items, _sortBy, _sortAscending);
       if (!mounted) return;
       setState(() {
         _dir = dir;
-        _items = cachedItems;
+        _items = items;
       });
+      _reportCurrentLocation(dir.path);
+      _scheduleScrollRestoreAfterLayout();
       _copySession.notifyChanged();
       return;
     }
@@ -473,28 +680,200 @@ class StorageTabState extends ConsumerState<StorageTab>
           return !settings.showHiddenFiles && name.startsWith('.');
         });
       }
+      if (widget.imageOnly) {
+        final visibleItems = <FileSystemEntity>[];
+        for (final item in items) {
+          if (item is File && _isImageFile(item)) {
+            visibleItems.add(item);
+          } else if (item is Directory && await _containsImage(item)) {
+            visibleItems.add(item);
+          }
+        }
+        items = visibleItems;
+      } else if (widget.documentOnly) {
+        final documentCategory = ref
+            .read(fileTypeCategoriesProvider)
+            .where((category) => category.name == 'Documents')
+            .firstOrNull;
+        final documentExtensions =
+            documentCategory?.extensions.toSet() ??
+            FileTypeCategory.documentsExtensions.toSet();
+        final visibleItems = <FileSystemEntity>[];
+        for (final item in items) {
+          if (item is File &&
+              documentExtensions.contains(
+                _fileExtension(_displayName(item.path)).toLowerCase(),
+              )) {
+            visibleItems.add(item);
+          } else if (item is Directory &&
+              await _containsDocument(item, documentExtensions)) {
+            visibleItems.add(item);
+          }
+        }
+        items = visibleItems;
+      }
       _sortList(items, _sortBy, _sortAscending);
     } catch (_) {
       items = [];
     }
 
-    _directoryCache[dir.path] = items;
+    _directoryCache[cacheKey] = items;
 
     if (!mounted) return;
     setState(() {
       _dir = dir;
       _items = items;
     });
+    _reportCurrentLocation(dir.path);
+    _scheduleScrollRestoreAfterLayout();
     _copySession.notifyChanged();
+  }
+
+  Future<String> _nearestExistingPath(String path, String rootPath) async {
+    var candidate = Directory(path);
+    final normalizedRoot = _normalizedPath(rootPath);
+    while (true) {
+      try {
+        if (await candidate.exists()) return candidate.path;
+      } on FileSystemException {
+        // Continue toward the known root; a missing path is a normal restore case.
+      }
+      final normalizedCandidate = _normalizedPath(candidate.path);
+      if (normalizedCandidate == normalizedRoot) return rootPath;
+      if (!normalizedCandidate.startsWith('$normalizedRoot/')) return rootPath;
+      final parent = candidate.parent;
+      if (_normalizedPath(parent.path) == normalizedCandidate) return rootPath;
+      candidate = parent;
+    }
+  }
+
+  String _directoryCacheKey(String path) => widget.imageOnly
+      ? 'imageStorage:$path'
+      : widget.documentOnly
+      ? 'documentStorage:$path'
+      : path;
+
+  void _reportCurrentLocation(String path) {
+    final rootPath = _drivePathFor(path);
+    final normalizedRoot = normalizeSortPath(rootPath);
+    widget.onPathChanged?.call(
+      StorageTabLocation(
+        path: path,
+        driveId: _storageIdsByRoot[normalizedRoot] ?? 'path:$normalizedRoot',
+        driveRoot: rootPath,
+      ),
+    );
+  }
+
+  SearchScope? _searchScope() {
+    final currentPath = _dir?.path;
+    if (currentPath == null) return null;
+    final driveRoot = _drivePathFor(currentPath);
+    final normalizedRoot = normalizeSortPath(driveRoot);
+    final normalizedCurrent = normalizeSortPath(currentPath);
+    final relativePath = normalizedCurrent == normalizedRoot
+        ? ''
+        : normalizedCurrent.startsWith('$normalizedRoot/')
+        ? normalizedCurrent.substring(normalizedRoot.length + 1)
+        : '';
+    final category = widget.imageOnly
+        ? SearchCategory.images
+        : widget.documentOnly
+        ? SearchCategory.documents
+        : null;
+
+    return SearchScope.forLocation(
+      driveId: _storageIdsByRoot[normalizedRoot] ?? 'path:$normalizedRoot',
+      relativePath: relativePath,
+      driveName:
+          _storageNamesByRoot[normalizedRoot] ?? _storageDisplayName(driveRoot),
+      folderName: _displayName(currentPath),
+      category: category,
+    );
+  }
+
+  bool _isImageFile(File file) {
+    final extension = _fileExtension(_displayName(file.path)).toLowerCase();
+    return FileTypeCategory.categoryForExtension(
+          extension,
+          categories: ref.read(fileTypeCategoriesProvider),
+        ) ==
+        'Image';
+  }
+
+  Future<bool> _containsImage(Directory directory) async {
+    final cached = _imageContentCache[directory.path];
+    if (cached != null) return cached;
+
+    final settings = ref.read(appSettingsProvider);
+    final pending = <Directory>[directory];
+    while (pending.isNotEmpty) {
+      final current = pending.removeLast();
+      if (!settings.showNomediaFiles &&
+          await _isInsideNoMediaDirectory(current)) {
+        continue;
+      }
+      try {
+        await for (final entity in current.list(followLinks: false)) {
+          final name = _displayName(entity.path);
+          if (!settings.showHiddenFiles && name.startsWith('.')) continue;
+          if (entity is File && _isImageFile(entity)) {
+            _imageContentCache[directory.path] = true;
+            return true;
+          }
+          if (entity is Directory) pending.add(entity);
+        }
+      } on FileSystemException {
+        continue;
+      }
+    }
+    _imageContentCache[directory.path] = false;
+    return false;
+  }
+
+  Future<bool> _containsDocument(
+    Directory directory,
+    Set<String> documentExtensions,
+  ) async {
+    final sortedExtensions = documentExtensions.toList()..sort();
+    final cacheKey =
+        'documents:${_normalizedPath(directory.path)}:${sortedExtensions.join(',')}';
+    final cached = _imageContentCache[cacheKey];
+    if (cached != null) return cached;
+
+    final settings = ref.read(appSettingsProvider);
+    final pending = <Directory>[directory];
+    while (pending.isNotEmpty) {
+      final current = pending.removeLast();
+      if (!settings.showNomediaFiles &&
+          await _isInsideNoMediaDirectory(current)) {
+        continue;
+      }
+      try {
+        await for (final entity in current.list(followLinks: false)) {
+          final name = _displayName(entity.path);
+          if (!settings.showHiddenFiles && name.startsWith('.')) continue;
+          if (entity is File &&
+              documentExtensions.contains(_fileExtension(name).toLowerCase())) {
+            _imageContentCache[cacheKey] = true;
+            return true;
+          }
+          if (entity is Directory) pending.add(entity);
+        }
+      } on FileSystemException {
+        continue;
+      }
+    }
+    _imageContentCache[cacheKey] = false;
+    return false;
   }
 
   /// Called by the shell to let this tab handle a back press.
   /// Returns true if the back was handled (e.g. navigated up), false to indicate
   /// the tab is at its root and did not handle the back.
   Future<bool> handleWillPop() async {
-    if (_copySession.sources.isNotEmpty) {
-      if (_copySession.goBack()) return true;
-      _cancelCopyMode();
+    if (_showBreadcrumbPath) {
+      setState(() => _showBreadcrumbPath = false);
       return true;
     }
     if (_selectionMode) {
@@ -504,7 +883,30 @@ class StorageTabState extends ConsumerState<StorageTab>
       });
       return true;
     }
+    if (_copySession.sources.isNotEmpty &&
+        _copySession.isPanelVisibleFor(widget.copySessionOwner)) {
+      if (_copySession.step == _CopyPanelStep.chooseNonConflicting) {
+        _copySession.setCancelMode(_CopyCancelMode.initial);
+        return true;
+      }
+      if (_copySession.goBack()) return true;
+      _cancelCopyMode();
+      return true;
+    }
     if (_dir == null) return false;
+    if (_breadcrumbReturnPaths.isNotEmpty) {
+      final returnPath = _breadcrumbReturnPaths.removeLast();
+      _beginScrollRestore(
+        _ListScrollRestore(
+          itemPath: _immediateChildPath(returnPath, _dir!.path),
+          fallbackOffset:
+              _lastKnownScrollOffsets[_normalizedPath(returnPath)] ?? 0,
+        ),
+      );
+      _reportCurrentLocation(returnPath);
+      _loadRoot(returnPath, forceRefresh: true);
+      return true;
+    }
     // If we're at or above the tab's anchor/root, do not handle back here.
     if (_anchorPath != null && _dir!.path == _anchorPath) return false;
     final parent = _dir!.parent;
@@ -516,7 +918,16 @@ class StorageTabState extends ConsumerState<StorageTab>
       return false;
     }
     // Navigate up one folder
-    _loadRoot(parent.path);
+    final currentPath = _dir!.path;
+    _beginScrollRestore(
+      _ListScrollRestore(
+        itemPath: _immediateChildPath(parent.path, currentPath),
+        fallbackOffset:
+            _lastKnownScrollOffsets[_normalizedPath(parent.path)] ?? 0,
+      ),
+    );
+    _reportCurrentLocation(parent.path);
+    _loadRoot(parent.path, forceRefresh: true);
     return true;
   }
 
@@ -538,7 +949,9 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
 
     if (e is Directory) {
-      _loadRoot(e.path);
+      _breadcrumbReturnPaths.clear();
+      _reportCurrentLocation(e.path);
+      _loadRoot(e.path, forceRefresh: true);
       return;
     }
 
@@ -555,7 +968,11 @@ class StorageTabState extends ConsumerState<StorageTab>
       return;
     }
     if (!mounted) return;
-    await _showOpenWithApplications(file, _categoryForFile(file));
+    await _showOpenWithApplications(
+      file,
+      widget.documentOnly ? 'Documents' : _categoryForFile(file),
+      allowBuiltInHandlers: !widget.documentOnly,
+    );
   }
 
   Future<void> _openImageThumbnail(File file) async {
@@ -592,6 +1009,9 @@ class StorageTabState extends ConsumerState<StorageTab>
     final result = resolveEffectiveSortRule(
       rules: rules,
       drivePath: drivePath,
+      driveId:
+          _storageIdsByRoot[normalizeSortPath(drivePath)] ??
+          'path:${normalizeSortPath(drivePath)}',
       folderPath: folderPath,
     );
     return result;
@@ -625,12 +1045,12 @@ class StorageTabState extends ConsumerState<StorageTab>
   }
 
   void _applyEffectiveSort(Iterable<SortRule> rules) {
-    if (_dir == null) return;
+    if (_dir == null || widget.imageOnly) return;
     _syncSortChoice(rules, _dir!.path);
     setState(() {
       _sortList(_items, _sortBy, _sortAscending);
     });
-    _directoryCache[_dir!.path] = _items;
+    _directoryCache[_directoryCacheKey(_dir!.path)] = _items;
   }
 
   Future<void> _saveSortRule({
@@ -645,10 +1065,16 @@ class StorageTabState extends ConsumerState<StorageTab>
       SortScope.folder => _dir?.path,
     };
     if (scope != SortScope.all && targetPath == null) return;
+    final drivePath = _dir == null ? null : _drivePathFor(_dir!.path);
+    final targetDriveId = scope == SortScope.drive && drivePath != null
+        ? _storageIdsByRoot[normalizeSortPath(drivePath)] ??
+              'path:${normalizeSortPath(drivePath)}'
+        : null;
 
     final rule = SortRule.create(
       scope: scope,
       targetPath: targetPath,
+      targetDriveId: targetDriveId,
       recursive: recursive,
       field: switch (field) {
         'Date modified' => SortField.dateModified,
@@ -677,7 +1103,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     final effectiveRule = _dir == null ? null : _resolveRule(rules, _dir!.path);
     if (_dir != null && mounted) {
       _applyEffectiveSort(rules);
-      _directoryCache[_dir!.path] = _items;
+      _directoryCache[_directoryCacheKey(_dir!.path)] = _items;
     }
     final order = ascending ? 'Ascending' : 'Descending';
     final scopeDescription = switch (scope) {
@@ -766,6 +1192,7 @@ class StorageTabState extends ConsumerState<StorageTab>
             SortRule.create(
               scope: SortScope.drive,
               targetPath: drivePath,
+              targetDriveId: _storageIdsByRoot[drivePath] ?? 'path:$drivePath',
               field: sortField,
               order: ascending ? SortOrder.ascending : SortOrder.descending,
             ),
@@ -825,9 +1252,10 @@ class StorageTabState extends ConsumerState<StorageTab>
               .compareTo(b.path.split('.').last.toLowerCase());
           break;
         default:
-          result = _displayName(
-            a.path,
-          ).toLowerCase().compareTo(_displayName(b.path).toLowerCase());
+          result = compareStorageNames(
+            _displayName(a.path),
+            _displayName(b.path),
+          );
       }
       return ascending ? result : -result;
     });
@@ -902,6 +1330,40 @@ class StorageTabState extends ConsumerState<StorageTab>
     if (choice == null) return;
     if (!mounted) return;
     final option = options[choice];
+
+    if (widget.imageOnly) {
+      final sortAction = await showMenu<int>(
+        context: context,
+        position: position,
+        items: const [
+          PopupMenuItem(value: 0, child: Text('Sort temporarily')),
+          PopupMenuItem(value: 1, child: Text('Save sorting')),
+        ],
+      );
+      if (sortAction == null || !mounted) return;
+      if (sortAction == 1) {
+        try {
+          final preferences = await SharedPreferences.getInstance();
+          final saved = await preferences.setString(
+            _imageSortPreferenceKey,
+            '${option.key}|${option.value ? 'ascending' : 'descending'}',
+          );
+          if (!saved) {
+            _message('Could not save Images sorting');
+            return;
+          }
+        } catch (error) {
+          _message('Could not save Images sorting: $error');
+          return;
+        }
+      }
+      setState(() {
+        _sortBy = option.key;
+        _sortAscending = option.value;
+        _sortList(_items, _sortBy, _sortAscending);
+      });
+      return;
+    }
 
     final scopes = [SortScope.drive, SortScope.folder];
     final scopeChoice = await showMenu<int>(
@@ -1015,22 +1477,50 @@ class StorageTabState extends ConsumerState<StorageTab>
       return;
     }
     var bytes = 0;
+    var folderCount = 0;
+    var fileCount = 0;
     DateTime? modified;
-    try {
-      for (final entity in entities) {
-        if (entity is File) bytes += await entity.length();
+    final visited = <String>{};
+    Future<void> measure(
+      FileSystemEntity entity, {
+      bool countDirectory = true,
+    }) async {
+      final path = _normalizedPath(entity.path);
+      if (!visited.add(path)) return;
+
+      if (entity is Directory) {
+        if (countDirectory) folderCount++;
         final date = (await entity.stat()).modified;
-        if (modified == null || date.isAfter(modified)) modified = date;
-      }
-      if (entities.length == 1 && entities.first is Directory) {
-        await for (final entity in (entities.first as Directory).list(
-          recursive: true,
-          followLinks: false,
-        )) {
-          if (entity is File) bytes += await entity.length();
+        final currentModified = modified;
+        if (currentModified == null || date.isAfter(currentModified)) {
+          modified = date;
+        }
+        await for (final child in entity.list(followLinks: false)) {
+          if (child is Directory) {
+            await measure(child);
+          } else if (child is File) {
+            await measure(child);
+          }
+        }
+      } else if (entity is File) {
+        fileCount++;
+        bytes += await entity.length();
+        final date = (await entity.stat()).modified;
+        final currentModified = modified;
+        if (currentModified == null || date.isAfter(currentModified)) {
+          modified = date;
         }
       }
+    }
+
+    try {
+      for (final entity in entities) {
+        await measure(entity, countDirectory: entity is! Directory);
+      }
       if (!mounted) return;
+      final itemCount =
+          '$folderCount folder${folderCount == 1 ? '' : 's'}, '
+          '$fileCount file${fileCount == 1 ? '' : 's'}';
       if (entities.length == 1) {
         final item = entities.first;
         await showDialog<void>(
@@ -1038,7 +1528,7 @@ class StorageTabState extends ConsumerState<StorageTab>
           builder: (ctx) => AlertDialog(
             title: const Text('Properties'),
             content: Text(
-              'Name: ${_displayName(item.path)}\nPath: ${item.path}\nItem count: ${item is Directory ? _items.length : 1}\nTotal size: $bytes bytes\nLast modified: ${modified ?? 'Unavailable'}',
+              'Name: ${_displayName(item.path)}\nPath: ${item.path}\nItem count: $itemCount\nTotal size: ${formatBytes(bytes)}\nLast modified: ${modified ?? 'Unavailable'}',
             ),
             actions: [
               TextButton(
@@ -1053,7 +1543,9 @@ class StorageTabState extends ConsumerState<StorageTab>
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Properties'),
-            content: Text('${entities.length} items\nTotal size: $bytes bytes'),
+            content: Text(
+              '${entities.length} selected items\nItem count: $itemCount\nTotal size: ${formatBytes(bytes)}',
+            ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(ctx),
@@ -1940,14 +2432,50 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
   }
 
+  bool _hasSelectedPendingCopySource() {
+    if (_copySession.sources.isEmpty ||
+        !_copySession.isPanelVisibleFor(widget.copySessionOwner)) {
+      return false;
+    }
+    final pendingPaths = _copySession.sources
+        .map((source) => _normalizedPath(source.path))
+        .toSet();
+    return _selected.any((path) {
+      final selectedPath = _normalizedPath(path);
+      return pendingPaths.any(
+        (pendingPath) => Platform.isWindows
+            ? pendingPath.toLowerCase() == selectedPath.toLowerCase()
+            : pendingPath == selectedPath,
+      );
+    });
+  }
+
   List<PopupMenuEntry<String>> _menuItems() {
     if (_selectionMode && _selected.isNotEmpty) {
+      final allItemsSelected =
+          _displayItems.isNotEmpty &&
+          _displayItems.every((item) => _selected.contains(item.path));
       final entries = <PopupMenuEntry<String>>[
-        const PopupMenuItem(value: 'select_all', child: Text('Select All')),
+        PopupMenuItem(
+          value: 'select_all',
+          child: Text(allItemsSelected ? 'Unselect All' : 'Select All'),
+        ),
         const PopupMenuItem(value: 'rename', child: Text('Rename')),
-        const PopupMenuItem(value: 'copy', child: Text('Copy')),
-        const PopupMenuItem(value: 'cut', child: Text('Cut')),
-        const PopupMenuItem(value: 'delete', child: Text('Delete')),
+        PopupMenuItem(
+          value: 'copy',
+          enabled: _copySession.sources.isEmpty,
+          child: const Text('Copy'),
+        ),
+        PopupMenuItem(
+          value: 'cut',
+          enabled: _copySession.sources.isEmpty,
+          child: const Text('Cut'),
+        ),
+        PopupMenuItem(
+          value: 'delete',
+          enabled: !_hasSelectedPendingCopySource(),
+          child: const Text('Delete'),
+        ),
         const PopupMenuItem(value: 'properties', child: Text('Properties')),
       ];
       if (_selected.length == 1) {
@@ -1988,7 +2516,8 @@ class StorageTabState extends ConsumerState<StorageTab>
       const PopupMenuItem(value: 'select', child: Text('Select')),
       const PopupMenuItem(value: 'select_all', child: Text('Select All')),
       const PopupMenuItem(value: 'sort', child: Text('Sort by')),
-      const PopupMenuItem(value: 'create', child: Text('Create')),
+      if (!widget.imageOnly)
+        const PopupMenuItem(value: 'create', child: Text('Create')),
     ];
   }
 
@@ -1999,11 +2528,23 @@ class StorageTabState extends ConsumerState<StorageTab>
         _message('Selection mode enabled');
         break;
       case 'select_all':
+        final allItemsSelected =
+            _displayItems.isNotEmpty &&
+            _displayItems.every((item) => _selected.contains(item.path));
         setState(() {
-          _selectionMode = true;
-          _selected.addAll(_items.map((e) => e.path));
+          if (allItemsSelected) {
+            _selected.clear();
+            _selectionMode = false;
+          } else {
+            _selectionMode = true;
+            _selected.addAll(_displayItems.map((e) => e.path));
+          }
         });
-        _message('${_items.length} items selected');
+        _message(
+          allItemsSelected
+              ? 'Selection cleared'
+              : '${_displayItems.length} items selected',
+        );
         break;
       case 'hidden':
         final showHidden = !ref.read(appSettingsProvider).showHiddenFiles;
@@ -2040,6 +2581,10 @@ class StorageTabState extends ConsumerState<StorageTab>
         _toggleSelectedQuickAccess();
         break;
       case 'delete':
+        if (_hasSelectedPendingCopySource()) {
+          _message('Cannot delete an item with a pending copy or move');
+          break;
+        }
         _deleteSelected();
         break;
       case 'rename':
@@ -2067,6 +2612,9 @@ class StorageTabState extends ConsumerState<StorageTab>
           _selectionMode = false;
         });
         _copySession.setSources(sources, cut: isCut);
+        if (_dir != null) {
+          unawaited(_refreshDirectories({_dir!.path}));
+        }
         break;
     }
   }
@@ -2162,6 +2710,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     File file,
     String category, {
     bool checkSavedDefault = true,
+    bool allowBuiltInHandlers = true,
   }) async {
     final extension = _fileExtension(_displayName(file.path));
     var effectiveCategory = category;
@@ -2267,9 +2816,11 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
     if (!mounted) return;
     final canUseTextEditor =
-        effectiveCategory == 'Text' || effectiveCategory == 'Others';
+        allowBuiltInHandlers &&
+        (effectiveCategory == 'Text' || effectiveCategory == 'Others');
     final canUseImageViewer =
-        effectiveCategory == 'Image' || effectiveCategory == 'Others';
+        allowBuiltInHandlers &&
+        (effectiveCategory == 'Image' || effectiveCategory == 'Others');
     if (apps.isEmpty && !canUseTextEditor && !canUseImageViewer) {
       _message(
         'No installed applications can open this file as $effectiveCategory',
@@ -2487,6 +3038,7 @@ class StorageTabState extends ConsumerState<StorageTab>
       }
       _copySession.setSources(sources, cut: true);
     }
+    _copySession.setPasteOwner(widget.copySessionOwner);
     _copySession.setPasting(true);
 
     final nonConflicting = <FileSystemEntity>[];
@@ -2520,6 +3072,20 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
   }
 
+  Future<void> _chooseNonConflictingItems(bool include) async {
+    _copySession.includeNonConflicting(include);
+    if (include) {
+      _copySession.setPasting(true);
+      await _copyNonConflictingItems();
+      _copySession.setPasting(false);
+    }
+    _copySession.setStep(
+      _copySession.conflicts.length > 1
+          ? _CopyPanelStep.chooseConflictScope
+          : _CopyPanelStep.resolveConflict,
+    );
+  }
+
   Future<void> _chooseConflictScope(_CopyConflictMode mode) async {
     _copySession.setPasting(false);
     _copySession.navigateTo(_CopyPanelStep.resolveConflict);
@@ -2548,6 +3114,10 @@ class StorageTabState extends ConsumerState<StorageTab>
   }
 
   void _goBackFromConflictPrompt() {
+    if (_copySession.step == _CopyPanelStep.chooseNonConflicting) {
+      _copySession.setCancelMode(_CopyCancelMode.initial);
+      return;
+    }
     if (_copySession.step == _CopyPanelStep.resolveConflict &&
         _copySession.mode == _CopyConflictMode.separate &&
         _copySession.conflicts.isNotEmpty) {
@@ -2827,6 +3397,10 @@ class StorageTabState extends ConsumerState<StorageTab>
         );
       }
       _copySession.setPastedCount(_copySession.pastedCount + 1);
+      await _refreshDirectories({
+        Directory(conflict.source.path).parent.path,
+        destination.path,
+      });
     } on FileSystemException catch (error) {
       _copySession.addFailedSource(conflict.source);
       debugPrint(
@@ -2877,9 +3451,12 @@ class StorageTabState extends ConsumerState<StorageTab>
   }
 
   Future<void> _copyNonConflictingItems() async {
+    if (!_copySession._includeNonConflicting) return;
     final destination = _copySession.destination;
     if (destination == null) return;
-    for (final source in _copySession.nonConflicting) {
+    for (final source in List<FileSystemEntity>.of(
+      _copySession.nonConflicting,
+    )) {
       try {
         final targetPath = _targetPath(
           destination.path,
@@ -2890,6 +3467,7 @@ class StorageTabState extends ConsumerState<StorageTab>
           await _moveCutSourceAfterTargetExists(source, targetPath);
         }
         _copySession.setPastedCount(_copySession.pastedCount + 1);
+        _copySession.markSourceCompleted(source);
       } on FileSystemException catch (error) {
         _copySession.addFailedSource(source);
         debugPrint(
@@ -2904,6 +3482,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         );
       }
     }
+    await _refreshDirectories(_pasteRefreshDirectories());
   }
 
   Future<void> _moveCutSourceAfterTargetExists(
@@ -2924,30 +3503,10 @@ class StorageTabState extends ConsumerState<StorageTab>
   }
 
   Future<void> _completePaste({String? additionalMessage}) async {
-    final destination = _copySession.destination;
     final pastedCount = _copySession.pastedCount;
     final failedCount = _copySession.failedSources.length;
     final isCut = _copySession.isCut;
-    final affectedDirectories = <String>{
-      if (destination != null) destination.path,
-      if (isCut)
-        for (final source in _copySession.sources)
-          Directory(source.path).parent.path,
-    };
-    for (final path in affectedDirectories) {
-      _directoryCache.remove(path);
-    }
-    await Future.wait(
-      _mountedStorageTabs
-          .where(
-            (state) =>
-                state._dir != null &&
-                affectedDirectories.contains(state._dir!.path),
-          )
-          .map(
-            (state) => state._loadRoot(state._dir!.path, forceRefresh: true),
-          ),
-    );
+    await _refreshDirectories(_pasteRefreshDirectories());
     if (!mounted) return;
     _copySession.finishPaste();
     final completedAction = isCut ? 'Moved' : 'Pasted';
@@ -2959,6 +3518,51 @@ class StorageTabState extends ConsumerState<StorageTab>
       additionalMessage == null
           ? completionMessage
           : '$completionMessage. $additionalMessage',
+    );
+  }
+
+  Set<String> _pasteRefreshDirectories() => {
+    ..._copySession._sourceDirectories,
+    if (_copySession.destination != null) _copySession.destination!.path,
+  };
+
+  Future<void> _refreshDirectories(Iterable<String> directoryPaths) async {
+    final normalizedPaths = directoryPaths.map(_normalizedPath).toSet();
+    if (normalizedPaths.isEmpty) return;
+
+    bool isAffectedPath(String path) {
+      final normalized = _normalizedPath(path);
+      return normalizedPaths.any(
+        (directoryPath) =>
+            normalized == directoryPath ||
+            normalized.startsWith('$directoryPath/'),
+      );
+    }
+
+    _directoryCache.removeWhere((path, _) {
+      final cachePath = path.startsWith('imageStorage:')
+          ? path.substring('imageStorage:'.length)
+          : path.startsWith('documentStorage:')
+          ? path.substring('documentStorage:'.length)
+          : path;
+      return isAffectedPath(cachePath);
+    });
+    _subfolderCache.removeWhere((path, _) => isAffectedPath(path));
+    _statCache.removeWhere((path, _) => isAffectedPath(path));
+    _itemCountCache.removeWhere((key, _) {
+      final path = _itemCountCachePath(key);
+      return isAffectedPath(path);
+    });
+
+    final tabsToRefresh = _mountedStorageTabs.where(
+      (state) =>
+          state._dir != null &&
+          normalizedPaths.contains(_normalizedPath(state._dir!.path)),
+    );
+    await Future.wait(
+      tabsToRefresh.map(
+        (state) => state._loadRoot(state._dir!.path, forceRefresh: true),
+      ),
     );
   }
 
@@ -3194,7 +3798,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         content: Text(
           'Delete $folderCount folder${folderCount == 1 ? '' : 's'} and '
           '$fileCount file${fileCount == 1 ? '' : 's'}?\n'
-          'Total storage used: $totalBytes bytes.',
+          'Total size of selected items: ${formatBytes(totalBytes)}.',
         ),
         actions: [
           TextButton(
@@ -3248,6 +3852,72 @@ class StorageTabState extends ConsumerState<StorageTab>
         : trimmedPath;
   }
 
+  List<MapEntry<String, String>> _breadcrumbSegments() {
+    final currentPath = _dir?.path;
+    if (currentPath == null) return const [];
+    final root = _drivePathFor(currentPath);
+    final normalizedRoot = _normalizedPath(root);
+    final normalizedCurrent = _normalizedPath(currentPath);
+    if (normalizedCurrent != normalizedRoot &&
+        !normalizedCurrent.startsWith('$normalizedRoot/')) {
+      return [MapEntry(root, _storageDisplayName(root))];
+    }
+
+    final result = <MapEntry<String, String>>[
+      MapEntry(root, _storageDisplayName(root)),
+    ];
+    final relativePath = normalizedCurrent == normalizedRoot
+        ? ''
+        : normalizedCurrent.substring(normalizedRoot.length + 1);
+    var path = root;
+    for (final segment
+        in relativePath.split('/').where((part) => part.isNotEmpty)) {
+      path = path.endsWith(Platform.pathSeparator)
+          ? '$path$segment'
+          : '$path${Platform.pathSeparator}$segment';
+      result.add(MapEntry(path, segment));
+    }
+    return result;
+  }
+
+  void _openBreadcrumbPath(String path) {
+    final currentPath = _dir?.path;
+    if (currentPath == null) return;
+    if (_normalizedPath(path) == _normalizedPath(currentPath)) {
+      setState(() => _showBreadcrumbPath = false);
+      return;
+    }
+    _breadcrumbReturnPaths.add(currentPath);
+    _beginScrollRestore(
+      _ListScrollRestore(
+        itemPath: _immediateChildPath(path, currentPath),
+        fallbackOffset: _lastKnownScrollOffsets[_normalizedPath(path)] ?? 0,
+      ),
+    );
+    _reportCurrentLocation(path);
+    setState(() => _showBreadcrumbPath = false);
+    _loadRoot(path, forceRefresh: true);
+  }
+
+  String? _immediateChildPath(String ancestorPath, String descendantPath) {
+    var child = Directory(descendantPath);
+    final ancestor = _normalizedPath(ancestorPath);
+    while (_normalizedPath(child.parent.path) != ancestor) {
+      if (_normalizedPath(child.parent.path) == _normalizedPath(child.path)) {
+        return null;
+      }
+      child = child.parent;
+    }
+    return child.path;
+  }
+
+  Widget _breadcrumbTitle() {
+    return _BreadcrumbTitle(
+      segments: _breadcrumbSegments(),
+      onTap: _openBreadcrumbPath,
+    );
+  }
+
   String _storageDisplayName(String path) {
     final normalized = path
         .replaceAll('\\', '/')
@@ -3287,6 +3957,7 @@ class StorageTabState extends ConsumerState<StorageTab>
   }
 
   Widget? buildCopyPanel() {
+    if (!_copySession.isPanelVisibleFor(widget.copySessionOwner)) return null;
     final sources = _copySession.sources;
     if (sources.isEmpty) return null;
     final isUnavailable = _dir == null || _copySession.isPasting;
@@ -3412,6 +4083,31 @@ class StorageTabState extends ConsumerState<StorageTab>
               ],
             ),
           ),
+        );
+      case _CopyPanelStep.chooseNonConflicting:
+        final conflictCount = _copySession.conflicts.length;
+        final nonConflictCount = sources.length - conflictCount;
+        panelContent = actionPanel(
+          message:
+              '$conflictCount item${conflictCount == 1 ? '' : 's'} already ${conflictCount == 1 ? 'exists' : 'exist'}, paste the non-conflicting $nonConflictCount item${nonConflictCount == 1 ? '' : 's'}?',
+          actions: [
+            button(
+              'Yes',
+              _copySession.isPasting
+                  ? null
+                  : () => _chooseNonConflictingItems(true),
+            ),
+            button(
+              'No',
+              _copySession.isPasting
+                  ? null
+                  : () => _chooseNonConflictingItems(false),
+            ),
+            button(
+              'Back',
+              _copySession.isPasting ? null : _goBackFromConflictPrompt,
+            ),
+          ],
         );
       case _CopyPanelStep.chooseConflictScope:
         final conflictCount = _copySession.conflicts.length;
@@ -3597,10 +4293,21 @@ class StorageTabState extends ConsumerState<StorageTab>
     ref.listen<bool>(foldersFirstProvider, (previous, next) {
       if (_dir != null) _applyEffectiveSort(_currentRules());
     });
+    ref.listen<List<FileTypeCategory>>(fileTypeCategoriesProvider, (
+      previous,
+      next,
+    ) {
+      if ((!widget.documentOnly && !widget.imageOnly) || _dir == null) return;
+      _imageContentCache.removeWhere((key, _) => key.startsWith('documents:'));
+      _imageContentCache.clear();
+      _itemCountCache.clear();
+      _loadRoot(_dir!.path, forceRefresh: true);
+    });
     ref.listen<AppSettings>(appSettingsProvider, (previous, next) {
       if (previous?.showHiddenFiles != next.showHiddenFiles ||
           previous?.showNomediaFiles != next.showNomediaFiles) {
         _directoryCache.clear();
+        _imageContentCache.clear();
         _subfolderCache.clear();
         _itemCountCache.clear();
         if (_dir != null) _loadRoot(_dir!.path, forceRefresh: true);
@@ -3610,7 +4317,13 @@ class StorageTabState extends ConsumerState<StorageTab>
     return Scaffold(
       appBar: AppBar(
         toolbarHeight: kToolbarHeight * 0.80,
-        leading: _selectionMode
+        leading: _showBreadcrumbPath
+            ? IconButton(
+                icon: const Icon(Icons.arrow_back),
+                tooltip: 'Close path',
+                onPressed: () => setState(() => _showBreadcrumbPath = false),
+              )
+            : _selectionMode
             ? IconButton(
                 icon: const Icon(Icons.arrow_back),
                 onPressed: () {
@@ -3634,10 +4347,26 @@ class StorageTabState extends ConsumerState<StorageTab>
                 '${_selected.length} selected',
                 style: const TextStyle(fontSize: 19),
               )
-            : MarqueeText(
-                _dir == null ? 'Storage' : _displayName(_dir!.path),
-                style: const TextStyle(fontSize: 19),
-                styleMode: MarqueeStyle.pauseAndLoop,
+            : _showBreadcrumbPath
+            ? _breadcrumbTitle()
+            : SizedBox(
+                width: double.infinity,
+                child: InkWell(
+                  onTap: _dir == null
+                      ? null
+                      : () => setState(() => _showBreadcrumbPath = true),
+                  child: SizedBox(
+                    height: kToolbarHeight * 0.8,
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: MarqueeText(
+                        _dir == null ? 'Storage' : _displayName(_dir!.path),
+                        style: const TextStyle(fontSize: 19),
+                        styleMode: MarqueeStyle.pauseAndLoop,
+                      ),
+                    ),
+                  ),
+                ),
               ),
         actions: [
           if (!_selectionMode)
@@ -3647,44 +4376,106 @@ class StorageTabState extends ConsumerState<StorageTab>
               constraints: const BoxConstraints(),
               onPressed: _dir == null
                   ? null
-                  : () => _loadRoot(_dir!.path, forceRefresh: true),
+                  : () {
+                      if (_showBreadcrumbPath) {
+                        setState(() => _showBreadcrumbPath = false);
+                      }
+                      _loadRoot(
+                        _dir!.path,
+                        forceRefresh: true,
+                        userInitiatedRefresh: true,
+                      );
+                    },
               icon: const Icon(Icons.refresh),
             ),
-          IconButton(
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(),
-            onPressed: () {},
-            icon: const Icon(Icons.search),
-          ),
+          if (!_selectionMode)
+            SearchActionButton(
+              sessionId: widget.searchSessionId,
+              scope: _searchScope(),
+              onResultSelected: (result) async {
+                if (!mounted) return;
+                if (result.isDirectory) {
+                  _breadcrumbReturnPaths.clear();
+                  _reportCurrentLocation(result.path);
+                  await _loadRoot(result.path, forceRefresh: true);
+                } else {
+                  await _openFileWithDetectedCategory(File(result.path));
+                }
+              },
+              key: const ValueKey('storage-search-action'),
+            ),
           PopupMenuButton<String>(
             key: _menuKey,
             padding: EdgeInsets.zero,
             icon: const Icon(Icons.more_vert),
+            onOpened: () {
+              if (_showBreadcrumbPath) {
+                setState(() => _showBreadcrumbPath = false);
+              }
+            },
             onSelected: _handleMenu,
             itemBuilder: (_) => _menuItems(),
           ),
         ],
       ),
-      body: _dir == null
-          ? const Center(child: CircularProgressIndicator())
-          : settings.defaultViewMode == 'grid'
-          ? GridView.builder(
-              padding: const EdgeInsets.all(8),
-              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 220,
-                mainAxisExtent: 70.4,
-                crossAxisSpacing: 8,
-                mainAxisSpacing: 8,
+      body: Listener(
+        onPointerDown: (_) {
+          if (_showBreadcrumbPath) {
+            setState(() => _showBreadcrumbPath = false);
+          }
+        },
+        child: _dir == null
+            ? const Center(child: CircularProgressIndicator())
+            : LayoutBuilder(
+                builder: (context, constraints) {
+                  final isGrid = settings.defaultViewMode == 'grid';
+                  if (isGrid) {
+                    final crossAxisExtent = constraints.maxWidth - 16;
+                    _gridColumnCount = (crossAxisExtent / (220 + 8))
+                        .ceil()
+                        .clamp(1, 1000)
+                        .toInt();
+                  }
+                  final list = isGrid
+                      ? GridView.builder(
+                          controller: _listScrollController,
+                          padding: const EdgeInsets.all(8),
+                          gridDelegate:
+                              const SliverGridDelegateWithMaxCrossAxisExtent(
+                                maxCrossAxisExtent: 220,
+                                mainAxisExtent: 70.4,
+                                crossAxisSpacing: 8,
+                                mainAxisSpacing: 8,
+                              ),
+                          itemCount: _displayItems.length,
+                          itemBuilder: (context, index) => _buildStorageItem(
+                            _displayItems[index],
+                            settings,
+                            grid: true,
+                          ),
+                        )
+                      : ListView.builder(
+                          controller: _listScrollController,
+                          itemExtent: _detailsEnabled(settings) ? 56 : 44,
+                          itemCount: _displayItems.length,
+                          itemBuilder: (context, index) =>
+                              _buildStorageItem(_displayItems[index], settings),
+                        );
+                  final restoring = _pendingScrollRestore != null;
+                  return Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      IgnorePointer(
+                        ignoring: restoring,
+                        child: Opacity(opacity: restoring ? 0 : 1, child: list),
+                      ),
+                      if (restoring)
+                        const Center(child: CircularProgressIndicator()),
+                    ],
+                  );
+                },
               ),
-              itemCount: _items.length,
-              itemBuilder: (context, index) =>
-                  _buildStorageItem(_items[index], settings, grid: true),
-            )
-          : ListView.builder(
-              itemCount: _items.length,
-              itemBuilder: (context, index) =>
-                  _buildStorageItem(_items[index], settings),
-            ),
+      ),
     );
   }
 
@@ -3694,12 +4485,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     bool grid = false,
   }) {
     final name = _displayName(entity.path);
-    final canShowDateTime = settings.defaultViewMode != 'grid';
-    final detailsEnabled =
-        (canShowDateTime &&
-            (settings.showModifiedDate || settings.showModifiedTime)) ||
-        settings.showFolderItemCount ||
-        settings.showFileSize;
+    final detailsEnabled = _detailsEnabled(settings);
     final leading = _selectionMode
         ? Row(
             mainAxisSize: MainAxisSize.min,
@@ -3716,40 +4502,20 @@ class StorageTabState extends ConsumerState<StorageTab>
         : _storageItemLeading(entity);
     final text = _storageItemText(entity, name, settings, detailsEnabled);
 
-    final Widget content = grid
-        ? Card(
-            margin: EdgeInsets.zero,
-            color: _selected.contains(entity.path)
-                ? Theme.of(context).colorScheme.secondaryContainer
-                : null,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Row(
-                children: [
-                  leading,
-                  const SizedBox(width: 8),
-                  Expanded(child: text),
-                ],
-              ),
-            ),
-          )
-        : ListTile(
-            selected: _selected.contains(entity.path),
-            onTap: null,
-            dense: true,
-            visualDensity: const VisualDensity(vertical: -1),
-            minVerticalPadding: 2,
-            horizontalTitleGap: 12,
-            leading: leading,
-            title: detailsEnabled ? SizedBox(height: 52, child: text) : text,
-          );
+    final content = StorageEntryRow(
+      leading: leading,
+      content: text,
+      selected: _selected.contains(entity.path),
+      detailsEnabled: detailsEnabled,
+      grid: grid,
+    );
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTapDown: (_) {
         _longPressTriggered = false;
         _pressTimer?.cancel();
-        _pressTimer = Timer(const Duration(milliseconds: 500), () {
+        _pressTimer = Timer(const Duration(milliseconds: 1250), () {
           if (!mounted) return;
           setState(() {
             _selectionMode = true;
@@ -3770,7 +4536,24 @@ class StorageTabState extends ConsumerState<StorageTab>
     );
   }
 
+  bool _detailsEnabled(AppSettings settings) =>
+      (settings.defaultViewMode != 'grid' &&
+          (settings.showModifiedDate || settings.showModifiedTime)) ||
+      settings.showFolderItemCount ||
+      settings.showFileSize;
+
   Widget _storageItemLeading(FileSystemEntity entity) {
+    if (widget.documentOnly && entity is File) {
+      final extension = _fileExtension(_displayName(entity.path)).toLowerCase();
+      final icon = switch (extension) {
+        '.pdf' => Icons.picture_as_pdf_outlined,
+        '.doc' || '.docx' || '.odt' || '.rtf' => Icons.description_outlined,
+        '.xls' || '.xlsx' || '.ods' || '.csv' => Icons.table_chart_outlined,
+        '.ppt' || '.pptx' || '.odp' => Icons.slideshow_outlined,
+        _ => Icons.insert_drive_file_outlined,
+      };
+      return Icon(icon, size: 24);
+    }
     if (entity is File &&
         FileTypeCategory.categoryForExtension(
               _fileExtension(_displayName(entity.path)).toLowerCase(),
@@ -3839,7 +4622,7 @@ class StorageTabState extends ConsumerState<StorageTab>
                   : entity is File && settings.showFileSize
                   ? _metadataText(
                       _statFor(entity),
-                      (stat) => _formatFileSize(stat.size),
+                      (stat) => formatBytes(stat.size),
                       mutedStyle,
                       alignment: Alignment.centerLeft,
                     )
@@ -3906,26 +4689,86 @@ class StorageTabState extends ConsumerState<StorageTab>
 
   void _invalidateMetadataCache(String directoryPath) {
     final normalized = _normalizedPath(directoryPath);
+    _imageContentCache.clear();
+    _directoryCache.removeWhere((key, _) {
+      final candidate = _normalizedPath(
+        key.startsWith('imageStorage:')
+            ? key.substring('imageStorage:'.length)
+            : key.startsWith('documentStorage:')
+            ? key.substring('documentStorage:'.length)
+            : key,
+      );
+      return candidate == normalized ||
+          candidate.startsWith('$normalized${Platform.pathSeparator}');
+    });
     _statCache.removeWhere((path, _) {
       final candidate = _normalizedPath(path);
       return candidate == normalized || candidate.startsWith('$normalized/');
     });
-    _itemCountCache.remove(directoryPath);
+    _itemCountCache.removeWhere(
+      (key, _) => _normalizedPath(_itemCountCachePath(key)) == normalized,
+    );
   }
 
-  Future<int> _itemCountFor(Directory directory, AppSettings settings) =>
-      _itemCountCache.putIfAbsent(directory.path, () async {
-        if (!settings.showNomediaFiles &&
-            await _isInsideNoMediaDirectory(directory)) {
-          return 0;
-        }
-        final children = await directory.list(followLinks: false).toList();
-        return children.where((child) {
-          final name = _displayName(child.path);
-          if (name == '.nomedia' && settings.showNomediaFiles) return true;
-          return settings.showHiddenFiles || !name.startsWith('.');
-        }).length;
+  String _itemCountCachePath(String key) {
+    for (final prefix in const ['all:', 'images:', 'documents:']) {
+      if (key.startsWith(prefix)) return key.substring(prefix.length);
+    }
+    return key;
+  }
+
+  Future<int> _itemCountFor(Directory directory, AppSettings settings) {
+    final category = widget.documentOnly
+        ? 'documents'
+        : widget.imageOnly
+        ? 'images'
+        : 'all';
+    final countCacheKey = '$category:${directory.path}';
+    return _itemCountCache.putIfAbsent(countCacheKey, () async {
+      if (!settings.showNomediaFiles &&
+          await _isInsideNoMediaDirectory(directory)) {
+        return 0;
+      }
+      final children = await directory.list(followLinks: false).toList();
+      final visibleChildren = children.where((child) {
+        final name = _displayName(child.path);
+        if (name == '.nomedia' && settings.showNomediaFiles) return true;
+        return settings.showHiddenFiles || !name.startsWith('.');
       });
+
+      if (!widget.imageOnly && !widget.documentOnly) {
+        return visibleChildren.length;
+      }
+
+      final documentExtensions = widget.documentOnly
+          ? (ref
+                        .read(fileTypeCategoriesProvider)
+                        .where((category) => category.name == 'Documents')
+                        .firstOrNull
+                        ?.extensions ??
+                    FileTypeCategory.documentsExtensions)
+                .toSet()
+          : const <String>{};
+      var count = 0;
+      for (final child in visibleChildren) {
+        if (child is File) {
+          final extension = _fileExtension(
+            _displayName(child.path),
+          ).toLowerCase();
+          final matches = widget.documentOnly
+              ? documentExtensions.contains(extension)
+              : _isImageFile(child);
+          if (matches) count++;
+        } else if (child is Directory) {
+          final containsMatch = widget.documentOnly
+              ? await _containsDocument(child, documentExtensions)
+              : await _containsImage(child);
+          if (containsMatch) count++;
+        }
+      }
+      return count;
+    });
+  }
 
   Future<bool> _isInsideNoMediaDirectory(Directory directory) async {
     final path = _normalizedPath(directory.path);
@@ -3969,17 +4812,93 @@ class StorageTabState extends ConsumerState<StorageTab>
       '${modified.hour.toString().padLeft(2, '0')}:'
       '${modified.minute.toString().padLeft(2, '0')}';
 
-  String _formatFileSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    final kb = bytes / 1024;
-    if (kb < 1024) return '${kb.toStringAsFixed(1)} KB';
-    final mb = kb / 1024;
-    if (mb < 1024) return '${mb.toStringAsFixed(1)} MB';
-    return '${(mb / 1024).toStringAsFixed(1)} GB';
+  @override
+  bool get wantKeepAlive => true;
+}
+
+class _BreadcrumbTitle extends StatefulWidget {
+  const _BreadcrumbTitle({required this.segments, required this.onTap});
+
+  final List<MapEntry<String, String>> segments;
+  final ValueChanged<String> onTap;
+
+  @override
+  State<_BreadcrumbTitle> createState() => _BreadcrumbTitleState();
+}
+
+class _BreadcrumbTitleState extends State<_BreadcrumbTitle> {
+  late List<TapGestureRecognizer> _recognizers;
+
+  @override
+  void initState() {
+    super.initState();
+    _recognizers = _createRecognizers();
   }
 
   @override
-  bool get wantKeepAlive => true;
+  void didUpdateWidget(covariant _BreadcrumbTitle oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final segmentsChanged = oldWidget.segments.length != widget.segments.length
+        ? true
+        : List.generate(
+            oldWidget.segments.length,
+            (index) =>
+                oldWidget.segments[index].key != widget.segments[index].key ||
+                oldWidget.segments[index].value != widget.segments[index].value,
+          ).contains(true);
+    if (segmentsChanged) {
+      _disposeRecognizers();
+      _recognizers = _createRecognizers();
+    }
+  }
+
+  List<TapGestureRecognizer> _createRecognizers() => [
+    for (final segment in widget.segments)
+      TapGestureRecognizer()..onTap = () => widget.onTap(segment.key),
+  ];
+
+  void _disposeRecognizers() {
+    for (final recognizer in _recognizers) {
+      recognizer.dispose();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final segments = widget.segments;
+    final textSpan = TextSpan(
+      style: const TextStyle(fontSize: 16),
+      children: [
+        for (var index = 0; index < segments.length; index++) ...[
+          if (index > 0) const TextSpan(text: ' / '),
+          TextSpan(
+            text: segments[index].value,
+            recognizer: _recognizers[index],
+          ),
+        ],
+      ],
+    );
+    final label = segments.map((segment) => segment.value).join(' / ');
+    return SizedBox(
+      height: kToolbarHeight * 0.8,
+      width: double.infinity,
+      child: Center(
+        child: MarqueeText(
+          label,
+          textSpan: textSpan,
+          style: const TextStyle(fontSize: 16),
+          styleMode: MarqueeStyle.pauseAndLoop,
+          isManuallyScrollable: true,
+        ),
+      ),
+    );
+  }
 }
 
 class _BatchTextDialog extends StatefulWidget {

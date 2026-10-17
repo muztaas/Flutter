@@ -7,6 +7,24 @@ class FileTypeCategory {
   final String name;
   final List<String> extensions;
 
+  static const documentsExtensions = <String>[
+    '.pdf',
+    '.doc',
+    '.docx',
+    '.xls',
+    '.xlsx',
+    '.ppt',
+    '.pptx',
+    '.odt',
+    '.ods',
+    '.odp',
+    '.rtf',
+    '.epub',
+    '.txt',
+    '.csv',
+    '.md',
+  ];
+
   static const defaults = <FileTypeCategory>[
     FileTypeCategory(
       name: 'Text',
@@ -99,6 +117,10 @@ class FileTypeCategory {
         '.cbz',
         '.cbr',
       ],
+    ),
+    FileTypeCategory(
+      name: 'Documents',
+      extensions: documentsExtensions,
     ),
   ];
 

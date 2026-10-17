@@ -8,6 +8,7 @@ class SortRule {
   final String id;
   final SortScope scope;
   final String? targetPath;
+  final String? targetDriveId;
   final bool recursive;
   final SortField field;
   final SortOrder order;
@@ -20,6 +21,7 @@ class SortRule {
     required this.order,
     required this.updatedAt,
     this.targetPath,
+    this.targetDriveId,
     this.recursive = false,
   });
 
@@ -28,6 +30,7 @@ class SortRule {
     required SortField field,
     required SortOrder order,
     String? targetPath,
+    String? targetDriveId,
     bool recursive = false,
     DateTime? updatedAt,
   }) {
@@ -36,13 +39,16 @@ class SortRule {
         : normalizeSortPath(targetPath);
     final id = switch (scope) {
       SortScope.all => 'all',
-      SortScope.drive => 'drive:$normalizedTarget',
+      SortScope.drive => targetDriveId == null
+          ? 'drive:$normalizedTarget'
+          : 'drive-id:$targetDriveId',
       SortScope.folder => 'folder:$normalizedTarget',
     };
     return SortRule(
       id: id,
       scope: scope,
       targetPath: normalizedTarget,
+      targetDriveId: scope == SortScope.drive ? targetDriveId : null,
       recursive: scope == SortScope.folder && recursive,
       field: field,
       order: order,
@@ -54,6 +60,7 @@ class SortRule {
     'id': id,
     'scope': scope.name,
     'targetPath': targetPath,
+    'targetDriveId': targetDriveId,
     'recursive': recursive,
     'field': field.name,
     'order': order.name,
@@ -64,6 +71,7 @@ class SortRule {
     id: json['id'] as String,
     scope: SortScope.values.byName(json['scope'] as String),
     targetPath: json['targetPath'] as String?,
+    targetDriveId: json['targetDriveId'] as String?,
     recursive: json['recursive'] as bool? ?? false,
     field: SortField.values.byName(json['field'] as String),
     order: SortOrder.values.byName(json['order'] as String),

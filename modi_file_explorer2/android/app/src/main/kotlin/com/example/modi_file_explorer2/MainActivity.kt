@@ -336,6 +336,7 @@ class MainActivity : FlutterActivity() {
 						if (directory == null || !directory.exists()) return@mapNotNull null
 						mapOf(
 							"path" to directory.absolutePath,
+							"uuid" to volume.uuid,
 							"description" to (volume.getDescription(this) ?: "Storage"),
 							"isPrimary" to volume.isPrimary,
 							"isRemovable" to volume.isRemovable,

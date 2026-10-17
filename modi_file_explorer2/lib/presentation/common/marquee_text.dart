@@ -30,10 +30,12 @@ class MarqueeVisibility extends InheritedWidget {
 
 class MarqueeText extends StatefulWidget {
   final String text;
+  final InlineSpan? textSpan;
   final TextStyle? style;
   final TextAlign textAlign;
   final MarqueeStyle styleMode;
   final bool isActive;
+  final bool isManuallyScrollable;
 
   const MarqueeText(
     this.text, {
@@ -42,6 +44,8 @@ class MarqueeText extends StatefulWidget {
     this.textAlign = TextAlign.start,
     this.styleMode = MarqueeStyle.continuousLoop,
     this.isActive = true,
+    this.isManuallyScrollable = false,
+    this.textSpan,
   });
 
   @override
@@ -57,6 +61,7 @@ class _MarqueeTextState extends State<MarqueeText>
   bool _pageIsVisible = true;
   bool _shouldScroll = false;
   bool _animationRequested = false;
+  double _dragOffset = 0;
   Duration? _configuredDuration;
 
   bool get _canAnimate => widget.isActive && _appIsResumed && _pageIsVisible;
@@ -75,9 +80,15 @@ class _MarqueeTextState extends State<MarqueeText>
   void didUpdateWidget(covariant MarqueeText oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.text != widget.text ||
+        oldWidget.textSpan?.toPlainText() != widget.textSpan?.toPlainText()) {
+      _dragOffset = 0;
+    }
+    if (oldWidget.text != widget.text ||
+        oldWidget.textSpan?.toPlainText() != widget.textSpan?.toPlainText() ||
         oldWidget.style != widget.style ||
         oldWidget.styleMode != widget.styleMode ||
-        oldWidget.isActive != widget.isActive) {
+        oldWidget.isActive != widget.isActive ||
+        oldWidget.isManuallyScrollable != widget.isManuallyScrollable) {
       _resetAnimation();
     }
   }
@@ -138,8 +149,10 @@ class _MarqueeTextState extends State<MarqueeText>
 
     return LayoutBuilder(
       builder: (context, constraints) {
+        final textSpan =
+            widget.textSpan ?? TextSpan(text: widget.text, style: textStyle);
         final painter = TextPainter(
-          text: TextSpan(text: widget.text, style: textStyle),
+          text: textSpan,
           maxLines: 1,
           textDirection: Directionality.of(context),
         )..layout(minWidth: 0, maxWidth: double.infinity);
@@ -150,14 +163,7 @@ class _MarqueeTextState extends State<MarqueeText>
           _resetAnimation();
         }
         if (!shouldScroll) {
-          return Text(
-            widget.text,
-            style: textStyle,
-            textAlign: widget.textAlign,
-            maxLines: 1,
-            overflow: TextOverflow.visible,
-            softWrap: false,
-          );
+          return _buildText(textSpan, painter.width, textStyle);
         }
 
         final cycleWidth = painter.width + _gap;
@@ -181,33 +187,56 @@ class _MarqueeTextState extends State<MarqueeText>
         return ClipRect(
           child: SizedBox(
             width: constraints.maxWidth,
-            child: AnimatedBuilder(
-              animation: _controller,
-              builder: (context, _) {
-                final progress = _scrollProgress(duration);
-                final offset = -cycleWidth * progress;
-                return SizedBox(
-                  width: constraints.maxWidth,
-                  height: painter.height,
-                  child: ClipRect(
-                    child: Stack(
-                      clipBehavior: Clip.hardEdge,
-                      children: [
-                        Positioned(
-                          left: offset,
-                          top: 0,
-                          child: _buildText(painter.width, textStyle),
-                        ),
-                        Positioned(
-                          left: offset + cycleWidth,
-                          top: 0,
-                          child: _buildText(painter.width, textStyle),
-                        ),
-                      ],
+            child: GestureDetector(
+              onHorizontalDragUpdate: widget.isManuallyScrollable
+                  ? (details) {
+                      setState(() {
+                        _dragOffset = _wrapOffset(
+                          _dragOffset + details.delta.dx,
+                          cycleWidth,
+                        );
+                      });
+                    }
+                  : null,
+              child: AnimatedBuilder(
+                animation: _controller,
+                builder: (context, _) {
+                  final progress = _scrollProgress(duration);
+                  final offset = _wrapOffset(
+                    -cycleWidth * progress + _dragOffset,
+                    cycleWidth,
+                  );
+                  return SizedBox(
+                    width: constraints.maxWidth,
+                    height: painter.height,
+                    child: ClipRect(
+                      child: Stack(
+                        clipBehavior: Clip.hardEdge,
+                        children: [
+                          Positioned(
+                            left: offset,
+                            top: 0,
+                            child: _buildText(
+                              textSpan,
+                              painter.width,
+                              textStyle,
+                            ),
+                          ),
+                          Positioned(
+                            left: offset + cycleWidth,
+                            top: 0,
+                            child: _buildText(
+                              textSpan,
+                              painter.width,
+                              textStyle,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                );
-              },
+                  );
+                },
+              ),
             ),
           ),
         );
@@ -227,12 +256,19 @@ class _MarqueeTextState extends State<MarqueeText>
     );
   }
 
-  Widget _buildText(double width, TextStyle? style) {
+  double _wrapOffset(double offset, double cycleWidth) {
+    final wrapped = offset % cycleWidth;
+    if (wrapped == 0) return -cycleWidth;
+    return wrapped > 0 ? wrapped - cycleWidth : wrapped;
+  }
+
+  Widget _buildText(InlineSpan span, double width, TextStyle? style) {
     return SizedBox(
       width: width,
-      child: Text(
-        widget.text,
+      child: Text.rich(
+        span,
         style: style,
+        textAlign: widget.textAlign,
         maxLines: 1,
         overflow: TextOverflow.visible,
         softWrap: false,

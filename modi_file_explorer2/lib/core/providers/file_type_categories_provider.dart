@@ -45,12 +45,25 @@ class FileTypeCategoriesController
   }
 
   List<FileTypeCategory> _normalize(List<FileTypeCategory> categories) {
-    final usedExtensions = <String>{};
+    final ownersByExtension = <String, Set<String>>{};
     return categories.map((category) {
       final extensions = category.extensions
           .map(FileTypeCategory.normalizeExtension)
           .where((extension) => extension.isNotEmpty)
-          .where(usedExtensions.add)
+          .where((extension) {
+            final owners = ownersByExtension.putIfAbsent(
+              extension,
+              () => <String>{},
+            );
+            final overlapsTextAndDocuments =
+                (category.name == 'Text' &&
+                    owners.every((owner) => owner == 'Documents')) ||
+                (category.name == 'Documents' &&
+                    owners.every((owner) => owner == 'Text'));
+            if (owners.isNotEmpty && !overlapsTextAndDocuments) return false;
+            owners.add(category.name);
+            return true;
+          })
           .toList()
         ..sort();
       return FileTypeCategory(name: category.name, extensions: extensions);

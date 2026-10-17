@@ -14,6 +14,8 @@ class AppSettings {
     this.showModifiedTime = false,
     this.showFolderItemCount = false,
     this.showFileSize = false,
+    this.closeAllTabsOnExit = false,
+    this.includeOtherStorageDrivesInRecent = false,
   });
 
   final bool darkTheme;
@@ -27,6 +29,8 @@ class AppSettings {
   final bool showModifiedTime;
   final bool showFolderItemCount;
   final bool showFileSize;
+  final bool closeAllTabsOnExit;
+  final bool includeOtherStorageDrivesInRecent;
 
   double get textSizeOffset => switch (fontSize) {
     'small' => -1,
@@ -46,6 +50,8 @@ class AppSettings {
     bool? showModifiedTime,
     bool? showFolderItemCount,
     bool? showFileSize,
+    bool? closeAllTabsOnExit,
+    bool? includeOtherStorageDrivesInRecent,
   }) => AppSettings(
     darkTheme: darkTheme ?? this.darkTheme,
     fontSize: fontSize ?? this.fontSize,
@@ -60,6 +66,10 @@ class AppSettings {
     showModifiedTime: showModifiedTime ?? this.showModifiedTime,
     showFolderItemCount: showFolderItemCount ?? this.showFolderItemCount,
     showFileSize: showFileSize ?? this.showFileSize,
+    closeAllTabsOnExit: closeAllTabsOnExit ?? this.closeAllTabsOnExit,
+    includeOtherStorageDrivesInRecent:
+        includeOtherStorageDrivesInRecent ??
+        this.includeOtherStorageDrivesInRecent,
   );
 
   static AppSettings fromPreferences(SharedPreferences preferences) {
@@ -94,6 +104,11 @@ class AppSettings {
       showFolderItemCount:
           preferences.getBool('settings.showFolderItemCount') ?? false,
       showFileSize: preferences.getBool('settings.showFileSize') ?? false,
+      closeAllTabsOnExit:
+          preferences.getBool('settings.closeAllTabsOnExit') ?? false,
+      includeOtherStorageDrivesInRecent:
+          preferences.getBool('settings.includeOtherStorageDrivesInRecent') ??
+          false,
     );
   }
 }
@@ -169,6 +184,18 @@ class AppSettingsController extends StateNotifier<AppSettings> {
     state = state.copyWith(showFileSize: value);
     final preferences = await SharedPreferences.getInstance();
     await preferences.setBool('settings.showFileSize', value);
+  }
+
+  Future<void> setCloseAllTabsOnExit(bool value) async {
+    state = state.copyWith(closeAllTabsOnExit: value);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool('settings.closeAllTabsOnExit', value);
+  }
+
+  Future<void> setIncludeOtherStorageDrivesInRecent(bool value) async {
+    state = state.copyWith(includeOtherStorageDrivesInRecent: value);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setBool('settings.includeOtherStorageDrivesInRecent', value);
   }
 }
 

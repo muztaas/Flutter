@@ -1,0 +1,68 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Android APK",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"build",
+				"apk",
+				"--debug"
+			],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Test Sort Scope Menus",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"test",
+				"--reporter",
+				"expanded",
+				"--timeout",
+				"30s",
+				"test/sort_scope_menu_test.dart"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Run Flutter Test Suite",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"test",
+				"--reporter",
+				"expanded",
+				"--timeout",
+				"60s"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Analyze Flutter Workspace",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"analyze"
+			],
+			"problemMatcher": []
+		},
+		{
+			"label": "Test Restart Persistence",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"test",
+				"--reporter",
+				"expanded",
+				"--timeout",
+				"60s",
+				"test/sort_rules_persistence_test.dart",
+				"test/tabs_restore_test.dart"
+			],
+			"problemMatcher": []
+		}
+	]
+}
