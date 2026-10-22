@@ -34,6 +34,16 @@ class _AboutPageState extends State<AboutPage> {
               Text('Modi File Explorer', style: Theme.of(context).textTheme.headlineSmall),
               const SizedBox(height: 8),
               Text('Version $_version', style: Theme.of(context).textTheme.bodyMedium),
+              const SizedBox(height: 16),
+              OutlinedButton.icon(
+                onPressed: () => showLicensePage(
+                  context: context,
+                  applicationName: 'Modi File Explorer',
+                  applicationVersion: _version,
+                ),
+                icon: const Icon(Icons.description_outlined),
+                label: const Text('Open source licenses'),
+              ),
             ],
           ),
         ),

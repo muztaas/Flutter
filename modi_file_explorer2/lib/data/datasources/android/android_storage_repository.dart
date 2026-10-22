@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:disk_space_2/disk_space_2.dart';
 import 'package:flutter/services.dart';
 
 import '../../../domain/entities/storage_device.dart';
 import '../../../domain/entities/file_system_entry.dart';
 import '../../../domain/repositories/storage_repository.dart';
+import '../../../domain/utils/storage_display_name.dart';
 
 class AndroidStorageRepositoryImpl implements StorageRepository {
   AndroidStorageRepositoryImpl();
@@ -33,7 +35,9 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
   }
 
   @override
-  Future<List<StorageDevice>> listStorageDevices() async {
+  Future<List<StorageDevice>> listStorageDevices({
+    bool includeUsage = true,
+  }) async {
     final List<StorageDevice> devices = [];
 
     try {
@@ -43,7 +47,6 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
               'listStorageVolumes',
             ) ??
             [];
-        var externalIndex = 0;
         for (final raw in rawVolumes) {
           final volume = Map<String, dynamic>.from(raw as Map);
           final path = volume['path'] as String?;
@@ -52,18 +55,22 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
           final isRemovable = volume['isRemovable'] == true;
           if (!isPrimary && !isRemovable) continue;
 
-          final currentExternalIndex = isPrimary ? null : externalIndex++;
+          final description = (volume['description'] as String?)?.trim();
           final name = isPrimary
               ? 'Internal Storage'
-              : ((volume['description'] as String?)?.trim().isNotEmpty == true
-                    ? volume['description'] as String
-                    : 'USB Drive ${(currentExternalIndex ?? 0) + 1}');
+              : description?.isNotEmpty == true
+              ? description!
+              : _fallbackDriveName(path);
           final uuid = (volume['uuid'] as String?)?.trim();
           final id = isPrimary
               ? 'internal'
               : uuid != null && uuid.isNotEmpty
               ? 'volume:${uuid.toLowerCase()}'
               : 'path:${path.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '')}';
+          if (!includeUsage) {
+            devices.add(StorageDevice(id: id, name: name, path: path));
+            continue;
+          }
           try {
             devices.add(await _deviceForPath(id: id, name: name, path: path));
           } catch (_) {
@@ -93,6 +100,14 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
     return devices;
   }
 
+  String _fallbackDriveName(String path) {
+    debugPrint(
+      '[AndroidStorageRepository] Using generic drive name for "$path" '
+      '(Android volume description unavailable).',
+    );
+    return 'USB Drive';
+  }
+
   @override
   Future<List<FileSystemEntry>> listDirectory(String path) async {
     final dir = Directory(path);
@@ -103,9 +118,7 @@ class AndroidStorageRepositoryImpl implements StorageRepository {
         final stat = await entity.stat();
         children.add(
           FileSystemEntry(
-            name: entity.uri.pathSegments.isNotEmpty
-                ? entity.uri.pathSegments.last
-                : entity.path,
+            name: storageDisplayName(path: entity.path),
             path: entity.path,
             isDirectory: stat.type == FileSystemEntityType.directory,
             size: stat.size,

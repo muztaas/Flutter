@@ -25,6 +25,14 @@ android {
         versionName = flutter.versionName
     }
 
+    dependencies {
+        implementation("androidx.media3:media3-exoplayer:1.9.2")
+        implementation("net.lingala.zip4j:zip4j:2.11.6")
+        implementation("org.apache.commons:commons-compress:1.28.0")
+        implementation("org.tukaani:xz:1.12")
+        implementation("com.github.junrar:junrar:8.1.2")
+    }
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.

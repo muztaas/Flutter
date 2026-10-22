@@ -33,13 +33,9 @@ dependencies:
   flutter_svg: ^2.0.6
   # package_info_plus removed to avoid version conflicts with device_info_plus
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
   flutter_riverpod: ^2.3.6
   permission_handler: ^13.0.1
   device_info_plus: ^13.2.0
-  go_router: ^17.5.0
   shared_preferences: ^2.5.5
   path_provider: ^2.1.6
   disk_space_2: ^1.0.13
@@ -102,6 +98,7 @@ flutter:
     - lib/assets/icons/app_icon.svg
     - assets/branding/logo2.png
     - assets/branding/logo_foreground.png
+    - assets/apache-2.0.txt
 
 flutter_icons:
   android: true

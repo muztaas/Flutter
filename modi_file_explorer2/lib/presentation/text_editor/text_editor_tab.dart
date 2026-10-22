@@ -18,6 +18,7 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
     with AutomaticKeepAliveClientMixin {
   TextEditingController? _controller;
   final FocusNode _focusNode = FocusNode();
+  final ScrollController _textScrollController = ScrollController();
   Object? _loadError;
   bool _loading = true;
   bool _saving = false;
@@ -40,6 +41,7 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
   void dispose() {
     _controller?.dispose();
     _focusNode.dispose();
+    _textScrollController.dispose();
     super.dispose();
   }
 
@@ -239,18 +241,24 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
                       ),
                     ),
                   )
-                : TextField(
-                    controller: _controller,
-                    focusNode: _focusNode,
-                    readOnly: !_editing,
-                    expands: true,
-                    minLines: null,
-                    maxLines: null,
-                    textAlignVertical: TextAlignVertical.top,
-                    keyboardType: TextInputType.multiline,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      alignLabelWithHint: true,
+                : Scrollbar(
+                    controller: _textScrollController,
+                    thumbVisibility: true,
+                    interactive: true,
+                    child: TextField(
+                      controller: _controller,
+                      focusNode: _focusNode,
+                      scrollController: _textScrollController,
+                      readOnly: !_editing,
+                      expands: true,
+                      minLines: null,
+                      maxLines: null,
+                      textAlignVertical: TextAlignVertical.top,
+                      keyboardType: TextInputType.multiline,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        alignLabelWithHint: true,
+                      ),
                     ),
                   ),
           ),

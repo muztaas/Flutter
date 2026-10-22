@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../core/utils/font_scaled_spacing.dart';
 
 class StorageEntryRow extends StatelessWidget {
   const StorageEntryRow({
@@ -31,11 +32,14 @@ class StorageEntryRow extends StatelessWidget {
         child: InkWell(
           onTap: onTap,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8),
+            padding: EdgeInsets.symmetric(
+              horizontal: fontScaledSpacing(context, 8),
+              vertical: fontScaledSpacing(context, 4),
+            ),
             child: Row(
               children: [
                 leading,
-                const SizedBox(width: 8),
+                SizedBox(width: fontScaledSpacing(context, 8)),
                 Expanded(child: content),
               ],
             ),
@@ -47,9 +51,8 @@ class StorageEntryRow extends StatelessWidget {
       selected: selected,
       onTap: onTap,
       dense: true,
-      visualDensity: const VisualDensity(vertical: -1),
-      minVerticalPadding: 2,
-      horizontalTitleGap: 12,
+      minVerticalPadding: fontScaledSpacing(context, 2),
+      horizontalTitleGap: fontScaledSpacing(context, 12),
       leading: leading,
       title: detailsEnabled
           ? SizedBox(height: detailsHeight, child: content)

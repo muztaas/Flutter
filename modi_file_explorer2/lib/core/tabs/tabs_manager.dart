@@ -5,11 +5,14 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../domain/entities/storage_device.dart';
+import '../../domain/utils/storage_display_name.dart';
 import '../../presentation/home/home_page.dart';
 import '../../presentation/apps/apps_tab.dart';
 import '../../presentation/storage/storage_tab.dart';
 import '../../presentation/text_editor/text_editor_tab.dart';
 import '../../presentation/image_viewer/image_viewer_tab.dart';
+import '../../presentation/archive/archive_manager_page.dart';
+import '../../presentation/video/video_tab.dart';
 
 int _tabInstanceSequence = 0;
 
@@ -34,24 +37,36 @@ class TabEntry {
   final Future<bool> Function()? saveChanges;
   TabEntry? returnToTab;
   final bool isImageViewer;
+  final bool isArchiveManager;
+  String? archivePath;
+  String archiveFolder;
   String? storagePath;
+  String? storageAnchorPath;
   String? driveId;
   String? driveRoot;
   bool imageOnly;
   bool documentOnly;
+  bool audioOnly;
+  bool archiveOnly;
   bool isDeferred;
   bool isFullscreen = false;
   bool isImageZoomed = false;
+  final bool isVideoPage;
+  String? videoDriveId;
+  String videoRelativePath;
   TabEntry({
     required this.id,
     required this.title,
     required this.pageBuilder,
     String? sessionId,
     this.storagePath,
+    this.storageAnchorPath,
     this.driveId,
     this.driveRoot,
     this.imageOnly = false,
     this.documentOnly = false,
+    this.audioOnly = false,
+    this.archiveOnly = false,
     this.isDeferred = false,
     this.bottomPanelBuilder,
     this.bottomPanelHeightBuilder,
@@ -61,6 +76,12 @@ class TabEntry {
     this.saveChanges,
     this.returnToTab,
     this.isImageViewer = false,
+    this.isArchiveManager = false,
+    this.archivePath,
+    this.archiveFolder = '',
+    this.isVideoPage = false,
+    this.videoDriveId,
+    this.videoRelativePath = '',
     this.initialImagePath,
     this.initialImagePaths,
     this.currentImagePath,
@@ -112,6 +133,80 @@ class TabsManager extends ChangeNotifier {
     return notice;
   }
 
+  void updateAvailableStorageDevices(List<StorageDevice> devices) {
+    _availableDevices = List.unmodifiable(devices);
+  }
+
+  void focusTabById(String id) {
+    final index = _tabs.indexWhere((tab) => tab.id == id);
+    if (index >= 0) goTo(index);
+  }
+
+  Future<void> openStartupPage(String pageId) async {
+    if (pageId == 'default' || pageId == 'home') {
+      goTo(0);
+      return;
+    }
+    if (pageId == 'video') {
+      openVideoTab();
+      return;
+    }
+    if (pageId == 'apps') {
+      openAppsTab();
+      return;
+    }
+    final devices = _availableDevices;
+    if (pageId == 'images' ||
+        pageId == 'documents' ||
+        pageId == 'audio' ||
+        pageId == 'archives' ||
+        pageId == 'downloads' ||
+        pageId == 'internal') {
+      final internal = devices.where((device) => device.id == 'internal').firstOrNull;
+      if (internal == null) return;
+      if (pageId == 'downloads') {
+        final downloadsPath = await _downloadsPath(internal.path);
+        if (downloadsPath != null) openStorageTab(downloadsPath, title: 'Downloads');
+      } else if (pageId == 'images') {
+        openStorageTab(internal.path, title: 'Images', imageOnly: true);
+      } else if (pageId == 'documents') {
+        openStorageTab(internal.path, title: 'Documents', documentOnly: true);
+      } else if (pageId == 'audio') {
+        openStorageTab(internal.path, title: 'Audio', audioOnly: true);
+      } else if (pageId == 'archives') {
+        openStorageTab(internal.path, title: 'Archives', archiveOnly: true);
+      } else {
+        openStorageTab(internal.path);
+      }
+      return;
+    }
+    if (pageId.startsWith('drive:')) {
+      final driveId = pageId.substring('drive:'.length);
+      final drive = devices.where((device) => device.id == driveId).firstOrNull;
+      if (drive != null) openStorageTab(drive.path, title: drive.name);
+    }
+  }
+
+  Future<String?> _downloadsPath(String rootPath) async {
+    try {
+      await for (final entry in Directory(rootPath).list(
+        followLinks: false,
+      )) {
+        if (entry is Directory &&
+            entry.uri.pathSegments
+                .where((segment) => segment.isNotEmpty)
+                .last
+                .toLowerCase() ==
+                'download') {
+          return entry.path;
+        }
+      }
+    } on FileSystemException catch (error) {
+      debugPrint('Could not locate the Downloads folder: $error');
+    }
+    return null;
+  }
+
   Future<List<String>> restorePersistedTabs({
     List<StorageDevice>? devices,
     bool closeAllTabsOnExit = false,
@@ -136,8 +231,16 @@ class TabsManager extends ChangeNotifier {
 
     _restoring = true;
     try {
-      final data = Map<String, dynamic>.from(jsonDecode(saved) as Map);
-      final rawItems = data['items'] as List<dynamic>? ?? const [];
+      final decoded = jsonDecode(saved);
+      if (decoded is! Map) {
+        throw const FormatException('Saved tab session is not an object');
+      }
+      final data = Map<String, dynamic>.from(decoded);
+      final rawItemsValue = data['items'];
+      final rawItems = rawItemsValue is List ? rawItemsValue : const [];
+      if (rawItemsValue != null && rawItemsValue is! List) {
+        failures.add('Saved tab records were invalid and were skipped.');
+      }
       final restoredTabs = <TabEntry>[_tabs.first];
       final savedIdToTab = <String, TabEntry>{'home': _tabs.first};
       final legacyIndexToTab = <int, TabEntry>{0: _tabs.first};
@@ -150,16 +253,51 @@ class TabsManager extends ChangeNotifier {
           failures.add('A tab record was invalid.');
           continue;
         }
-        final item = Map<String, dynamic>.from(raw);
+        final Map<String, dynamic> item;
+        try {
+          item = Map<String, dynamic>.from(raw);
+        } on TypeError {
+          failures.add('A tab record had invalid fields and was skipped.');
+          debugPrint('[TabsManager] Dropping saved tab with non-string keys.');
+          continue;
+        }
         final type = item['type'];
-        final title = item['title'] as String?;
-        final tabId = item['tabId'] is String
-            ? item['tabId'] as String
+        final validationError = _validateSavedTabRecord(item);
+        if (validationError != null) {
+          failures.add('${_savedTabLabel(item)}: $validationError');
+          debugPrint(
+            '[TabsManager] Dropping malformed saved tab record: $validationError',
+          );
+          continue;
+        }
+        final titleValue = item['title'];
+        final title = titleValue is String ? titleValue : null;
+        if (titleValue != null && title == null) {
+          debugPrint(
+            '[TabsManager] Repairing a saved tab with a non-string title.',
+          );
+        }
+        final savedTabId = item['tabId'];
+        var tabId = savedTabId is String && savedTabId.trim().isNotEmpty
+            ? savedTabId
             : _newTabInstanceId();
+        if (savedTabId != null && tabId != savedTabId) {
+          debugPrint(
+            '[TabsManager] Replacing an invalid saved tab identifier.',
+          );
+        }
+        if (savedIdToTab.containsKey(tabId)) {
+          debugPrint(
+            '[TabsManager] Replacing duplicate saved tab identifier "$tabId".',
+          );
+          tabId = _newTabInstanceId();
+        }
         TabEntry? tab;
         if (type == 'storage' ||
             type == 'imageStorage' ||
-            type == 'documentStorage') {
+            type == 'documentStorage' ||
+            type == 'audioStorage' ||
+            type == 'archiveStorage') {
           final location = _resolveStorageRecord(
             item,
             availableDevices,
@@ -175,14 +313,19 @@ class TabsManager extends ChangeNotifier {
               title: title,
               imageOnly: type == 'imageStorage',
               documentOnly: type == 'documentStorage',
+              audioOnly: type == 'audioStorage',
+              archiveOnly: type == 'archiveStorage',
               sessionId: tabId,
               driveId: location.driveId,
               driveRoot: location.driveRoot,
+              anchorPath: _resolveStorageAnchor(item, location),
               isDeferred: true,
               restoreRootPath: location.driveRoot,
             );
           }
-        } else if (type == 'textEditor' || type == 'imageViewer') {
+        } else if (type == 'textEditor' ||
+            type == 'imageViewer' ||
+            type == 'archiveManager') {
           if (type == 'imageViewer' && imageViewerCount >= maxImageViewerTabs) {
             failures.add(
               '${title ?? _savedTabLabel(item)}: image viewer limit reached.',
@@ -212,7 +355,7 @@ class TabsManager extends ChangeNotifier {
               sessionId: tabId,
               isDeferred: true,
             );
-          } else {
+          } else if (type == 'imageViewer') {
             imageViewerCount++;
             tab = _createImageViewerEntry(
               filePath,
@@ -221,6 +364,15 @@ class TabsManager extends ChangeNotifier {
             );
             pendingOrigins[tab] = item['originTabId'] as String?;
             pendingLegacyOrigins[tab] = item['originTabIndex'] as int?;
+          } else {
+            tab = _createArchiveManagerEntry(
+              filePath,
+              title: _validSavedTitle(title),
+              initialFolder: item['archiveFolder'] as String? ?? '',
+              sessionId: tabId,
+              isDeferred: true,
+            );
+            pendingOrigins[tab] = item['originTabId'] as String?;
           }
         } else if (type == 'apps') {
           late final TabEntry appsTab;
@@ -234,6 +386,29 @@ class TabsManager extends ChangeNotifier {
                 : const AppsTab(),
           );
           tab = appsTab;
+        } else if (type == 'video') {
+          final driveId = item['driveId'] as String? ?? 'internal';
+          final drive = _deviceById(driveId, availableDevices);
+          if (drive == null) {
+            failures.add('${title ?? 'Videos'}: drive unavailable.');
+          } else {
+            final relativePath = item['relativePath'] as String? ?? '';
+            if (relativePath
+                .replaceAll('\\', '/')
+                .split('/')
+                .any((segment) => segment == '.' || segment == '..')) {
+              failures.add(
+                '${title ?? 'Videos'}: saved folder path is invalid.',
+              );
+            } else {
+              tab = _createVideoEntry(
+                sessionId: tabId,
+                driveId: drive.id,
+                relativePath: relativePath,
+                isDeferred: true,
+              );
+            }
+          }
         } else {
           failures.add(
             '${title ?? _savedTabLabel(item)}: unsupported tab type.',
@@ -259,8 +434,18 @@ class TabsManager extends ChangeNotifier {
             restoredTabs.first;
       }
 
-      final savedActiveId = data['selectedTabId'] as String?;
-      final legacySelectedIndex = data['selectedIndex'] as int?;
+      final savedActiveId = data['selectedTabId'] is String
+          ? data['selectedTabId'] as String
+          : null;
+      final legacySelectedIndex = data['selectedIndex'] is int
+          ? data['selectedIndex'] as int
+          : null;
+      if (data['selectedTabId'] != null && savedActiveId == null ||
+          data['selectedIndex'] != null && legacySelectedIndex == null) {
+        debugPrint(
+          '[TabsManager] Ignoring malformed saved tab selection metadata.',
+        );
+      }
       final activeTab = savedActiveId != null
           ? savedIdToTab[savedActiveId]
           : legacySelectedIndex == null
@@ -293,11 +478,98 @@ class TabsManager extends ChangeNotifier {
 
   static const int maxImageViewerTabs = 5;
 
+  String? _validateSavedTabRecord(Map<String, dynamic> item) {
+    final type = item['type'];
+    const supportedTypes = {
+      'storage',
+      'imageStorage',
+      'documentStorage',
+      'audioStorage',
+      'archiveStorage',
+      'textEditor',
+      'imageViewer',
+      'archiveManager',
+      'apps',
+      'video',
+    };
+    if (type is! String || !supportedTypes.contains(type)) {
+      return 'unsupported tab type';
+    }
+
+    for (final key in const ['driveId', 'relativePath', 'path']) {
+      final value = item[key];
+      if (value != null && value is! String) {
+        return 'invalid $key';
+      }
+    }
+    if (type == 'storage' ||
+        type == 'imageStorage' ||
+        type == 'documentStorage' ||
+        type == 'audioStorage' ||
+        type == 'archiveStorage') {
+      final driveId = item['driveId'];
+      final path = item['path'];
+      if ((driveId == null || (driveId as String).trim().isEmpty) &&
+          (path == null || (path as String).trim().isEmpty)) {
+        return 'missing storage location';
+      }
+    } else if (type == 'textEditor' ||
+        type == 'imageViewer' ||
+        type == 'archiveManager') {
+      final driveId = item['driveId'];
+      final path = item['path'];
+      if ((driveId == null || (driveId as String).trim().isEmpty) &&
+          (path == null || (path as String).trim().isEmpty)) {
+        return 'missing file location';
+      }
+      if (driveId != null) {
+        final relativePath = item['relativePath'] as String?;
+        if (relativePath == null || relativePath.trim().isEmpty) {
+          return 'missing file path';
+        }
+      }
+      if (type == 'archiveManager') {
+        final folder = item['archiveFolder'];
+        if (folder != null && folder is! String) {
+          return 'invalid folder inside archive';
+        }
+        if (folder is String &&
+            folder
+                .replaceAll('\\', '/')
+                .split('/')
+                .any((segment) => segment == '.' || segment == '..')) {
+          return 'invalid folder inside archive';
+        }
+      }
+    } else if (type == 'video') {
+      final driveId = item['driveId'];
+      if (driveId != null && (driveId as String).trim().isEmpty) {
+        return 'invalid drive identifier';
+      }
+    }
+
+    final originTabId = item['originTabId'];
+    if (originTabId != null && originTabId is! String) {
+      return 'invalid origin tab identifier';
+    }
+    final originTabIndex = item['originTabIndex'];
+    if (originTabIndex != null && originTabIndex is! int) {
+      return 'invalid origin tab index';
+    }
+    return null;
+  }
+
   String _savedTabLabel(Map<String, dynamic> item) {
-    final path = item['path'] as String?;
-    if (path == null) return 'Tab';
-    final parts = path.split(RegExp(r'[/\\]')).where((part) => part.isNotEmpty);
-    return parts.isEmpty ? 'Tab' : parts.last;
+    final pathValue = item['path'];
+    if (pathValue is! String) return 'Tab';
+    final path = pathValue;
+    final isNumericRoot =
+        RegExp(r'^\d+$').hasMatch(_lastPathSegment(path, fallback: ''));
+    return storageDisplayName(
+      path: path,
+      isDriveRoot: isNumericRoot,
+      fallback: 'Tab',
+    );
   }
 
   String _normalizePath(String path) =>
@@ -338,6 +610,31 @@ class TabsManager extends ChangeNotifier {
       driveId: legacyDevice.id,
       driveRoot: legacyDevice.path,
     );
+  }
+
+  String _resolveStorageAnchor(
+    Map<String, dynamic> item,
+    StorageTabLocation location,
+  ) {
+    final relativeAnchor = item['anchorRelativePath'];
+    if (relativeAnchor is String) {
+      final anchor = _joinDrivePath(location.driveRoot, relativeAnchor);
+      if (anchor != null) return anchor;
+    }
+    if (item['title'] == 'Downloads') {
+      var current = Directory(location.path);
+      final root = _normalizePath(location.driveRoot);
+      while (_normalizePath(current.path) != root) {
+        final name = current.uri.pathSegments
+            .where((segment) => segment.isNotEmpty)
+            .lastOrNull;
+        if (name?.toLowerCase() == 'download') return current.path;
+        final parent = current.parent;
+        if (parent.path == current.path) break;
+        current = parent;
+      }
+    }
+    return location.driveRoot;
   }
 
   String? _resolveFileRecord(
@@ -393,28 +690,67 @@ class TabsManager extends ChangeNotifier {
     required String? title,
     required bool imageOnly,
     required bool documentOnly,
+    required bool audioOnly,
+    required bool archiveOnly,
     required String sessionId,
     required bool isDeferred,
     String? driveId,
     String? driveRoot,
+    String? anchorPath,
     String? restoreRootPath,
   }) {
     final key = GlobalKey<StorageTabState>();
     final copySessionOwner = Object();
+    final titleDrive =
+        (driveId == null ? null : _deviceById(driveId, _availableDevices)) ??
+        _deviceForAbsolutePath(path, _availableDevices);
+    final isDriveRoot =
+        (driveRoot != null && _normalizePath(path) == _normalizePath(driveRoot)) ||
+        (titleDrive != null &&
+            _normalizePath(path) == _normalizePath(titleDrive.path)) ||
+        (titleDrive == null &&
+            title == null &&
+            RegExp(r'^\d+$').hasMatch(_lastPathSegment(path, fallback: '')));
+    final categoryTitle = imageOnly
+        ? 'Images'
+        : documentOnly
+        ? 'Documents'
+        : audioOnly
+        ? 'Audio'
+        : archiveOnly
+        ? 'Archives'
+        : null;
+    final savedTitle = _validSavedTitle(title);
+    final resolvedTitle = categoryTitle != null
+        ? savedTitle ?? categoryTitle
+        : savedTitle ??
+              storageDisplayName(
+            path: path,
+            drive: titleDrive,
+            isDriveRoot: isDriveRoot,
+            fallback: title,
+          );
     late final TabEntry entry;
     entry = TabEntry(
       id: imageOnly
           ? 'imageStorage:$path'
           : documentOnly
           ? 'documentStorage:$path'
+          : audioOnly
+          ? 'audioStorage:$path'
+          : archiveOnly
+          ? 'archiveStorage:$path'
           : path,
-      title: title ?? _lastPathSegment(path, fallback: 'Storage'),
+      title: resolvedTitle,
       sessionId: sessionId,
       storagePath: path,
+      storageAnchorPath: anchorPath ?? path,
       driveId: driveId,
       driveRoot: driveRoot,
       imageOnly: imageOnly,
       documentOnly: documentOnly,
+      audioOnly: audioOnly,
+      archiveOnly: archiveOnly,
       isDeferred: isDeferred,
       pageBuilder: () => entry.isDeferred
           ? const _DeferredRestoredTab()
@@ -425,8 +761,11 @@ class TabsManager extends ChangeNotifier {
               displayName: entry.title,
               imageOnly: entry.imageOnly,
               documentOnly: entry.documentOnly,
+              audioOnly: entry.audioOnly,
+              archiveOnly: entry.archiveOnly,
               copySession: copySession,
               copySessionOwner: copySessionOwner,
+              initialAnchorPath: entry.storageAnchorPath,
               restoreRootPath: restoreRootPath,
               onPathChanged: (location) =>
                   updateStorageLocation(entry, location),
@@ -488,18 +827,18 @@ class TabsManager extends ChangeNotifier {
       pageBuilder: () => entry.isDeferred
           ? const _DeferredRestoredTab()
           : ImageViewerTab(
-          initialPath: entry.initialImagePath ?? path,
-          initialImagePaths: entry.initialImagePaths,
-          currentPath: entry.currentImagePath ?? path,
-          isFullscreen: entry.isFullscreen,
-          onFullscreenChanged: (isFullscreen) =>
-              setImageViewerFullscreen(entry, isFullscreen),
-          onZoomChanged: (isZoomed) =>
-              setImageViewerZoomed(entry, isZoomed),
-          onCurrentPathChanged: (currentPath) =>
-              updateImageViewerPath(entry, currentPath),
-          onBoundaryHandoff: (direction) =>
-              handOffImageViewerSwipe(entry, direction),
+              initialPath: entry.initialImagePath ?? path,
+              initialImagePaths: entry.initialImagePaths,
+              currentPath: entry.currentImagePath ?? path,
+              isFullscreen: entry.isFullscreen,
+              onFullscreenChanged: (isFullscreen) =>
+                  setImageViewerFullscreen(entry, isFullscreen),
+              onZoomChanged: (isZoomed) =>
+                  setImageViewerZoomed(entry, isZoomed),
+              onCurrentPathChanged: (currentPath) =>
+                  updateImageViewerPath(entry, currentPath),
+              onBoundaryHandoff: (direction) =>
+                  handOffImageViewerSwipe(entry, direction),
             ),
       onWillPop: () async {
         final index = _tabs.indexOf(entry);
@@ -511,9 +850,51 @@ class TabsManager extends ChangeNotifier {
     return entry;
   }
 
-  String _lastPathSegment(String path, {required String fallback}) {
-    final parts = path.split(RegExp(r'[/\\]')).where((part) => part.isNotEmpty);
-    return parts.isEmpty ? fallback : parts.last;
+  TabEntry _createVideoEntry({
+    required String sessionId,
+    required String driveId,
+    required String relativePath,
+    required bool isDeferred,
+  }) {
+    final key = GlobalKey<VideoTabState>();
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'video',
+      title: 'Videos',
+      sessionId: sessionId,
+      isDeferred: isDeferred,
+      isVideoPage: true,
+      videoDriveId: driveId,
+      videoRelativePath: relativePath,
+      pageBuilder: () => entry.isDeferred
+          ? const _DeferredRestoredTab()
+          : VideoTab(
+              key: key,
+              sessionId: entry.sessionId,
+              initialDriveId: entry.videoDriveId,
+              initialRelativePath: entry.videoRelativePath,
+              onLocationChanged: (location) =>
+                  updateVideoLocation(entry, location),
+            ),
+      onWillPop: () async => key.currentState?.handleWillPop() ?? false,
+    );
+    return entry;
+  }
+
+  String _lastPathSegment(String path, {required String fallback}) =>
+      storageDisplayName(path: path, fallback: fallback);
+
+  String? _validSavedTitle(String? title) {
+    final normalized = title?.trim();
+    if (normalized == null ||
+        normalized.isEmpty ||
+        RegExp(r'^\d+$').hasMatch(normalized)) {
+      debugPrint(
+        '[TabsManager] Ignoring missing or index-like saved tab title "$title".',
+      );
+      return null;
+    }
+    return normalized;
   }
 
   void updateImageViewerPath(TabEntry entry, String path) {
@@ -567,14 +948,21 @@ class TabsManager extends ChangeNotifier {
 
   void updateStorageLocation(TabEntry entry, StorageTabLocation location) {
     if (!_tabs.contains(entry)) return;
-    _availableDevices = [
-      ..._availableDevices.where((device) => device.id != location.driveId),
-      StorageDevice(id: location.driveId, name: '', path: location.driveRoot),
-    ];
     entry
       ..storagePath = location.path
       ..driveId = location.driveId
       ..driveRoot = location.driveRoot;
+    _schedulePersistTabs();
+  }
+
+  void updateVideoLocation(
+    TabEntry entry,
+    ({String driveId, String relativePath}) location,
+  ) {
+    if (!_tabs.contains(entry) || !entry.isVideoPage) return;
+    entry
+      ..videoDriveId = location.driveId
+      ..videoRelativePath = location.relativePath;
     _schedulePersistTabs();
   }
 
@@ -605,7 +993,17 @@ class TabsManager extends ChangeNotifier {
         : normalizedPath.startsWith('$normalizedRoot/')
         ? normalizedPath.substring(normalizedRoot.length + 1)
         : '';
-    return {'driveId': driveId, 'relativePath': relativePath};
+    final normalizedAnchor = _normalizePath(tab.storageAnchorPath ?? root);
+    final anchorRelativePath = normalizedAnchor == normalizedRoot
+        ? ''
+        : normalizedAnchor.startsWith('$normalizedRoot/')
+        ? normalizedAnchor.substring(normalizedRoot.length + 1)
+        : '';
+    return {
+      'driveId': driveId,
+      'relativePath': relativePath,
+      'anchorRelativePath': anchorRelativePath,
+    };
   }
 
   void _schedulePersistTabs() {
@@ -630,6 +1028,14 @@ class TabsManager extends ChangeNotifier {
           'title': tab.title,
         };
         if (tab.id == 'apps') return {'type': 'apps', ...common};
+        if (tab.isVideoPage) {
+          return {
+            'type': 'video',
+            ...common,
+            'driveId': tab.videoDriveId,
+            'relativePath': tab.videoRelativePath,
+          };
+        }
         if (tab.isImageViewer) {
           return {
             'type': 'imageViewer',
@@ -637,6 +1043,15 @@ class TabsManager extends ChangeNotifier {
             ..._fileLocationRecord(
               tab.currentImagePath ?? tab.id.substring('imageViewer:'.length),
             ),
+            'originTabId': tab.returnToTab?.sessionId,
+          };
+        }
+        if (tab.isArchiveManager) {
+          return {
+            'type': 'archiveManager',
+            ...common,
+            ..._fileLocationRecord(tab.archivePath!),
+            'archiveFolder': tab.archiveFolder,
             'originTabId': tab.returnToTab?.sessionId,
           };
         }
@@ -652,6 +1067,10 @@ class TabsManager extends ChangeNotifier {
               ? 'imageStorage'
               : tab.documentOnly
               ? 'documentStorage'
+              : tab.audioOnly
+              ? 'audioStorage'
+              : tab.archiveOnly
+              ? 'archiveStorage'
               : 'storage',
           ...common,
           ..._storageLocationRecord(tab),
@@ -677,12 +1096,32 @@ class TabsManager extends ChangeNotifier {
     String? title,
     bool imageOnly = false,
     bool documentOnly = false,
+    bool audioOnly = false,
+    bool archiveOnly = false,
     bool allowDuplicate = false,
   }) {
+    if (!allowDuplicate &&
+        (imageOnly || documentOnly || audioOnly || archiveOnly)) {
+      final existing = _tabs.indexWhere(
+        (tab) =>
+            tab.imageOnly == imageOnly &&
+            tab.documentOnly == documentOnly &&
+            tab.audioOnly == audioOnly &&
+            tab.archiveOnly == archiveOnly,
+      );
+      if (existing != -1) {
+        goTo(existing);
+        return;
+      }
+    }
     final id = imageOnly
         ? 'imageStorage:$path'
         : documentOnly
         ? 'documentStorage:$path'
+        : audioOnly
+        ? 'audioStorage:$path'
+        : archiveOnly
+        ? 'archiveStorage:$path'
         : path;
     // Existing callers retain focus-existing-tab behavior. Only an explicit
     // duplicate request, such as an Available Storage card tap, skips this.
@@ -701,14 +1140,18 @@ class TabsManager extends ChangeNotifier {
       title: title,
       imageOnly: imageOnly,
       documentOnly: documentOnly,
+      audioOnly: audioOnly,
+      archiveOnly: archiveOnly,
       sessionId: _newTabInstanceId(),
       isDeferred: false,
       driveId: device?.id,
       driveRoot: device?.path,
+      anchorPath: path,
     );
     _tabs.add(entry);
     final target = _tabs.length - 1;
     // set selection first so listeners rebuild for the new selected index
+    _leaveFullscreenViewer();
     _selected = target;
     debugPrint(
       '[TabsManager] openStorageTab -> added tab "$path" target=$target selected=$_selected',
@@ -726,12 +1169,42 @@ class TabsManager extends ChangeNotifier {
       goTo(existing);
       return;
     }
+
     if (_tabs.length >= maxOpenTabs) return;
 
     _tabs.add(
       TabEntry(id: id, title: 'Apps', pageBuilder: () => const AppsTab()),
     );
     final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePersistTabs();
+    _schedulePageJump(target);
+  }
+
+  void openVideoTab() {
+    const id = 'video';
+    final existing = _tabs.indexWhere((tab) => tab.id == id);
+    if (existing != -1) {
+      goTo(existing);
+      return;
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return;
+    }
+    _tabs.add(
+      _createVideoEntry(
+        sessionId: _newTabInstanceId(),
+        driveId: 'internal',
+        relativePath: '',
+        isDeferred: false,
+      ),
+    );
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
     _selected = target;
     notifyListeners();
     _schedulePersistTabs();
@@ -757,6 +1230,7 @@ class TabsManager extends ChangeNotifier {
       ),
     );
     final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
     _selected = target;
     notifyListeners();
     _schedulePersistTabs();
@@ -775,6 +1249,7 @@ class TabsManager extends ChangeNotifier {
         goTo(existing);
         return _tabs[existing];
       }
+
     }
     if (_tabs.where((tab) => tab.isImageViewer).length >= maxImageViewerTabs) {
       _pendingNotice = 'You can open up to $maxImageViewerTabs image viewers.';
@@ -793,11 +1268,107 @@ class TabsManager extends ChangeNotifier {
     );
     _tabs.add(entry);
     final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
     _selected = target;
     notifyListeners();
     _schedulePersistTabs();
     _schedulePageJump(target);
     return entry;
+  }
+
+  TabEntry? openArchiveManagerTab(
+    String path, {
+    bool allowDuplicate = false,
+    String? autoExtractTo,
+    bool closeAfterAutoExtraction = false,
+    Future<void> Function()? onAutoExtractionComplete,
+  }) {
+    final id = 'archiveManager:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere((tab) => tab.id == id);
+      if (existing >= 0) {
+        goTo(existing);
+        return _tabs[existing];
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return null;
+    }
+    final originTab = _tabs[_selected];
+    final entry = _createArchiveManagerEntry(
+      path,
+      sessionId: _newTabInstanceId(),
+      isDeferred: false,
+      originTab: originTab,
+      autoExtractTo: autoExtractTo,
+      closeAfterAutoExtraction: closeAfterAutoExtraction,
+      onAutoExtractionComplete: onAutoExtractionComplete,
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePersistTabs();
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry _createArchiveManagerEntry(
+    String path, {
+    required String sessionId,
+    required bool isDeferred,
+    String? title,
+    String initialFolder = '',
+    TabEntry? originTab,
+    String? autoExtractTo,
+    bool closeAfterAutoExtraction = false,
+    Future<void> Function()? onAutoExtractionComplete,
+  }) {
+    final key = GlobalKey<ArchiveManagerPageState>();
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'archiveManager:$path',
+      title: title ?? _lastPathSegment(path, fallback: 'Archive'),
+      sessionId: sessionId,
+      isDeferred: isDeferred,
+      isArchiveManager: true,
+      archivePath: path,
+      archiveFolder: initialFolder,
+      returnToTab: originTab,
+      pageBuilder: () => entry.isDeferred
+          ? const _DeferredRestoredTab()
+          : ArchiveManagerPage(
+              key: key,
+              archivePath: entry.archivePath!,
+              initialFolder: entry.archiveFolder,
+              autoExtractTo: autoExtractTo,
+              closeAfterAutoExtraction: closeAfterAutoExtraction,
+              onFolderChanged: (folder) =>
+                  updateArchiveManagerFolder(entry, folder),
+              onClose: () => closeTab(entry),
+              onAutoExtractionComplete: onAutoExtractionComplete,
+            ),
+      onWillPop: () async => key.currentState?.handleWillPop() ?? false,
+    );
+    return entry;
+  }
+
+  void updateArchiveManagerFolder(TabEntry entry, String folder) {
+    if (!_tabs.contains(entry) ||
+        !entry.isArchiveManager ||
+        entry.archiveFolder == folder) {
+      return;
+    }
+    entry.archiveFolder = folder;
+    _schedulePersistTabs();
+  }
+
+  void closeTab(TabEntry entry) {
+    final index = _tabs.indexOf(entry);
+    if (index > 0) closeTabAt(index);
   }
 
   void setImageViewerFullscreen(TabEntry entry, bool isFullscreen) {
@@ -854,7 +1425,7 @@ class TabsManager extends ChangeNotifier {
     if (idx <= 0 || idx >= _tabs.length) return; // never close home
     final closingSelectedTab = idx == _selected;
     final closingTab = _tabs[idx];
-    final returnToTab = closingTab.isImageViewer
+    final returnToTab = closingTab.isImageViewer || closingTab.isArchiveManager
         ? closingTab.returnToTab
         : null;
     _tabs.removeAt(idx);

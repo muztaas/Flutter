@@ -13,6 +13,8 @@ class DefaultFileApp {
 
   static const textEditorHandlerId = 'textEditor';
   static const imageViewerHandlerId = 'imageViewer';
+  static const videoPlayerHandlerId = 'videoPlayer';
+  static const archiveManagerHandlerId = 'archiveManager';
 
   final String extension;
   final String handlerId;
@@ -29,6 +31,8 @@ class DefaultFileApp {
 
   bool get isTextEditor => handlerId == textEditorHandlerId;
   bool get isImageViewer => handlerId == imageViewerHandlerId;
+  bool get isVideoPlayer => handlerId == videoPlayerHandlerId;
+  bool get isArchiveManager => handlerId == archiveManagerHandlerId;
 
   Map<String, Object?> toJson() => {
     'extension': extension,

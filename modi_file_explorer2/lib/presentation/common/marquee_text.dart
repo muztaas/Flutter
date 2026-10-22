@@ -54,7 +54,7 @@ class MarqueeText extends StatefulWidget {
 
 class _MarqueeTextState extends State<MarqueeText>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  static const double _gap = 32;
+  static const double _gapFontSizeFactor = 1.5;
 
   late final AnimationController _controller;
   bool _appIsResumed = true;
@@ -155,6 +155,7 @@ class _MarqueeTextState extends State<MarqueeText>
           text: textSpan,
           maxLines: 1,
           textDirection: Directionality.of(context),
+          textScaler: MediaQuery.textScalerOf(context),
         )..layout(minWidth: 0, maxWidth: double.infinity);
 
         final shouldScroll = painter.width > constraints.maxWidth;
@@ -163,10 +164,18 @@ class _MarqueeTextState extends State<MarqueeText>
           _resetAnimation();
         }
         if (!shouldScroll) {
-          return _buildText(textSpan, painter.width, textStyle);
+          final width = constraints.maxWidth.isFinite
+              ? constraints.maxWidth
+              : painter.width;
+          return ClipRect(
+            child: _buildText(textSpan, width, textStyle),
+          );
         }
 
-        final cycleWidth = painter.width + _gap;
+        final gap = MediaQuery.textScalerOf(context).scale(
+          (textStyle?.fontSize ?? 14) * _gapFontSizeFactor,
+        );
+        final cycleWidth = painter.width + gap;
         final scrollDuration = Duration(
           milliseconds: (cycleWidth * marqueeOverflowToScrollDurationRatio)
               .round(),

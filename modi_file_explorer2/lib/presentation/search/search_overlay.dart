@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/providers/search_provider.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/utils/format_bytes.dart';
+import '../../core/utils/display_file_name.dart';
+import '../../core/utils/font_scaled_spacing.dart';
 import '../../core/utils/time_format.dart';
 import '../../core/utils/extension_parser.dart';
 import '../../core/providers/file_type_categories_provider.dart';
@@ -11,7 +13,9 @@ import '../../domain/entities/search_folder_candidate.dart';
 import '../../domain/entities/search_query.dart';
 import '../../domain/entities/search_scope.dart';
 import '../../domain/entities/search_result.dart';
+import '../../domain/utils/shared_storage_scan_scope.dart';
 import '../image_viewer/image_file_preview.dart';
+import '../common/file_type_icon.dart';
 import '../common/marquee_text.dart';
 import '../common/storage_entry_row.dart';
 
@@ -36,6 +40,8 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
   final TextEditingController _maximumSizeController = TextEditingController();
   final FocusNode _focusNode = FocusNode();
   final ScrollController _resultsScrollController = ScrollController();
+  final ScrollController _searchResultsScrollController = ScrollController();
+  final ScrollController _filterScrollController = ScrollController();
   int _sizeUnitIndex = 0;
 
   static const _sizeUnits = ['B', 'KB', 'MB', 'GB'];
@@ -59,6 +65,8 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
     _maximumSizeController.dispose();
     _focusNode.dispose();
     _resultsScrollController.dispose();
+    _searchResultsScrollController.dispose();
+    _filterScrollController.dispose();
     super.dispose();
   }
 
@@ -77,33 +85,43 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
           .read(fileSearchProvider(widget.sessionId).notifier)
           .updateFoldersFirst(next);
     });
-    ref.listen<SearchOverlayState>(
-      fileSearchProvider(widget.sessionId),
-      (previous, next) {
-        if (previous?.isOpen != true && next.isOpen) {
-          _textController.text = next.query;
-          _syncFilterControllers(next.searchQuery);
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted &&
-                widget.isActive &&
-                ref.read(fileSearchProvider(widget.sessionId)).isOpen) {
-              _focusNode.requestFocus();
-            }
-          });
-        } else if (previous?.isOpen == true && !next.isOpen) {
-          _focusNode.unfocus();
-          _textController.clear();
-        }
-      },
-    );
+    ref.listen<SearchOverlayState>(fileSearchProvider(widget.sessionId), (
+      previous,
+      next,
+    ) {
+      if (previous?.isOpen != true && next.isOpen) {
+        _textController.text = next.query;
+        _syncFilterControllers(next.searchQuery);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted &&
+              widget.isActive &&
+              ref.read(fileSearchProvider(widget.sessionId)).isOpen) {
+            _focusNode.requestFocus();
+          }
+        });
+      } else if (previous?.isOpen == true && !next.isOpen) {
+        _focusNode.unfocus();
+        _textController.clear();
+      }
+    });
     final search = ref.watch(fileSearchProvider(widget.sessionId));
     final scope = search.scope;
     final settings = ref.watch(appSettingsProvider);
+    final visibleResults =
+        scope != null &&
+            scope.category != null &&
+            settings.hideAndroidFoldersInCategoryPages
+        ? search.results
+              .where(
+                (result) =>
+                    !SharedStorageScanScope.isInsideAndroidFolder(result.path),
+              )
+              .toList(growable: false)
+        : search.results;
     final categories = ref.watch(fileTypeCategoriesProvider);
     final surface = Theme.of(context).colorScheme.surface;
     final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     final visible = search.isOpen && widget.isActive;
-
     return Positioned.fill(
       child: LayoutBuilder(
         builder: (context, constraints) {
@@ -122,277 +140,317 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
                 child: Material(
                   color: surface.withValues(alpha: visible ? 0.9 : 0),
                   child: Column(
-                  children: [
-                    SizedBox(
-                      height: 56,
-                      child: Row(
-                        children: [
-                          IconButton(
-                            tooltip: 'Exit search',
-                            onPressed: () =>
-                                ref.read(fileSearchProvider(widget.sessionId).notifier).close(),
-                            icon: const Icon(Icons.arrow_back),
-                          ),
-                          Expanded(
-                            child: Stack(
-                              alignment: Alignment.centerLeft,
-                              children: [
-                                TextField(
-                                  controller: _textController,
-                                  focusNode: _focusNode,
-                                  textInputAction: TextInputAction.search,
-                                  onChanged: ref
-                                      .read(fileSearchProvider(widget.sessionId).notifier)
-                                      .onTextChanged,
-                                  onSubmitted: (_) => ref
-                                      .read(fileSearchProvider(widget.sessionId).notifier)
-                                      .submit(),
-                                  decoration: const InputDecoration(
-                                    border: InputBorder.none,
-                                    contentPadding: EdgeInsets.symmetric(
-                                      horizontal: 12,
-                                    ),
-                                  ),
-                                ),
-                                if (search.query.isEmpty && scope != null)
-                                  Positioned.fill(
-                                    child: IgnorePointer(
-                                      child: Padding(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 12,
-                                        ),
-                                        child: Align(
-                                          alignment: Alignment.centerLeft,
-                                          child: MarqueeText(
-                                            scope.hintText,
-                                            style: Theme.of(context)
-                                                .textTheme
-                                                .bodyLarge
-                                                ?.copyWith(
-                                                  color: Theme.of(context)
-                                                      .colorScheme
-                                                      .onSurfaceVariant,
-                                                ),
-                                            styleMode:
-                                                MarqueeStyle.pauseAndLoop,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                          if (search.query.isNotEmpty)
+                    children: [
+                      SizedBox(
+                        height: 56,
+                        child: Row(
+                          children: [
                             IconButton(
-                              tooltip: 'Clear search text',
-                              onPressed: () {
-                                ref
-                                    .read(fileSearchProvider(widget.sessionId).notifier)
-                                    .clearText();
-                                _textController.clear();
-                              },
-                              icon: const Icon(Icons.close),
+                              tooltip: 'Exit search',
+                              onPressed: () => ref
+                                  .read(
+                                    fileSearchProvider(
+                                      widget.sessionId,
+                                    ).notifier,
+                                  )
+                                  .close(),
+                              icon: const Icon(Icons.arrow_back),
                             ),
-                          IconButton(
-                            tooltip: 'Submit search',
-                            onPressed: () =>
-                                ref.read(fileSearchProvider(widget.sessionId).notifier).submit(),
-                            icon: const Icon(Icons.search),
-                          ),
-                        ],
-                      ),
-                    ),
-                    SizedBox(
-                      height: 40,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Padding(
-                              padding: const EdgeInsets.only(left: 16),
-                              child: Row(
+                            Expanded(
+                              child: Stack(
+                                alignment: Alignment.centerLeft,
                                 children: [
-                                  if (search.isSearching) ...[
-                                    const SizedBox(
-                                      width: 14,
-                                      height: 14,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
+                                  TextField(
+                                    controller: _textController,
+                                    focusNode: _focusNode,
+                                    textInputAction: TextInputAction.search,
+                                    onChanged: ref
+                                        .read(
+                                          fileSearchProvider(
+                                            widget.sessionId,
+                                          ).notifier,
+                                        )
+                                        .onTextChanged,
+                                    onSubmitted: (_) => ref
+                                        .read(
+                                          fileSearchProvider(
+                                            widget.sessionId,
+                                          ).notifier,
+                                        )
+                                        .submit(),
+                                    decoration: const InputDecoration(
+                                      border: InputBorder.none,
+                                      contentPadding: EdgeInsets.symmetric(
+                                        horizontal: 12,
                                       ),
                                     ),
-                                    const SizedBox(width: 8),
-                                  ],
-                                  Expanded(
-                                    child: Text(
-                                      search.statusText,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodySmall
-                                          ?.copyWith(
-                                            color: Theme.of(
-                                              context,
-                                            ).colorScheme.onSurfaceVariant,
-                                          ),
-                                    ),
                                   ),
+                                  if (search.query.isEmpty && scope != null)
+                                    Positioned.fill(
+                                      child: IgnorePointer(
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 12,
+                                          ),
+                                          child: Align(
+                                            alignment: Alignment.centerLeft,
+                                            child: MarqueeText(
+                                              scope.hintText,
+                                              style: Theme.of(context)
+                                                  .textTheme
+                                                  .bodyLarge
+                                                  ?.copyWith(
+                                                    color: Theme.of(context)
+                                                        .colorScheme
+                                                        .onSurfaceVariant,
+                                                  ),
+                                              styleMode:
+                                                  MarqueeStyle.pauseAndLoop,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
                                 ],
                               ),
                             ),
-                          ),
-                          IconButton(
-                            tooltip: 'Filters',
-                            onPressed: () => ref
-                                .read(fileSearchProvider(widget.sessionId).notifier)
-                                .toggleFilters(),
-                            icon: Stack(
-                              clipBehavior: Clip.none,
-                              children: [
-                                Icon(
-                                  Icons.filter_list,
-                                  color: search.activeFilterCount > 0
-                                      ? Theme.of(context).colorScheme.primary
-                                      : null,
-                                ),
-                                if (search.activeFilterCount > 0)
-                                  Positioned(
-                                    right: -9,
-                                    top: -7,
-                                    child: Container(
-                                      padding: const EdgeInsets.all(3),
-                                      decoration: BoxDecoration(
-                                        color: Theme.of(
-                                          context,
-                                        ).colorScheme.primary,
-                                        shape: BoxShape.circle,
+                            if (search.query.isNotEmpty)
+                              IconButton(
+                                tooltip: 'Clear search text',
+                                onPressed: () {
+                                  ref
+                                      .read(
+                                        fileSearchProvider(
+                                          widget.sessionId,
+                                        ).notifier,
+                                      )
+                                      .clearText();
+                                  _textController.clear();
+                                },
+                                icon: const Icon(Icons.close),
+                              ),
+                            IconButton(
+                              tooltip: 'Submit search',
+                              onPressed: () => ref
+                                  .read(
+                                    fileSearchProvider(
+                                      widget.sessionId,
+                                    ).notifier,
+                                  )
+                                  .submit(),
+                              icon: const Icon(Icons.search),
+                            ),
+                          ],
+                        ),
+                      ),
+                      SizedBox(
+                        height: 40,
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Padding(
+                                padding: const EdgeInsets.only(left: 16),
+                                child: Row(
+                                  children: [
+                                    if (search.isSearching) ...[
+                                      const SizedBox(
+                                        width: 14,
+                                        height: 14,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
                                       ),
-                                      constraints: const BoxConstraints(
-                                        minWidth: 17,
-                                        minHeight: 17,
-                                      ),
+                                      const SizedBox(width: 8),
+                                    ],
+                                    Expanded(
                                       child: Text(
-                                        '${search.activeFilterCount}',
-                                        textAlign: TextAlign.center,
+                                        search.statusText,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
                                         style: Theme.of(context)
                                             .textTheme
-                                            .labelSmall
+                                            .bodySmall
                                             ?.copyWith(
                                               color: Theme.of(
                                                 context,
-                                              ).colorScheme.onPrimary,
-                                              fontSize: 10,
+                                              ).colorScheme.onSurfaceVariant,
                                             ),
                                       ),
                                     ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    AnimatedSize(
-                      duration: const Duration(milliseconds: 200),
-                      curve: Curves.easeInOut,
-                      child: search.filtersExpanded
-                          ? ConstrainedBox(
-                              constraints: BoxConstraints(
-                                maxHeight: filterSectionMaxHeight,
-                              ),
-                              child: SingleChildScrollView(
-                                child: Padding(
-                                  padding: const EdgeInsets.fromLTRB(
-                                    16,
-                                    4,
-                                    16,
-                                    12,
-                                  ),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      for (final definition
-                                          in _filterDefinitions)
-                                        _buildFilter(
-                                          context,
-                                          search,
-                                          definition,
-                                          categories,
-                                        ),
-                                      _buildFolderSelectionSection(
-                                        context,
-                                        search,
-                                        blacklist: true,
-                                      ),
-                                      _buildFolderSelectionSection(
-                                        context,
-                                        search,
-                                        blacklist: false,
-                                      ),
-                                      if (search.validationMessage != null)
-                                        Padding(
-                                          padding: const EdgeInsets.only(
-                                            top: 6,
-                                          ),
-                                          child: Text(
-                                            search.validationMessage!,
-                                            style: TextStyle(
-                                              color: Theme.of(
-                                                context,
-                                              ).colorScheme.error,
-                                            ),
-                                          ),
-                                        ),
-                                      Align(
-                                        alignment: Alignment.centerRight,
-                                        child: TextButton(
-                                          onPressed: () {
-                                            _sizeUnitIndex = 0;
-                                            _minimumSizeController.clear();
-                                            _maximumSizeController.clear();
-                                            _extensionsController.clear();
-                                            ref
-                                                .read(
-                                                  fileSearchProvider(widget.sessionId).notifier,
-                                                )
-                                                .resetFilters();
-                                          },
-                                          child: const Text('Reset filters'),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                                  ],
                                 ),
                               ),
-                            )
-                          : const SizedBox(width: double.infinity),
-                    ),
-                    Expanded(
-                      child: search.results.isEmpty
-                          ? const SizedBox.expand()
-                          : ListView.builder(
-                              keyboardDismissBehavior:
-                                  ScrollViewKeyboardDismissBehavior.onDrag,
-                              itemCount: search.results.length,
-                              itemBuilder: (context, index) {
-                                final result = search.results[index];
-                                return _buildResultRow(
-                                  context,
-                                  result,
-                                  settings,
-                                  () => _openResult(result),
-                                );
-                              },
                             ),
-                    ),
-                    if (bottomInset > 0)
-                      Container(
-                        height: bottomInset,
-                        color: surface.withValues(
-                          alpha: visible ? 0.9 : 0,
+                            IconButton(
+                              tooltip: 'Filters',
+                              onPressed: () => ref
+                                  .read(
+                                    fileSearchProvider(
+                                      widget.sessionId,
+                                    ).notifier,
+                                  )
+                                  .toggleFilters(),
+                              icon: Stack(
+                                clipBehavior: Clip.none,
+                                children: [
+                                  Icon(
+                                    Icons.filter_list,
+                                    color: search.activeFilterCount > 0
+                                        ? Theme.of(context).colorScheme.primary
+                                        : null,
+                                  ),
+                                  if (search.activeFilterCount > 0)
+                                    Positioned(
+                                      right: -9,
+                                      top: -7,
+                                      child: Container(
+                                        padding: const EdgeInsets.all(3),
+                                        decoration: BoxDecoration(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.primary,
+                                          shape: BoxShape.circle,
+                                        ),
+                                        constraints: const BoxConstraints(
+                                          minWidth: 17,
+                                          minHeight: 17,
+                                        ),
+                                        child: Text(
+                                          '${search.activeFilterCount}',
+                                          textAlign: TextAlign.center,
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .labelSmall
+                                              ?.copyWith(
+                                                color: Theme.of(
+                                                  context,
+                                                ).colorScheme.onPrimary,
+                                                fontSize: 10,
+                                              ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ],
                         ),
                       ),
+                      AnimatedSize(
+                        duration: const Duration(milliseconds: 200),
+                        curve: Curves.easeInOut,
+                        child: search.filtersExpanded
+                            ? ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  maxHeight: filterSectionMaxHeight,
+                                ),
+                                child: Scrollbar(
+                                  controller: _filterScrollController,
+                                  thumbVisibility: true,
+                                  interactive: true,
+                                  child: SingleChildScrollView(
+                                    controller: _filterScrollController,
+                                    child: Padding(
+                                      padding: const EdgeInsets.fromLTRB(
+                                        16,
+                                        4,
+                                        16,
+                                        12,
+                                      ),
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          for (final definition
+                                              in _filterDefinitions)
+                                            _buildFilter(
+                                              context,
+                                              search,
+                                              definition,
+                                              categories,
+                                            ),
+                                          _buildFolderSelectionSection(
+                                            context,
+                                            search,
+                                            blacklist: true,
+                                          ),
+                                          _buildFolderSelectionSection(
+                                            context,
+                                            search,
+                                            blacklist: false,
+                                          ),
+                                          if (search.validationMessage != null)
+                                            Padding(
+                                              padding: const EdgeInsets.only(
+                                                top: 6,
+                                              ),
+                                              child: Text(
+                                                search.validationMessage!,
+                                                style: TextStyle(
+                                                  color: Theme.of(
+                                                    context,
+                                                  ).colorScheme.error,
+                                                ),
+                                              ),
+                                            ),
+                                          Align(
+                                            alignment: Alignment.centerRight,
+                                            child: TextButton(
+                                              onPressed: () {
+                                                _sizeUnitIndex = 0;
+                                                _minimumSizeController.clear();
+                                                _maximumSizeController.clear();
+                                                _extensionsController.clear();
+                                                ref
+                                                    .read(
+                                                      fileSearchProvider(
+                                                        widget.sessionId,
+                                                      ).notifier,
+                                                    )
+                                                    .resetFilters();
+                                              },
+                                              child: const Text(
+                                                'Reset filters',
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              )
+                            : const SizedBox(width: double.infinity),
+                      ),
+                      Expanded(
+                        child: visibleResults.isEmpty
+                            ? const SizedBox.expand()
+                            : Scrollbar(
+                                controller: _searchResultsScrollController,
+                                thumbVisibility: true,
+                                interactive: true,
+                                child: ListView.builder(
+                                  controller: _searchResultsScrollController,
+                                  keyboardDismissBehavior:
+                                      ScrollViewKeyboardDismissBehavior.onDrag,
+                                  itemCount: visibleResults.length,
+                                  itemBuilder: (context, index) {
+                                    final result = visibleResults[index];
+                                    return _buildResultRow(
+                                      context,
+                                      result,
+                                      settings,
+                                      () => _openResult(result),
+                                    );
+                                  },
+                                ),
+                              ),
+                      ),
+                      if (bottomInset > 0)
+                        Container(
+                          height: bottomInset,
+                          color: surface.withValues(alpha: visible ? 0.9 : 0),
+                        ),
                     ],
                   ),
                 ),
@@ -632,10 +690,10 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
                       ),
                       items: [
                         for (var i = 0; i < _sizeUnits.length; i++)
-                  DropdownMenuItem(
-                    value: i,
-                    child: Text(_sizeUnits[i]),
-                  ),
+                          DropdownMenuItem(
+                            value: i,
+                            child: Text(_sizeUnits[i]),
+                          ),
                       ],
                       onChanged: (value) {
                         if (value == null) return;
@@ -802,27 +860,43 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
                       )
                     else
                       SizedBox(
-                        height: visibleRows * _folderListRowHeight,
-                        child: ListView.builder(
+                        height:
+                            visibleRows *
+                            fontScaledSpacing(context, _folderListRowHeight),
+                        child: Scrollbar(
+                          controller: _resultsScrollController,
+                          thumbVisibility: true,
+                          interactive: true,
+                          child: ListView.builder(
                             controller: _resultsScrollController,
-                          primary: false,
-                          itemExtent: _folderListRowHeight,
-                          itemCount: candidates.length,
-                          itemBuilder: (context, index) {
-                            final candidate = candidates[index];
-                            final selected = selectedIds.contains(candidate.id);
-                            return _buildFolderCandidateRow(
+                            primary: false,
+                            itemExtent: fontScaledSpacing(
                               context,
-                              candidate,
-                              selected: selected,
-                              onChanged: (_) => ref
-                                  .read(fileSearchProvider(widget.sessionId).notifier)
-                                  .toggleFolderSelection(
-                                    candidate.id,
-                                    blacklist: blacklist,
-                                  ),
-                            );
-                          },
+                              _folderListRowHeight,
+                            ),
+                            itemCount: candidates.length,
+                            itemBuilder: (context, index) {
+                              final candidate = candidates[index];
+                              final selected = selectedIds.contains(
+                                candidate.id,
+                              );
+                              return _buildFolderCandidateRow(
+                                context,
+                                candidate,
+                                selected: selected,
+                                onChanged: (_) => ref
+                                    .read(
+                                      fileSearchProvider(
+                                        widget.sessionId,
+                                      ).notifier,
+                                    )
+                                    .toggleFolderSelection(
+                                      candidate.id,
+                                      blacklist: blacklist,
+                                    ),
+                              );
+                            },
+                          ),
                         ),
                       ),
                   ],
@@ -845,7 +919,7 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
       child: Row(
         children: [
           Checkbox(value: selected, onChanged: onChanged),
-          Icon(Icons.folder_outlined, color: theme.colorScheme.primary),
+          FileTypeIcon(extension: '', isFolder: true),
           const SizedBox(width: 8),
           Expanded(
             child: MarqueeText(
@@ -1016,7 +1090,11 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           MarqueeText(
-            result.name,
+            displayFileName(
+              result.name,
+              showExtension: ref.watch(appSettingsProvider).showFileExtension,
+              isDirectory: result.isDirectory,
+            ),
             style: nameStyle,
             styleMode: MarqueeStyle.pauseAndLoop,
           ),
@@ -1040,27 +1118,40 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
   }
 
   Widget _resultLeading(BuildContext context, SearchResult result) {
-    if (result.isDirectory) return const Icon(Icons.folder, size: 24);
+    if (result.isDirectory) {
+      return FileTypeIcon(extension: '', isFolder: true);
+    }
     final extensionStart = result.name.lastIndexOf('.');
     final extension = extensionStart < 0
         ? ''
         : result.name.substring(extensionStart).toLowerCase();
+    if (extension == '.apk') {
+      return FileTypeIcon(extension: extension, path: result.path);
+    }
     if (ref.read(fileSearchProvider(widget.sessionId)).scope?.category ==
         SearchCategory.documents) {
-      final icon = switch (extension) {
-        '.pdf' => Icons.picture_as_pdf_outlined,
-        '.doc' || '.docx' || '.odt' || '.rtf' => Icons.description_outlined,
-        '.xls' || '.xlsx' || '.ods' || '.csv' => Icons.table_chart_outlined,
-        '.ppt' || '.pptx' || '.odp' => Icons.slideshow_outlined,
-        _ => Icons.insert_drive_file_outlined,
-      };
-      return Icon(icon, size: 24);
+      return FileTypeIcon(extension: extension);
     }
-    if (FileTypeCategory.categoryForExtension(
-          extension,
-          categories: ref.read(fileTypeCategoriesProvider),
-        ) ==
-        'Image') {
+    if (ref.read(fileSearchProvider(widget.sessionId)).scope?.category ==
+        SearchCategory.videos) {
+      return FileTypeIcon(extension: extension, path: result.path);
+    }
+    if (ref.read(fileSearchProvider(widget.sessionId)).scope?.category ==
+        SearchCategory.audio) {
+      return FileTypeIcon(extension: extension);
+    }
+    if (ref.read(fileSearchProvider(widget.sessionId)).scope?.category ==
+        SearchCategory.archives) {
+      return FileTypeIcon(extension: extension);
+    }
+    final category = FileTypeCategory.categoryForExtension(
+      extension,
+      categories: ref.read(fileTypeCategoriesProvider),
+    );
+    if (category == 'Video') {
+      return FileTypeIcon(extension: extension, path: result.path);
+    }
+    if (category == 'Image') {
       return ClipRRect(
         borderRadius: BorderRadius.circular(6),
         child: SizedBox(
@@ -1069,14 +1160,13 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
           child: ImageFilePreview(
             path: result.path,
             fit: BoxFit.cover,
-            loadingBuilder: (_) => const Icon(Icons.image_outlined, size: 24),
-            errorBuilder: (_, _, _) =>
-                const Icon(Icons.image_outlined, size: 24),
+            loadingBuilder: (_) => FileTypeIcon(extension: extension),
+            errorBuilder: (_, _, _) => FileTypeIcon(extension: extension),
           ),
         ),
       );
     }
-    return const Icon(Icons.insert_drive_file, size: 24);
+    return FileTypeIcon(extension: extension);
   }
 
   Future<void> _openResult(SearchResult result) async {

@@ -67,10 +67,18 @@ class AndroidSearchRepository implements SearchRepository {
     final relativeSegments = _relativeSegments(scope.relativePath);
     if (relativeSegments == null) return const [];
     final currentPath = _joinPath(device.path, relativeSegments);
-    final preferences = await _getPreferences();
+    final preferences = await _getPreferences(scope: scope);
     if (!preferences['showNomediaFiles']! &&
-        (await File('$currentPath${Platform.pathSeparator}.nomedia').exists() ||
-            await _hasNoMediaAncestor(currentPath, device.path))) {
+        ((scope.category != SearchCategory.videos ||
+                    relativeSegments.isNotEmpty) &&
+                await File(
+                  '$currentPath${Platform.pathSeparator}.nomedia',
+                ).exists() ||
+            await _hasNoMediaAncestor(
+              currentPath,
+              device.path,
+              ignoreRootMarker: scope.category == SearchCategory.videos,
+            ))) {
       return const [];
     }
 
@@ -82,6 +90,9 @@ class AndroidSearchRepository implements SearchRepository {
         'Documents',
         categories,
       ).toSet(),
+      SearchCategory.videos => _extensionsFor('Video', categories).toSet(),
+      SearchCategory.audio => _extensionsFor('Audio', categories).toSet(),
+      SearchCategory.archives => _extensionsFor('Archives', categories).toSet(),
       null => const <String>{},
     };
     final candidates = <SearchFolderCandidate>[];
@@ -130,7 +141,7 @@ class AndroidSearchRepository implements SearchRepository {
       return;
     }
     final devices = await _storageRepository.listStorageDevices();
-    final preferences = await _getPreferences();
+    final preferences = await _getPreferences(scope: scope);
     final roots = await _rootsForScope(scope, devices, query);
     if (roots.isEmpty) {
       if (query.includedFolders.isNotEmpty ||
@@ -145,6 +156,9 @@ class AndroidSearchRepository implements SearchRepository {
     final extensions = switch (scope.category) {
       SearchCategory.images => _extensionsFor('Image', categories),
       SearchCategory.documents => _extensionsFor('Documents', categories),
+      SearchCategory.videos => _extensionsFor('Video', categories),
+      SearchCategory.audio => _extensionsFor('Audio', categories),
+      SearchCategory.archives => _extensionsFor('Archives', categories),
       null => const <String>[],
     };
     yield* _searchInIsolate({
@@ -173,6 +187,7 @@ class AndroidSearchRepository implements SearchRepository {
       'categoryOnly': scope.category != null,
       'showHiddenFiles': preferences['showHiddenFiles'],
       'showNomediaFiles': preferences['showNomediaFiles'],
+      'ignoreRootNomedia': scope.category == SearchCategory.videos,
       'showFolderItemCount': preferences['showFolderItemCount'],
       'showFileSize': preferences['showFileSize'],
       'showModifiedDate': preferences['showModifiedDate'],
@@ -325,13 +340,19 @@ class AndroidSearchRepository implements SearchRepository {
         const [];
   }
 
-  Future<Map<String, bool>> _getPreferences() async {
+  Future<Map<String, bool>> _getPreferences({
+    required SearchScope scope,
+  }) async {
     final preferences = await SharedPreferences.getInstance();
+    final isVideoSearch = scope.category == SearchCategory.videos;
     return {
-      'showHiddenFiles':
-          preferences.getBool('settings.showHiddenFiles') ?? false,
-      'showNomediaFiles':
-          preferences.getBool('settings.showNomediaFiles') ?? true,
+      'showHiddenFiles': isVideoSearch
+          ? preferences.getBool('video.advanced.showHiddenFilesAndFolders') ??
+                false
+          : preferences.getBool('settings.showHiddenFiles') ?? false,
+      'showNomediaFiles': isVideoSearch
+          ? !(preferences.getBool('video.advanced.recognizeNomedia') ?? true)
+          : preferences.getBool('settings.showNomediaFiles') ?? true,
       'showFolderItemCount':
           preferences.getBool('settings.showFolderItemCount') ?? false,
       'showFileSize': preferences.getBool('settings.showFileSize') ?? false,
@@ -491,6 +512,7 @@ Future<void> _searchWorker(Map<String, Object?> arguments) async {
   final categoryOnly = arguments['categoryOnly']! as bool;
   final showHiddenFiles = arguments['showHiddenFiles']! as bool;
   final showNomediaFiles = arguments['showNomediaFiles']! as bool;
+  final ignoreRootNomedia = arguments['ignoreRootNomedia']! as bool;
   final showFolderItemCount = arguments['showFolderItemCount']! as bool;
   final showFileSize = arguments['showFileSize']! as bool;
   final showModifiedDate = arguments['showModifiedDate']! as bool;
@@ -508,7 +530,12 @@ Future<void> _searchWorker(Map<String, Object?> arguments) async {
       >[];
   for (final root in roots) {
     final insideNoMedia =
-        !showNomediaFiles && await _hasNoMediaAncestor(root.start, root.root);
+        !showNomediaFiles &&
+        await _hasNoMediaAncestor(
+          root.start,
+          root.root,
+          ignoreRootMarker: ignoreRootNomedia,
+        );
     pending.add((
       root: root.root,
       driveId: root.driveId,
@@ -554,6 +581,8 @@ Future<void> _searchWorker(Map<String, Object?> arguments) async {
       if (!visitedPaths.add(normalizedCurrent)) continue;
       if (current.insideNoMedia ||
           (!showNomediaFiles &&
+              !(ignoreRootNomedia &&
+                  normalizedCurrent == _normalizeSearchPath(current.root)) &&
               await File(
                 '${current.directory.path}${Platform.pathSeparator}.nomedia',
               ).exists())) {
@@ -896,11 +925,19 @@ String _folderIdentifier(String driveId, String relativePath) {
   return relative.isEmpty ? driveId : '$driveId|$relative';
 }
 
-Future<bool> _hasNoMediaAncestor(String path, String root) async {
+Future<bool> _hasNoMediaAncestor(
+  String path,
+  String root, {
+  bool ignoreRootMarker = false,
+}) async {
   final normalizedRoot = _normalizeSearchPath(root);
   if (_normalizeSearchPath(path) == normalizedRoot) return false;
   var current = Directory(path).parent;
   while (true) {
+    if (ignoreRootMarker &&
+        _normalizeSearchPath(current.path) == normalizedRoot) {
+      return false;
+    }
     if (await File(
       '${current.path}${Platform.pathSeparator}.nomedia',
     ).exists()) {

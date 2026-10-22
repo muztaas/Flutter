@@ -14,6 +14,7 @@ import '../../domain/entities/file_system_entry.dart';
 import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/sort_rule.dart';
 import '../../domain/usecases/resolve_effective_sort_rule.dart';
+import '../common/marquee_text.dart';
 import 'image_file_preview.dart';
 
 class ImageViewerTab extends ConsumerStatefulWidget {
@@ -57,6 +58,17 @@ class _ImageViewerTabState extends ConsumerState<ImageViewerTab> {
   bool get _transformationIsZoomed =>
       ((_activeTransformation?.value.getMaxScaleOnAxis() ?? 1) - 1).abs() >
       0.01;
+
+  String get _currentImageName {
+    final currentPath = _imagePaths.isEmpty
+        ? widget.currentPath
+        : _imagePaths[_currentIndex];
+    return currentPath
+            .split(RegExp(r'[/\\]'))
+            .where((part) => part.isNotEmpty)
+            .lastOrNull ??
+        currentPath;
+  }
 
   @override
   void initState() {
@@ -315,7 +327,7 @@ class _ImageViewerTabState extends ConsumerState<ImageViewerTab> {
           position.dx * (1 - scale),
           position.dy * (1 - scale),
           0,
-          0,
+          1,
         )
         ..scaleByDouble(scale, scale, 1, 1);
     }
@@ -350,8 +362,8 @@ class _ImageViewerTabState extends ConsumerState<ImageViewerTab> {
       child: ColoredBox(
         color: Theme.of(context).colorScheme.surface,
         child: SafeArea(
-          top: widget.isFullscreen,
-          bottom: !widget.isFullscreen,
+          top: false,
+          bottom: false,
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTap: () => widget.onFullscreenChanged(!widget.isFullscreen),
@@ -370,6 +382,28 @@ class _ImageViewerTabState extends ConsumerState<ImageViewerTab> {
                         onNotification: _handlePageNotification,
                         child: Stack(
                           children: [
+                            if (!widget.isFullscreen)
+                              Positioned(
+                                top: 0,
+                                left: 0,
+                                right: 0,
+                                height: 40,
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                  ),
+                                  child: Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: MarqueeText(
+                                      _currentImageName,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.titleSmall,
+                                      styleMode: MarqueeStyle.pauseAndLoop,
+                                    ),
+                                  ),
+                                ),
+                              ),
                             PageView.builder(
                               controller: _pageController,
                               itemCount: _imagePaths.length,

@@ -139,6 +139,32 @@ class FileTypeCategory {
     return null;
   }
 
+  static String? categoryForFileName(
+    String fileName, {
+    List<FileTypeCategory> categories = defaults,
+  }) {
+    final extension = extensionForFileName(fileName, categories: categories);
+    return extension == null
+        ? null
+        : categoryForExtension(extension, categories: categories);
+  }
+
+  static String? extensionForFileName(
+    String fileName, {
+    List<FileTypeCategory> categories = defaults,
+  }) {
+    final normalizedName = fileName.toLowerCase();
+    final extensions = categories
+        .expand((category) => category.extensions)
+        .map(normalizeExtension)
+        .where((extension) => extension.isNotEmpty)
+        .toSet()
+        .where(normalizedName.endsWith)
+        .toList()
+      ..sort((left, right) => right.length.compareTo(left.length));
+    return extensions.firstOrNull;
+  }
+
   static String normalizeExtension(String extension) {
     final trimmed = extension.trim().toLowerCase();
     if (trimmed.isEmpty) return '';

@@ -1,15 +1,19 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../../core/tabs/tabs_manager.dart';
+import '../../core/utils/startup_page_order.dart';
 import '../text_editor/text_editor_tab.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../settings/settings_panel.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/providers/search_provider.dart';
 import '../../core/providers/storage_providers.dart';
+import '../../domain/entities/storage_device.dart';
 import '../common/marquee_text.dart';
 import '../search/search_overlay.dart';
 
@@ -27,8 +31,13 @@ class _TopLevelShellState extends State<TopLevelShell>
   bool _exitConfirmationInProgress = false;
   bool _startupReady = false;
   bool _restoreInProgress = false;
+  bool _restoringTabs = false;
   TabEntry? _fullscreenViewer;
   Timer? _statusBarTimer;
+  final GlobalKey _tabHeaderKey = GlobalKey();
+  int? _edgeSwipePointer;
+  Offset? _edgeSwipeStart;
+  bool _edgeSwipeDragging = false;
   // Storage paths can intentionally occur in multiple tabs, so tab ids are
   // not unique enough to identify header widgets.
   final Map<TabEntry, GlobalKey> _tabKeys = {};
@@ -57,8 +66,14 @@ class _TopLevelShellState extends State<TopLevelShell>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused) {
       unawaited(tabs.flushPersistedTabs());
-    } else if (state == AppLifecycleState.resumed && !tabs.restoreAttempted) {
-      unawaited(_restoreSessionWhenReady());
+    } else if (state == AppLifecycleState.resumed) {
+      unawaited(
+        ProviderScope.containerOf(
+          context,
+          listen: false,
+        ).read(availableStorageDevicesProvider.notifier).refresh(),
+      );
+      if (!tabs.restoreAttempted) unawaited(_restoreSessionWhenReady());
     }
   }
 
@@ -75,15 +90,30 @@ class _TopLevelShellState extends State<TopLevelShell>
         }
       }
       if (!mounted) return;
+      setState(() => _restoringTabs = true);
       final container = ProviderScope.containerOf(context, listen: false);
-      final devices = await container
-          .read(storageRepositoryProvider)
-          .listStorageDevices();
+      final devicesNotifier = container.read(
+        availableStorageDevicesProvider.notifier,
+      );
+      await devicesNotifier.refresh();
+      final devices =
+          container.read(availableStorageDevicesProvider).asData?.value ??
+          const <StorageDevice>[];
+      tabs.updateAvailableStorageDevices(devices);
       final settings = container.read(appSettingsProvider);
       final failures = await tabs.restorePersistedTabs(
         devices: devices,
         closeAllTabsOnExit: settings.closeAllTabsOnExit,
       );
+      final restoredActiveTabId = tabs.tabs[tabs.selectedIndex].id;
+      for (final page in orderStartupPages(settings.alwaysOpenTabs, devices)) {
+        await tabs.openStartupPage(page);
+      }
+      if (settings.defaultStartupTab != 'default') {
+        await tabs.openStartupPage(settings.defaultStartupTab);
+      } else {
+        tabs.focusTabById(restoredActiveTabId);
+      }
       if (!mounted) return;
       setState(() => _startupReady = true);
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -103,7 +133,10 @@ class _TopLevelShellState extends State<TopLevelShell>
       }
     } catch (error) {
       if (!mounted) return;
-      setState(() => _startupReady = true);
+      setState(() {
+        _startupReady = true;
+        _restoringTabs = false;
+      });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
@@ -114,6 +147,9 @@ class _TopLevelShellState extends State<TopLevelShell>
       });
     } finally {
       _restoreInProgress = false;
+      if (mounted && _restoringTabs) {
+        setState(() => _restoringTabs = false);
+      }
     }
   }
 
@@ -151,7 +187,9 @@ class _TopLevelShellState extends State<TopLevelShell>
   }
 
   bool _canSearch(TabEntry tab) =>
-      tab.id == 'home' || (!tab.isImageViewer && tab.storagePath != null);
+      tab.id == 'home' ||
+      tab.isVideoPage ||
+      (!tab.isImageViewer && tab.storagePath != null);
 
   void _ensureSelectedTabVisible() {
     if (tabs.tabs.isEmpty) return;
@@ -247,10 +285,19 @@ class _TopLevelShellState extends State<TopLevelShell>
           );
         }
         final selectedTab = tabs.tabs[tabs.selectedIndex];
+        final fontOffset = ref.watch(appSettingsProvider).textSizeOffset;
+        final tabScale = (13 + fontOffset) / 14;
+        final tabHeaderHeight = (52.8 + (fontOffset - 1) * 2.4)
+            .clamp(48, 67.2)
+            .toDouble();
+        final closeIconSize = (16 + fontOffset - 1) * 1.2;
+        final closeButtonSize = (24 + (fontOffset - 1) * 2) * 1.2;
         final open = ref.watch(settingsPanelProvider);
         final searchOpen =
             _canSearch(selectedTab) &&
             ref.watch(fileSearchProvider(selectedTab.sessionId)).isOpen;
+        final hideImageTabStrip =
+            selectedTab.isImageViewer && selectedTab.isFullscreen && !searchOpen;
         return PopScope(
           canPop: false,
           onPopInvokedWithResult: (didPop, result) async {
@@ -297,16 +344,16 @@ class _TopLevelShellState extends State<TopLevelShell>
           child: Stack(
             children: [
               Scaffold(
-                appBar:
-                    tabs.tabs[tabs.selectedIndex].isImageViewer &&
-                        tabs.tabs[tabs.selectedIndex].isFullscreen &&
-                        !searchOpen
-                    ? null
-                    : PreferredSize(
-                        preferredSize: const Size.fromHeight(44),
-                        child: SafeArea(
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                appBar: PreferredSize(
+                  preferredSize: Size.fromHeight(tabHeaderHeight),
+                  child: SafeArea(
+                    child: hideImageTabStrip
+                        ? SizedBox(height: tabHeaderHeight)
+                        : Container(
+                            key: _tabHeaderKey,
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 8 * tabScale,
+                            ),
                             color: Colors.lightBlue,
                             child: Row(
                               children: [
@@ -327,12 +374,14 @@ class _TopLevelShellState extends State<TopLevelShell>
                                         return GestureDetector(
                                           onTap: () => tabs.goTo(tabIndex),
                                           child: SizedBox(
-                                            width: isHome ? 60 : 100,
+                                            width:
+                                                (isHome ? 60 : 100) * tabScale,
                                             child: Container(
                                               key: key,
                                               padding: EdgeInsets.symmetric(
-                                                horizontal: isHome ? 0 : 8,
-                                                vertical: 4,
+                                                horizontal:
+                                                    (isHome ? 0 : 8) * tabScale,
+                                                vertical: 4 * tabScale,
                                               ),
                                               decoration: BoxDecoration(
                                                 color: selected
@@ -352,7 +401,7 @@ class _TopLevelShellState extends State<TopLevelShell>
                                                           .textTheme
                                                           .titleSmall
                                                           ?.copyWith(
-                                                            fontSize: 14,
+                                                            fontSize: 13,
                                                             color: selected
                                                                 ? Theme.of(
                                                                         context,
@@ -369,7 +418,9 @@ class _TopLevelShellState extends State<TopLevelShell>
                                                     ),
                                                   ),
                                                   if (!isHome) ...[
-                                                    const SizedBox(width: 4),
+                                                    SizedBox(
+                                                      width: 4 * tabScale,
+                                                    ),
                                                     GestureDetector(
                                                       onTap: () => unawaited(
                                                         tabs.requestCloseTab(
@@ -377,14 +428,14 @@ class _TopLevelShellState extends State<TopLevelShell>
                                                           tabs.tabs.indexOf(
                                                             tab,
                                                           ),
-                                                        ),
-                                                      ),
+                  ),
+                ),
                                                       child: SizedBox(
-                                                        width: 24,
-                                                        height: 24,
+                                                        width: closeButtonSize,
+                                                        height: closeButtonSize,
                                                         child: Icon(
                                                           Icons.close,
-                                                          size: 16,
+                                                          size: closeIconSize,
                                                           color: selected
                                                               ? Theme.of(
                                                                       context,
@@ -404,57 +455,132 @@ class _TopLevelShellState extends State<TopLevelShell>
                                       }
 
                                       final homeTab = tabs.tabs.first;
-                                      return Row(
-                                        children: [
-                                          buildTabChip(
+                                      return LayoutBuilder(
+                                        builder: (context, constraints) {
+                                          final stripHeight =
+                                              constraints.maxHeight;
+                                          final homeWidth = math.max(
+                                            stripHeight,
+                                            MediaQuery.sizeOf(context).width *
+                                                0.1,
+                                          );
+                                          final selected =
+                                              tabs.selectedIndex == 0;
+                                          final homeKey = _tabKeys.putIfAbsent(
                                             homeTab,
-                                            tabIndex: 0,
-                                            isHome: true,
-                                          ),
-                                          const SizedBox(width: 8),
-                                          Expanded(
-                                            child: SizedBox(
-                                              height: 38,
-                                              child: DragBoundary(
-                                                child: ReorderableListView.builder(
-                                                  scrollDirection:
-                                                      Axis.horizontal,
-                                                  padding: EdgeInsets.zero,
-                                                  buildDefaultDragHandles:
-                                                      false,
-                                                  dragBoundaryProvider:
-                                                      (context) =>
-                                                          DragBoundary.forRectOf(
-                                                            context,
+                                            () => GlobalKey(),
+                                          );
+                                          return Row(
+                                            children: [
+                                              SizedBox(
+                                                key: homeKey,
+                                                width: homeWidth,
+                                                height: stripHeight,
+                                                child: Tooltip(
+                                                  message: 'Home',
+                                                  child: Semantics(
+                                                    label: 'Home',
+                                                    button: true,
+                                                    child: Material(
+                                                      color: Colors.transparent,
+                                                      child: InkWell(
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              8,
+                                                            ),
+                                                        onTap: () =>
+                                                            tabs.goTo(0),
+                                                        child: Padding(
+                                                          padding:
+                                                              EdgeInsets.symmetric(
+                                                                vertical:
+                                                                    4 * tabScale,
+                                                              ),
+                                                          child: Container(
+                                                            decoration: BoxDecoration(
+                                                              color: selected
+                                                                  ? Theme.of(
+                                                                          context,
+                                                                        )
+                                                                        .colorScheme
+                                                                        .secondaryContainer
+                                                                  : Colors
+                                                                        .transparent,
+                                                              borderRadius:
+                                                                  BorderRadius.circular(
+                                                                    8,
+                                                                  ),
+                                                            ),
+                                                            alignment:
+                                                                Alignment.center,
+                                                            child: Icon(
+                                                              Icons.home,
+                                                              size:
+                                                                  22 * tabScale,
+                                                              color: selected
+                                                                  ? Theme.of(
+                                                                          context,
+                                                                        )
+                                                                        .colorScheme
+                                                                        .onSecondaryContainer
+                                                                  : null,
+                                                            ),
                                                           ),
-                                                  itemCount:
-                                                      tabs.tabs.length - 1,
-                                                  onReorderItem:
-                                                      (oldIndex, newIndex) {
-                                                        tabs.reorderTab(
-                                                          oldIndex + 1,
-                                                          newIndex + 1,
-                                                        );
-                                                      },
-                                                  itemBuilder: (context, index) {
-                                                    final tabIndex = index + 1;
-                                                    final tab =
-                                                        tabs.tabs[tabIndex];
-                                                    return ReorderableDelayedDragStartListener(
-                                                      key: ObjectKey(tab),
-                                                      index: index,
-                                                      child: buildTabChip(
-                                                        tab,
-                                                        tabIndex: tabIndex,
-                                                        isHome: false,
+                                                        ),
                                                       ),
-                                                    );
-                                                  },
+                                                    ),
+                                                  ),
                                                 ),
                                               ),
-                                            ),
-                                          ),
-                                        ],
+                                              SizedBox(width: 8 * tabScale),
+                                              Expanded(
+                                                child: SizedBox(
+                                                  height:
+                                                      stripHeight -
+                                                      6 * tabScale,
+                                                  child: DragBoundary(
+                                                    child: ReorderableListView.builder(
+                                                      scrollDirection:
+                                                          Axis.horizontal,
+                                                      padding: EdgeInsets.zero,
+                                                      buildDefaultDragHandles:
+                                                          false,
+                                                      dragBoundaryProvider:
+                                                          (context) =>
+                                                              DragBoundary.forRectOf(
+                                                                context,
+                                                              ),
+                                                      itemCount:
+                                                          tabs.tabs.length - 1,
+                                                      onReorderItem:
+                                                          (oldIndex, newIndex) {
+                                                            tabs.reorderTab(
+                                                              oldIndex + 1,
+                                                              newIndex + 1,
+                                                            );
+                                                          },
+                                                      itemBuilder: (context, index) {
+                                                        final tabIndex =
+                                                            index + 1;
+                                                        final tab =
+                                                            tabs.tabs[tabIndex];
+                                                        return ReorderableDelayedDragStartListener(
+                                                          key: ObjectKey(tab),
+                                                          index: index,
+                                                          child: buildTabChip(
+                                                            tab,
+                                                            tabIndex: tabIndex,
+                                                            isHome: false,
+                                                          ),
+                                                        );
+                                                      },
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          );
+                                        },
                                       );
                                     },
                                   ),
@@ -475,76 +601,171 @@ class _TopLevelShellState extends State<TopLevelShell>
                     final bottomInset = MediaQuery.viewPaddingOf(
                       context,
                     ).bottom;
-                    return Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        Padding(
-                          padding: EdgeInsets.only(
-                            bottom: panel == null
-                                ? 0
-                                : panelHeight + bottomInset,
-                          ),
-                          child: PageView.builder(
-                            controller: tabs.pageController,
-                            physics:
-                                selectedTab.isImageViewer &&
-                                    selectedTab.isImageZoomed
-                                ? const NeverScrollableScrollPhysics()
-                                : null,
-                            itemCount: tabs.tabs.length,
-                            findChildIndexCallback: (key) {
-                              if (key is! ObjectKey) return null;
-                              final index = tabs.tabs.indexWhere(
-                                (tab) => identical(tab, key.value),
-                              );
-                              return index < 0 ? null : index;
-                            },
-                            // When PageView reports a page change, update the selected index
-                            // without asking the PageController to jump again (prevents a
-                            // feedback loop that could revert the selection).
-                            onPageChanged: (i) => tabs.setSelectedFromPage(i),
-                            itemBuilder: (context, index) {
-                              final tab = tabs.tabs[index];
-                              return KeyedSubtree(
-                                key: ObjectKey(tab),
-                                child: MarqueeVisibility(
-                                  isVisible: index == tabs.selectedIndex,
-                                  child: tab.pageBuilder(),
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                        if (panel != null)
-                          Align(
-                            alignment: Alignment.bottomCenter,
-                            child: SizedBox(
-                              width: double.infinity,
-                              child: panel,
+                    final media = MediaQuery.of(context);
+                    final edgeSwipeEnabled =
+                        !searchOpen && !selectedTab.isFullscreen;
+                    void handlePointerDown(PointerDownEvent event) {
+                      if (!edgeSwipeEnabled ||
+                          open ||
+                          _edgeSwipePointer != null) {
+                        return;
+                      }
+                      final headerObject = _tabHeaderKey.currentContext
+                          ?.findRenderObject();
+                      if (headerObject is! RenderBox || !headerObject.hasSize) {
+                        return;
+                      }
+                      final headerBottom = headerObject
+                          .localToGlobal(Offset(0, headerObject.size.height))
+                          .dy;
+                      final systemGestureInset = media.systemGestureInsets.left;
+                      final stripWidth = media.size.width * 0.06;
+                      final bottomLimit = media.size.height - bottomInset;
+                      if (event.position.dx < systemGestureInset ||
+                          event.position.dx > systemGestureInset + stripWidth ||
+                          event.position.dy < headerBottom ||
+                          event.position.dy > bottomLimit) {
+                        return;
+                      }
+                      setState(() {
+                        _edgeSwipePointer = event.pointer;
+                        _edgeSwipeStart = event.position;
+                        _edgeSwipeDragging = false;
+                      });
+                    }
+
+                    void handlePointerMove(PointerMoveEvent event) {
+                      if (event.pointer != _edgeSwipePointer) return;
+                      final start = _edgeSwipeStart;
+                      if (start == null) return;
+                      final dx = event.position.dx - start.dx;
+                      final dy = event.position.dy - start.dy;
+                      if (!_edgeSwipeDragging) {
+                        if (dx <= kTouchSlop || dx <= dy.abs()) return;
+                        _edgeSwipeDragging = true;
+                        ref
+                                .read(
+                                  settingsPanelDragProgressProvider.notifier,
+                                )
+                                .state =
+                            0;
+                      }
+                      ref
+                          .read(settingsPanelDragProgressProvider.notifier)
+                          .state = (dx / (media.size.width * 0.8))
+                          .clamp(0, 1)
+                          .toDouble();
+                    }
+
+                    void finishEdgeSwipe(bool cancelled) {
+                      if (_edgeSwipePointer == null) return;
+                      if (_edgeSwipeDragging) {
+                        final progress = ref.read(
+                          settingsPanelDragProgressProvider,
+                        );
+                        final shouldOpen = !cancelled && (progress ?? 0) >= 0.5;
+                        final panel = ref.read(settingsPanelProvider.notifier);
+                        if (shouldOpen) {
+                          panel.open();
+                        } else {
+                          panel.close();
+                        }
+                        ref
+                                .read(
+                                  settingsPanelDragProgressProvider.notifier,
+                                )
+                                .state =
+                            null;
+                      }
+                      setState(() {
+                        _edgeSwipePointer = null;
+                        _edgeSwipeStart = null;
+                        _edgeSwipeDragging = false;
+                      });
+                    }
+
+                    return Listener(
+                      onPointerDown: handlePointerDown,
+                      onPointerMove: handlePointerMove,
+                      onPointerUp: (_) => finishEdgeSwipe(false),
+                      onPointerCancel: (_) => finishEdgeSwipe(true),
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          Padding(
+                            padding: EdgeInsets.only(
+                              bottom: panel == null
+                                  ? 0
+                                  : panelHeight + bottomInset,
+                            ),
+                            child: PageView.builder(
+                              key: ValueKey(tabs.pageController),
+                              controller: tabs.pageController,
+                              physics:
+                                  _edgeSwipePointer != null ||
+                                      (selectedTab.isImageViewer &&
+                                          selectedTab.isImageZoomed)
+                                  ? const NeverScrollableScrollPhysics()
+                                  : null,
+                              itemCount: tabs.tabs.length,
+                              findChildIndexCallback: (key) {
+                                if (key is! ObjectKey) return null;
+                                final index = tabs.tabs.indexWhere(
+                                  (tab) => identical(tab, key.value),
+                                );
+                                return index < 0 ? null : index;
+                              },
+                              // When PageView reports a page change, update the selected index
+                              // without asking the PageController to jump again (prevents a
+                              // feedback loop that could revert the selection).
+                              onPageChanged: (i) => tabs.setSelectedFromPage(i),
+                              itemBuilder: (context, index) {
+                                final tab = tabs.tabs[index];
+                                return KeyedSubtree(
+                                  key: ObjectKey(tab),
+                                  child: MarqueeVisibility(
+                                    isVisible: index == tabs.selectedIndex,
+                                    child: tab.pageBuilder(),
+                                  ),
+                                );
+                              },
                             ),
                           ),
-                        for (final tab in tabs.tabs.where(
-                          (tab) =>
-                              _canSearch(tab) && !identical(tab, selectedTab),
-                        ))
-                          SearchOverlay(
-                            key: ValueKey(tab.sessionId),
-                            sessionId: tab.sessionId,
-                            isActive: false,
-                          ),
-                        if (_canSearch(selectedTab))
-                          SearchOverlay(
-                            key: ValueKey(selectedTab.sessionId),
-                            sessionId: selectedTab.sessionId,
-                            isActive: true,
-                          ),
-                      ],
+                          if (panel != null)
+                            Align(
+                              alignment: Alignment.bottomCenter,
+                              child: SizedBox(
+                                width: double.infinity,
+                                child: panel,
+                              ),
+                            ),
+                          for (final tab in tabs.tabs.where(
+                            (tab) =>
+                                _canSearch(tab) && !identical(tab, selectedTab),
+                          ))
+                            SearchOverlay(
+                              key: ValueKey(tab.sessionId),
+                              sessionId: tab.sessionId,
+                              isActive: false,
+                            ),
+                          if (_canSearch(selectedTab))
+                            SearchOverlay(
+                              key: ValueKey(selectedTab.sessionId),
+                              sessionId: selectedTab.sessionId,
+                              isActive: true,
+                            ),
+                        ],
+                      ),
                     );
                   },
                 ),
               ),
               // Settings panel overlay
-              const SettingsPanel(),
+              SettingsPanel(tabHeaderKey: _tabHeaderKey),
+              if (_restoringTabs) ...[
+                const ModalBarrier(dismissible: false, color: Colors.black26),
+                const Center(child: CircularProgressIndicator()),
+              ],
             ],
           ),
         );

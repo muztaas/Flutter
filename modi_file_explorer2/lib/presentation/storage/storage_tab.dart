@@ -14,20 +14,33 @@ import '../../core/providers/default_file_apps_provider.dart';
 import '../../core/providers/file_type_categories_provider.dart';
 import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/sort_rules_provider.dart';
+import '../../core/constants/branding.dart';
+import '../../core/constants/selection_long_press_delay.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../core/utils/format_bytes.dart';
+import '../../core/utils/display_file_name.dart';
+import '../../core/utils/font_scaled_spacing.dart';
 import '../../core/utils/time_format.dart';
 import '../../core/utils/file_name_comparator.dart';
 import '../../domain/entities/default_file_app.dart';
 import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/quick_access_item.dart';
 import '../../domain/entities/search_scope.dart';
+import '../../domain/entities/storage_device.dart';
 import '../../domain/entities/sort_rule.dart';
 import '../../domain/entities/open_with_app.dart';
+import '../../domain/entities/video_player_item.dart';
+import '../../domain/utils/shared_storage_scan_scope.dart';
 import '../../domain/usecases/resolve_effective_sort_rule.dart';
 import '../image_viewer/image_file_preview.dart';
+import '../common/file_type_icon.dart';
 import '../common/open_with_label.dart' as open_with_label;
 import '../common/marquee_text.dart';
+import '../common/open_with_app_option.dart';
+import '../common/name_entry_dialog.dart';
+import '../common/open_video_file.dart';
+import '../archive/archive_manager_page.dart';
+import '../archive/archive_compression_dialog.dart';
 import '../common/search_action_button.dart';
 import '../common/storage_entry_row.dart';
 
@@ -63,30 +76,18 @@ class _OpenWithSelection {
     this.app,
     this.isTextEditor = false,
     this.isImageViewer = false,
+    this.isArchiveManager = false,
   });
 
   final OpenWithApp? app;
   final bool isTextEditor;
   final bool isImageViewer;
+  final bool isArchiveManager;
   final bool saveAsDefault;
 }
 
-Widget _openWithAppIcon(OpenWithApp app) {
-  if (app.iconBytes != null) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(6),
-      child: Image.memory(
-        app.iconBytes!,
-        width: 32,
-        height: 32,
-        fit: BoxFit.contain,
-        errorBuilder: (context, error, stackTrace) => const Icon(Icons.apps),
-      ),
-    );
-  }
-
-  return const Icon(Icons.apps);
-}
+Widget _builtInAppIcon() =>
+    Image.asset(Branding.logoPng, width: 32, height: 32, fit: BoxFit.contain);
 
 class _BatchRenameEntry {
   _BatchRenameEntry({
@@ -413,9 +414,12 @@ class StorageTab extends ConsumerStatefulWidget {
   final String? displayName;
   final bool imageOnly;
   final bool documentOnly;
+  final bool audioOnly;
+  final bool archiveOnly;
   final StorageCopySession? copySession;
   final Object? copySessionOwner;
   final ValueChanged<StorageTabLocation>? onPathChanged;
+  final String? initialAnchorPath;
   final String? restoreRootPath;
   const StorageTab({
     super.key,
@@ -424,9 +428,12 @@ class StorageTab extends ConsumerStatefulWidget {
     this.displayName,
     this.imageOnly = false,
     this.documentOnly = false,
+    this.audioOnly = false,
+    this.archiveOnly = false,
     this.copySession,
     this.copySessionOwner,
     this.onPathChanged,
+    this.initialAnchorPath,
     this.restoreRootPath,
   });
 
@@ -446,15 +453,28 @@ class StorageTabState extends ConsumerState<StorageTab>
   static final Map<String, Future<FileStat>> _statCache = {};
   static final Map<String, Future<int>> _itemCountCache = {};
   static final Map<String, bool> _imageContentCache = {};
+  final Map<String, GlobalKey> _itemKeys = {};
   Directory? _dir;
+  List<StorageDevice> _categoryDrives = const [];
+  List<StorageDevice> _allCategoryDrives = const [];
+  bool _showCategoryDrivePicker = false;
+  bool _categoryDriveSelected = false;
+  String? _categoryInitialPath;
   String? _anchorPath;
   List<String> _storageRootPaths = const [];
   Map<String, String> _storageIdsByRoot = const {};
   Map<String, String> _storageNamesByRoot = const {};
   List<FileSystemEntity> _items = [];
+  bool _isListScrolling = false;
+  bool _isRefreshing = false;
+  ({Directory directory, List<FileSystemEntity> items})? _pendingScanResult;
   final ScrollController _listScrollController = ScrollController();
+  final ScrollController _batchRenamePreviewController = ScrollController();
+  final ScrollController _batchRenameCollisionController = ScrollController();
+  final ScrollController _batchRenameResultsController = ScrollController();
   final Map<String, double> _lastKnownScrollOffsets = {};
   _ListScrollRestore? _pendingScrollRestore;
+  String? _topScrollResetPath;
   int _gridColumnCount = 1;
   bool _selectionMode = false;
   bool _showBreadcrumbPath = false;
@@ -466,6 +486,15 @@ class StorageTabState extends ConsumerState<StorageTab>
   final GlobalKey _menuKey = GlobalKey();
 
   List<FileSystemEntity> get _displayItems => _items;
+
+  static Future<void> refreshMountedDirectories(
+    Iterable<String> directoryPaths,
+  ) async {
+    final states = _mountedStorageTabs.toList(growable: false);
+    if (states.isNotEmpty) {
+      await states.first._refreshDirectories(directoryPaths);
+    }
+  }
 
   Timer? _pressTimer;
   bool _longPressTriggered = false;
@@ -492,7 +521,10 @@ class StorageTabState extends ConsumerState<StorageTab>
     try {
       await ref.read(sortRulesProvider.notifier).ready;
     } catch (_) {}
-    if (widget.imageOnly || widget.documentOnly) {
+    if (widget.imageOnly ||
+        widget.documentOnly ||
+        widget.audioOnly ||
+        widget.archiveOnly) {
       try {
         await ref.read(fileTypeCategoriesProvider.notifier).ready;
       } catch (_) {}
@@ -520,6 +552,8 @@ class StorageTabState extends ConsumerState<StorageTab>
       final devices = await ref
           .read(storageRepositoryProvider)
           .listStorageDevices();
+      _allCategoryDrives = devices;
+      _categoryDrives = devices;
       _storageRootPaths = devices.map((device) => device.path).toList();
       _storageIdsByRoot = {
         for (final device in devices) normalizeSortPath(device.path): device.id,
@@ -528,6 +562,25 @@ class StorageTabState extends ConsumerState<StorageTab>
         for (final device in devices)
           normalizeSortPath(device.path): device.name,
       };
+      _categoryInitialPath =
+          widget.restoreRootPath ??
+          path ??
+          devices.where((device) => device.id == 'internal').firstOrNull?.path;
+      final settings = ref.read(appSettingsProvider);
+      final atCategoryRoot =
+          _isCategoryTab &&
+          path != null &&
+          _normalizedPath(path) ==
+              _normalizedPath(_categoryInitialPath ?? '');
+      if (atCategoryRoot && settings.includeOtherDrivesInCategoryPages) {
+        _categoryDrives = await _categoryDrivesWithFiles(devices);
+        if (_categoryDrives.length == 1) {
+          path = _categoryDrives.single.path;
+          _anchorPath = path;
+        } else if (_categoryDrives.length > 1) {
+          _showCategoryDrivePicker = true;
+        }
+      }
       try {
         await ref
             .read(sortRulesProvider.notifier)
@@ -539,7 +592,80 @@ class StorageTabState extends ConsumerState<StorageTab>
       }
     } catch (_) {}
     if (!mounted) return;
-    _loadRoot(path, forceRefresh: true);
+    _loadRoot(path);
+  }
+
+  bool get _isCategoryTab =>
+      widget.imageOnly ||
+      widget.documentOnly ||
+      widget.audioOnly ||
+      widget.archiveOnly;
+
+  Future<List<StorageDevice>> _categoryDrivesWithFiles(
+    List<StorageDevice> devices,
+  ) async {
+    final matchingDrives = <StorageDevice>[];
+    for (final device in devices) {
+      try {
+        if (await _buildCategoryDirectoryCache(Directory(device.path))) {
+          matchingDrives.add(device);
+        }
+      } on FileSystemException catch (error) {
+        debugPrint(
+          'Could not check category files on ${device.name}: $error',
+        );
+      }
+    }
+    return matchingDrives;
+  }
+
+  Future<void> _refreshCategoryDriveOptions(
+    List<StorageDevice> devices,
+  ) async {
+    _allCategoryDrives = devices;
+    final settings = ref.read(appSettingsProvider);
+    final matchingDrives = settings.includeOtherDrivesInCategoryPages
+        ? await _categoryDrivesWithFiles(devices)
+        : devices;
+    if (!mounted) return;
+    final initialPath = _categoryInitialPath;
+    final atInitialRoot =
+        initialPath != null &&
+        _dir != null &&
+        _normalizedPath(_dir!.path) == _normalizedPath(initialPath);
+    if (!settings.includeOtherDrivesInCategoryPages) {
+      _categoryDrives = devices;
+      if (_showCategoryDrivePicker || _categoryDriveSelected) {
+        _categoryDriveSelected = false;
+        _showCategoryDrivePicker = false;
+        if (initialPath != null) {
+          _anchorPath = initialPath;
+          unawaited(_loadRoot(initialPath, forceRefresh: true));
+        }
+      } else {
+        setState(() {});
+      }
+      return;
+    }
+
+    _categoryDrives = matchingDrives;
+    if (atInitialRoot || _showCategoryDrivePicker) {
+      if (matchingDrives.length == 1) {
+        _categoryDriveSelected = false;
+        _showCategoryDrivePicker = false;
+        _anchorPath = matchingDrives.single.path;
+        unawaited(_loadRoot(matchingDrives.single.path, forceRefresh: true));
+      } else {
+        _categoryDriveSelected = false;
+        _showCategoryDrivePicker = matchingDrives.length > 1;
+        setState(() {});
+        if (matchingDrives.isEmpty && initialPath != null && atInitialRoot) {
+          unawaited(_loadRoot(initialPath, forceRefresh: true));
+        }
+      }
+    } else {
+      setState(() {});
+    }
   }
 
   @override
@@ -550,6 +676,9 @@ class StorageTabState extends ConsumerState<StorageTab>
     _listScrollController
       ..removeListener(_rememberScrollOffset)
       ..dispose();
+    _batchRenamePreviewController.dispose();
+    _batchRenameCollisionController.dispose();
+    _batchRenameResultsController.dispose();
     super.dispose();
   }
 
@@ -565,6 +694,19 @@ class StorageTabState extends ConsumerState<StorageTab>
     setState(() {});
   }
 
+  void _beginTopScrollReset(String path) {
+    _topScrollResetPath = _normalizedPath(path);
+  }
+
+  void _applyTopScrollReset(String path) {
+    if (_topScrollResetPath != _normalizedPath(path)) return;
+    _topScrollResetPath = null;
+    _pendingScrollRestore = const _ListScrollRestore(
+      itemPath: null,
+      fallbackOffset: 0,
+    );
+  }
+
   void _scheduleScrollRestoreAfterLayout() {
     final restore = _pendingScrollRestore;
     if (restore == null) return;
@@ -578,18 +720,24 @@ class StorageTabState extends ConsumerState<StorageTab>
 
       var requestedOffset = restore.fallbackOffset;
       final itemPath = restore.itemPath;
+      GlobalKey? targetKey;
       if (itemPath != null) {
         final targetIndex = _items.indexWhere(
           (item) => _normalizedPath(item.path) == _normalizedPath(itemPath),
         );
         if (targetIndex >= 0) {
+          targetKey = _itemKeys.putIfAbsent(itemPath, GlobalKey.new);
           final settings = ref.read(appSettingsProvider);
+          final spacingScale = fontScaledSpacing(context, 1);
           if (settings.defaultViewMode == 'grid') {
             requestedOffset =
-                8 + (targetIndex ~/ _gridColumnCount) * (70.4 + 8);
+                8 +
+                (targetIndex ~/ _gridColumnCount) * ((70.4 + 8) * spacingScale);
           } else {
             requestedOffset =
-                targetIndex * (_detailsEnabled(settings) ? 56 : 44);
+                targetIndex *
+                (_detailsEnabled(settings) ? 56 : 44) *
+                spacingScale;
           }
         }
       }
@@ -599,24 +747,67 @@ class StorageTabState extends ConsumerState<StorageTab>
           .clamp(position.minScrollExtent, position.maxScrollExtent)
           .toDouble();
       _listScrollController.jumpTo(clampedOffset);
-      _rememberScrollOffset();
-      _pendingScrollRestore = null;
-      setState(() {});
+      unawaited(_correctScrollRestore(restore, targetKey));
     });
   }
 
-  Future<void> _loadRoot(
-    String? path, {
-    bool forceRefresh = false,
-    bool userInitiatedRefresh = false,
-  }) async {
-    if ((widget.imageOnly || widget.documentOnly) &&
+  Future<void> _correctScrollRestore(
+    _ListScrollRestore restore,
+    GlobalKey? targetKey,
+  ) async {
+    for (var attempt = 0; attempt < 8; attempt++) {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted || !identical(_pendingScrollRestore, restore)) return;
+      if (!_listScrollController.hasClients || targetKey == null) break;
+      final targetObject = targetKey.currentContext?.findRenderObject();
+      final viewportObject = _listScrollController
+          .position
+          .context
+          .storageContext
+          .findRenderObject();
+      if (targetObject == null) continue;
+      if (targetObject is! RenderBox ||
+          viewportObject is! RenderBox ||
+          !targetObject.hasSize ||
+          !viewportObject.hasSize) {
+        break;
+      }
+      final targetTop = targetObject.localToGlobal(Offset.zero).dy;
+      final viewportTop = viewportObject.localToGlobal(Offset.zero).dy;
+      final correction = targetTop - viewportTop;
+      if (correction.abs() < 1) break;
+      final position = _listScrollController.position;
+      final nextOffset = (_listScrollController.offset + correction)
+          .clamp(position.minScrollExtent, position.maxScrollExtent)
+          .toDouble();
+      if ((nextOffset - _listScrollController.offset).abs() < 1) break;
+      _listScrollController.jumpTo(nextOffset);
+    }
+    if (!mounted || !identical(_pendingScrollRestore, restore)) return;
+    _rememberScrollOffset();
+    _pendingScrollRestore = null;
+    setState(() {});
+  }
+
+  Future<void> _loadRoot(String? path, {bool forceRefresh = false}) async {
+    final scanResultPage = _isCategoryTab;
+    final refreshOfCurrentPage =
+        scanResultPage &&
         forceRefresh &&
-        !userInitiatedRefresh &&
         path != null &&
         _dir != null &&
-        _normalizedPath(path) == _normalizedPath(_dir!.path)) {
-      return;
+        _normalizedPath(path) == _normalizedPath(_dir!.path);
+    final preserveCurrentResults =
+        forceRefresh &&
+        path != null &&
+        _dir != null &&
+        _normalizedPath(path) == _normalizedPath(_dir!.path);
+    if (scanResultPage &&
+        !refreshOfCurrentPage &&
+        path != null &&
+        _dir != null &&
+        _normalizedPath(path) != _normalizedPath(_dir!.path)) {
+      _pendingScanResult = null;
     }
     if (path != null && widget.restoreRootPath != null) {
       path = await _nearestExistingPath(path, widget.restoreRootPath!);
@@ -645,19 +836,67 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
 
     // set anchor path on first load so this tab won't navigate above it
-    _anchorPath ??= widget.restoreRootPath ?? dir.path;
+    _anchorPath ??=
+        widget.initialAnchorPath ?? widget.restoreRootPath ?? dir.path;
     if (!widget.imageOnly) _syncSortChoice(_currentRules(), dir.path);
     if (forceRefresh) _invalidateMetadataCache(dir.path);
 
     final cacheKey = _directoryCacheKey(dir.path);
-    final cachedItems = _directoryCache[cacheKey];
+    var cachedItems = _directoryCache[cacheKey];
+    if (_isCategoryTab && (forceRefresh || cachedItems == null)) {
+      try {
+        await _buildCategoryDirectoryCache(Directory(_anchorPath ?? dir.path));
+      } on FileSystemException catch (error) {
+        if (mounted) _message('Could not scan this category: $error');
+        return;
+      }
+      cachedItems = _directoryCache[cacheKey] ?? const [];
+      if (!mounted) return;
+      _sortList(cachedItems, _sortBy, _sortAscending);
+      final indexedItems = List<FileSystemEntity>.of(cachedItems);
+      if (preserveCurrentResults &&
+          !await _directoryEntriesChanged(_items, indexedItems)) {
+        _pendingScanResult = null;
+        return;
+      }
+      if (refreshOfCurrentPage &&
+          _isListScrolling &&
+          _dir != null &&
+          _normalizedPath(_dir!.path) == _normalizedPath(dir.path)) {
+        _pendingScanResult = (directory: dir, items: indexedItems);
+        return;
+      }
+      _applyTopScrollReset(dir.path);
+      setState(() {
+        _dir = dir;
+        _items = indexedItems;
+        _showCategoryDrivePicker =
+            !_categoryDriveSelected &&
+            ref.read(appSettingsProvider).includeOtherDrivesInCategoryPages &&
+            _categoryDrives.length > 1 &&
+            _normalizedPath(dir.path) ==
+                _normalizedPath(_categoryInitialPath ?? '');
+      });
+      _reportCurrentLocation(dir.path);
+      _scheduleScrollRestoreAfterLayout();
+      _copySession.notifyChanged();
+      return;
+    }
     if (!forceRefresh && cachedItems != null) {
       final items = List<FileSystemEntity>.of(cachedItems);
       _sortList(items, _sortBy, _sortAscending);
       if (!mounted) return;
+      _applyTopScrollReset(dir.path);
       setState(() {
         _dir = dir;
         _items = items;
+        _showCategoryDrivePicker =
+            _isCategoryTab &&
+            !_categoryDriveSelected &&
+            ref.read(appSettingsProvider).includeOtherDrivesInCategoryPages &&
+            _categoryDrives.length > 1 &&
+            _normalizedPath(dir.path) ==
+                _normalizedPath(_categoryInitialPath ?? '');
       });
       _reportCurrentLocation(dir.path);
       _scheduleScrollRestoreAfterLayout();
@@ -680,6 +919,9 @@ class StorageTabState extends ConsumerState<StorageTab>
           if (name == '.nomedia' && settings.showNomediaFiles) return false;
           return !settings.showHiddenFiles && name.startsWith('.');
         });
+      }
+      if (_isCategoryTab) {
+        items.removeWhere((item) => !_isInSharedScanScope(item.path));
       }
       if (widget.imageOnly) {
         final visibleItems = <FileSystemEntity>[];
@@ -712,22 +954,128 @@ class StorageTabState extends ConsumerState<StorageTab>
           }
         }
         items = visibleItems;
+      } else if (widget.audioOnly) {
+        final audioCategory = ref
+            .read(fileTypeCategoriesProvider)
+            .where((category) => category.name == 'Audio')
+            .firstOrNull;
+        final audioExtensions =
+            audioCategory?.extensions
+                .map(FileTypeCategory.normalizeExtension)
+                .toSet() ??
+            const <String>{};
+        final visibleItems = <FileSystemEntity>[];
+        for (final item in items) {
+          if (item is File &&
+              audioExtensions.contains(
+                _fileExtension(_displayName(item.path)).toLowerCase(),
+              )) {
+            visibleItems.add(item);
+          } else if (item is Directory &&
+              await _containsCategoryAudio(item, audioExtensions)) {
+            visibleItems.add(item);
+          }
+        }
+        items = visibleItems;
+      } else if (widget.archiveOnly) {
+        final archiveExtensions = _categoryExtensions('Archives');
+        final visibleItems = <FileSystemEntity>[];
+        for (final item in items) {
+          if (item is File &&
+              archiveExtensions.contains(
+                _fileExtension(_displayName(item.path)).toLowerCase(),
+              )) {
+            visibleItems.add(item);
+          } else if (item is Directory &&
+              await _containsCategoryFiles(item, archiveExtensions)) {
+            visibleItems.add(item);
+          }
+        }
+        items = visibleItems;
       }
       _sortList(items, _sortBy, _sortAscending);
-    } catch (_) {
+    } catch (error) {
+      if (preserveCurrentResults) {
+        if (mounted) _message('Could not refresh this folder: $error');
+        return;
+      }
       items = [];
     }
 
     _directoryCache[cacheKey] = items;
 
     if (!mounted) return;
+    if (preserveCurrentResults &&
+        !await _directoryEntriesChanged(_items, items)) {
+      _pendingScanResult = null;
+      return;
+    }
+    if (refreshOfCurrentPage &&
+        _isListScrolling &&
+        _dir != null &&
+        _normalizedPath(_dir!.path) == _normalizedPath(dir.path)) {
+      _pendingScanResult = (directory: dir, items: items);
+      return;
+    }
+    _applyTopScrollReset(dir.path);
     setState(() {
       _dir = dir;
       _items = items;
+      _showCategoryDrivePicker =
+          _isCategoryTab &&
+          !_categoryDriveSelected &&
+          ref.read(appSettingsProvider).includeOtherDrivesInCategoryPages &&
+          _categoryDrives.length > 1 &&
+          _normalizedPath(dir.path) ==
+              _normalizedPath(_categoryInitialPath ?? '');
     });
     _reportCurrentLocation(dir.path);
     _scheduleScrollRestoreAfterLayout();
     _copySession.notifyChanged();
+  }
+
+  Future<bool> _directoryEntriesChanged(
+    List<FileSystemEntity> previous,
+    List<FileSystemEntity> next,
+  ) async {
+    if (previous.length != next.length) return true;
+    for (var index = 0; index < previous.length; index++) {
+      final oldEntry = previous[index];
+      final newEntry = next[index];
+      if (oldEntry.path != newEntry.path ||
+          oldEntry.runtimeType != newEntry.runtimeType) {
+        return true;
+      }
+      try {
+        final oldStat = await oldEntry.stat();
+        final newStat = await newEntry.stat();
+        if (oldStat.type != newStat.type ||
+            oldStat.size != newStat.size ||
+            oldStat.modified != newStat.modified) {
+          return true;
+        }
+      } on FileSystemException {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Future<void> _refreshCurrentPage() async {
+    if (_isRefreshing) return;
+    setState(() => _isRefreshing = true);
+    try {
+      if (_showCategoryDrivePicker) {
+        await ref.read(availableStorageDevicesProvider.notifier).refresh();
+      } else if (_dir != null) {
+        if (_showBreadcrumbPath) {
+          setState(() => _showBreadcrumbPath = false);
+        }
+        await _loadRoot(_dir!.path, forceRefresh: true);
+      }
+    } finally {
+      if (mounted) setState(() => _isRefreshing = false);
+    }
   }
 
   Future<String> _nearestExistingPath(String path, String rootPath) async {
@@ -752,7 +1100,108 @@ class StorageTabState extends ConsumerState<StorageTab>
       ? 'imageStorage:$path'
       : widget.documentOnly
       ? 'documentStorage:$path'
+      : widget.audioOnly
+      ? 'audioStorage:$path'
+      : widget.archiveOnly
+      ? 'archiveStorage:$path'
       : path;
+
+  Future<bool> _buildCategoryDirectoryCache(Directory root) async {
+    final categoryPrefix = widget.imageOnly
+        ? 'imageStorage:'
+        : widget.documentOnly
+        ? 'documentStorage:'
+        : widget.audioOnly
+        ? 'audioStorage:'
+        : 'archiveStorage:';
+    final settings = ref.read(appSettingsProvider);
+    final categoryName = widget.imageOnly
+        ? 'Image'
+        : widget.documentOnly
+        ? 'Documents'
+        : widget.audioOnly
+        ? 'Audio'
+        : 'Archives';
+    final extensions =
+        ref
+            .read(fileTypeCategoriesProvider)
+            .where((category) => category.name == categoryName)
+            .firstOrNull
+            ?.extensions
+            .map(FileTypeCategory.normalizeExtension)
+            .toSet() ??
+        const <String>{};
+    final rootPath = _normalizedPath(root.path);
+    final rootKey = _normalizedPath(_drivePathFor(root.path));
+    final scannedEntries = <String, List<FileSystemEntity>>{};
+
+    Future<bool> scanDirectory(Directory directory) async {
+      final normalizedDirectory = _normalizedPath(directory.path);
+      if (normalizedDirectory != rootPath &&
+          !normalizedDirectory.startsWith('$rootPath/')) {
+        return false;
+      }
+      try {
+        final entries = await directory.list(followLinks: false).toList();
+        final hasNoMedia =
+            normalizedDirectory != rootKey &&
+            entries.any((entry) => _displayName(entry.path) == '.nomedia');
+        if (!settings.showNomediaFiles && hasNoMedia) {
+          scannedEntries[_directoryCacheKey(directory.path)] = const [];
+          return false;
+        }
+
+        final visible = <FileSystemEntity>[];
+        var containsCategoryFile = false;
+        for (final entry in entries) {
+          final name = _displayName(entry.path);
+          if (!settings.showHiddenFiles &&
+              name.startsWith('.') &&
+              !(name == '.nomedia' && settings.showNomediaFiles)) {
+            continue;
+          }
+          if (entry is File) {
+            if (_isInSharedScanScope(entry.path) &&
+                extensions.contains(_fileExtension(name).toLowerCase())) {
+              visible.add(entry);
+              containsCategoryFile = true;
+            } else if (name == '.nomedia' && settings.showNomediaFiles) {
+              visible.add(entry);
+            }
+            continue;
+          }
+          if (entry is! Directory || !_isInSharedScanScope(entry.path)) {
+            continue;
+          }
+          try {
+            if (await scanDirectory(entry)) {
+              visible.add(entry);
+              containsCategoryFile = true;
+            }
+          } on FileSystemException catch (error) {
+            debugPrint('Could not scan category folder ${entry.path}: $error');
+          }
+        }
+        _sortList(visible, _sortBy, _sortAscending);
+        scannedEntries[_directoryCacheKey(directory.path)] = visible;
+        return containsCategoryFile;
+      } on FileSystemException catch (error) {
+        debugPrint('Could not scan category folder ${directory.path}: $error');
+        if (normalizedDirectory == rootPath) rethrow;
+        scannedEntries[_directoryCacheKey(directory.path)] = const [];
+        return false;
+      }
+    }
+
+    final hasCategoryFiles = await scanDirectory(root);
+    _directoryCache.removeWhere((key, _) {
+      if (!key.startsWith(categoryPrefix)) return false;
+      final cachedPath = _normalizedPath(key.substring(categoryPrefix.length));
+      return cachedPath == rootPath || cachedPath.startsWith('$rootPath/');
+    });
+    _directoryCache.addAll(scannedEntries);
+    return hasCategoryFiles;
+  }
 
   void _reportCurrentLocation(String path) {
     final rootPath = _drivePathFor(path);
@@ -781,6 +1230,10 @@ class StorageTabState extends ConsumerState<StorageTab>
         ? SearchCategory.images
         : widget.documentOnly
         ? SearchCategory.documents
+        : widget.audioOnly
+        ? SearchCategory.audio
+        : widget.archiveOnly
+        ? SearchCategory.archives
         : null;
 
     return SearchScope.forLocation(
@@ -800,6 +1253,21 @@ class StorageTabState extends ConsumerState<StorageTab>
           categories: ref.read(fileTypeCategoriesProvider),
         ) ==
         'Image';
+  }
+
+  bool _isInSharedScanScope(String path) {
+    final normalizedPath = _normalizedPath(path);
+    final driveRoot = _normalizedPath(_drivePathFor(path));
+    final relativePath = normalizedPath == driveRoot
+        ? ''
+        : normalizedPath.substring(driveRoot.length + 1);
+    final settings = ref.read(appSettingsProvider);
+    if (_isCategoryTab &&
+        settings.hideAndroidFoldersInCategoryPages &&
+        SharedStorageScanScope.isInsideAndroidFolder(relativePath)) {
+      return false;
+    }
+    return SharedStorageScanScope.shouldDescendIntoRelativePath(relativePath);
   }
 
   List<String> _visibleImagePaths() => _items
@@ -822,6 +1290,7 @@ class StorageTabState extends ConsumerState<StorageTab>
       }
       try {
         await for (final entity in current.list(followLinks: false)) {
+          if (!_isInSharedScanScope(entity.path)) continue;
           final name = _displayName(entity.path);
           if (!settings.showHiddenFiles && name.startsWith('.')) continue;
           if (entity is File && _isImageFile(entity)) {
@@ -858,6 +1327,7 @@ class StorageTabState extends ConsumerState<StorageTab>
       }
       try {
         await for (final entity in current.list(followLinks: false)) {
+          if (!_isInSharedScanScope(entity.path)) continue;
           final name = _displayName(entity.path);
           if (!settings.showHiddenFiles && name.startsWith('.')) continue;
           if (entity is File &&
@@ -875,14 +1345,151 @@ class StorageTabState extends ConsumerState<StorageTab>
     return false;
   }
 
+  Future<bool> _containsCategoryAudio(
+    Directory directory,
+    Set<String> audioExtensions,
+  ) async {
+    final sortedExtensions = audioExtensions.toList()..sort();
+    final cacheKey =
+        'audio:${_normalizedPath(directory.path)}:${sortedExtensions.join(',')}';
+    final cached = _imageContentCache[cacheKey];
+    if (cached != null) return cached;
+
+    final settings = ref.read(appSettingsProvider);
+    final pending = <Directory>[directory];
+    while (pending.isNotEmpty) {
+      final current = pending.removeLast();
+      if (!settings.showNomediaFiles &&
+          await _isInsideNoMediaDirectory(current)) {
+        continue;
+      }
+      try {
+        await for (final entity in current.list(followLinks: false)) {
+          if (!_isInSharedScanScope(entity.path)) continue;
+          final name = _displayName(entity.path);
+          if (!settings.showHiddenFiles && name.startsWith('.')) continue;
+          if (entity is File &&
+              audioExtensions.contains(_fileExtension(name).toLowerCase())) {
+            _imageContentCache[cacheKey] = true;
+            return true;
+          }
+          if (entity is Directory) pending.add(entity);
+        }
+      } on FileSystemException {
+        continue;
+      }
+    }
+    _imageContentCache[cacheKey] = false;
+    return false;
+  }
+
+  Set<String> _categoryExtensions(String categoryName) =>
+      ref
+          .read(fileTypeCategoriesProvider)
+          .where((category) => category.name == categoryName)
+          .firstOrNull
+          ?.extensions
+          .map(FileTypeCategory.normalizeExtension)
+          .toSet() ??
+      const <String>{};
+
+  Future<bool> _containsCategoryFiles(
+    Directory directory,
+    Set<String> extensions,
+  ) async {
+    final sortedExtensions = extensions.toList()..sort();
+    final cacheKey =
+        'archives:${_normalizedPath(directory.path)}:${sortedExtensions.join(',')}';
+    final cached = _imageContentCache[cacheKey];
+    if (cached != null) return cached;
+
+    final settings = ref.read(appSettingsProvider);
+    final pending = <Directory>[directory];
+    while (pending.isNotEmpty) {
+      final current = pending.removeLast();
+      if (!settings.showNomediaFiles &&
+          await _isInsideNoMediaDirectory(current)) {
+        continue;
+      }
+      try {
+        await for (final entity in current.list(followLinks: false)) {
+          if (!_isInSharedScanScope(entity.path)) continue;
+          final name = _displayName(entity.path);
+          if (!settings.showHiddenFiles && name.startsWith('.')) continue;
+          if (entity is File &&
+              extensions.contains(_fileExtension(name).toLowerCase())) {
+            _imageContentCache[cacheKey] = true;
+            return true;
+          }
+          if (entity is Directory) pending.add(entity);
+        }
+      } on FileSystemException {
+        continue;
+      }
+    }
+    _imageContentCache[cacheKey] = false;
+    return false;
+  }
+
+  Future<void> _selectCategoryDrive(StorageDevice drive) async {
+    _breadcrumbReturnPaths.clear();
+    _categoryDriveSelected = true;
+    _anchorPath = drive.path;
+    _reportCurrentLocation(drive.path);
+    await _loadRoot(drive.path);
+  }
+
+  Widget _buildCategoryDrivePicker() {
+    final drives = _categoryDrives;
+    if (drives.isEmpty) {
+      return const Center(child: Text('No storage devices found'));
+    }
+    return Scrollbar(
+      thumbVisibility: true,
+      interactive: true,
+      child: ListView.builder(
+        itemCount: drives.length,
+        itemBuilder: (context, index) {
+          final drive = drives[index];
+          return StorageEntryRow(
+            leading: const Icon(Icons.sd_storage_outlined),
+            content: MarqueeText(
+              drive.name,
+              style: Theme.of(context).textTheme.titleSmall,
+              styleMode: MarqueeStyle.pauseAndLoop,
+            ),
+            onTap: () => unawaited(_selectCategoryDrive(drive)),
+          );
+        },
+      ),
+    );
+  }
+
   /// Called by the shell to let this tab handle a back press.
   /// Returns true if the back was handled (e.g. navigated up), false to indicate
   /// the tab is at its root and did not handle the back.
   Future<bool> handleWillPop() async {
+    if (_isCategoryTab &&
+        _categoryDriveSelected &&
+        _dir != null &&
+        _normalizedPath(_dir!.path) == _normalizedPath(_anchorPath ?? '')) {
+      setState(() {
+        _showCategoryDrivePicker = true;
+        _categoryDriveSelected = false;
+        _anchorPath = _categoryInitialPath;
+        _selectionMode = false;
+        _selected.clear();
+      });
+      final initialPath = _categoryInitialPath ?? _dir!.path;
+      _reportCurrentLocation(initialPath);
+      unawaited(_loadRoot(initialPath));
+      return true;
+    }
     if (_showBreadcrumbPath) {
       setState(() => _showBreadcrumbPath = false);
       return true;
     }
+
     if (_selectionMode) {
       setState(() {
         _selectionMode = false;
@@ -911,7 +1518,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         ),
       );
       _reportCurrentLocation(returnPath);
-      _loadRoot(returnPath, forceRefresh: true);
+      _loadRoot(returnPath);
       return true;
     }
     // If we're at or above the tab's anchor/root, do not handle back here.
@@ -934,7 +1541,7 @@ class StorageTabState extends ConsumerState<StorageTab>
       ),
     );
     _reportCurrentLocation(parent.path);
-    _loadRoot(parent.path, forceRefresh: true);
+    _loadRoot(parent.path);
     return true;
   }
 
@@ -957,8 +1564,9 @@ class StorageTabState extends ConsumerState<StorageTab>
 
     if (e is Directory) {
       _breadcrumbReturnPaths.clear();
+      _beginTopScrollReset(e.path);
       _reportCurrentLocation(e.path);
-      _loadRoot(e.path, forceRefresh: true);
+      _loadRoot(e.path);
       return;
     }
 
@@ -978,7 +1586,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     await _showOpenWithApplications(
       file,
       widget.documentOnly ? 'Documents' : _categoryForFile(file),
-      allowBuiltInHandlers: !widget.documentOnly,
+      allowBuiltInHandlers: true,
     );
   }
 
@@ -1839,35 +2447,41 @@ class StorageTabState extends ConsumerState<StorageTab>
                 ),
               ),
             Expanded(
-              child: ListView.builder(
-                itemCount: entries.length,
-                itemBuilder: (context, index) {
-                  final entry = entries[index];
-                  final collision = collisions
-                      .where((item) => identical(item.entry, entry))
-                      .firstOrNull;
-                  final detail = entry.skipped
-                      ? 'Skipped'
-                      : collision != null
-                      ? collision.isDuplicatePlan
-                            ? 'Also assigned to ${collision.occupantName}'
-                            : 'Conflicts with ${collision.occupantName}'
-                      : entry.overwrite
-                      ? 'Will overwrite existing item'
-                      : null;
-                  return ListTile(
-                    dense: true,
-                    title: Text(
-                      '${entry.oldName}  →  ${entry.skipped ? 'Skip' : entry.targetName}',
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    subtitle: detail == null ? null : Text(detail),
-                    textColor: collision == null
-                        ? null
-                        : Theme.of(context).colorScheme.error,
-                  );
-                },
+              child: Scrollbar(
+                controller: _batchRenamePreviewController,
+                thumbVisibility: true,
+                interactive: true,
+                child: ListView.builder(
+                  controller: _batchRenamePreviewController,
+                  itemCount: entries.length,
+                  itemBuilder: (context, index) {
+                    final entry = entries[index];
+                    final collision = collisions
+                        .where((item) => identical(item.entry, entry))
+                        .firstOrNull;
+                    final detail = entry.skipped
+                        ? 'Skipped'
+                        : collision != null
+                        ? collision.isDuplicatePlan
+                              ? 'Also assigned to ${collision.occupantName}'
+                              : 'Conflicts with ${collision.occupantName}'
+                        : entry.overwrite
+                        ? 'Will overwrite existing item'
+                        : null;
+                    return ListTile(
+                      dense: true,
+                      title: Text(
+                        '${entry.oldName}  →  ${entry.skipped ? 'Skip' : entry.targetName}',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: detail == null ? null : Text(detail),
+                      textColor: collision == null
+                          ? null
+                          : Theme.of(context).colorScheme.error,
+                    );
+                  },
+                ),
               ),
             ),
           ],
@@ -1902,24 +2516,30 @@ class StorageTabState extends ConsumerState<StorageTab>
         content: SizedBox(
           width: 420,
           height: 280,
-          child: ListView(
-            children: collisions
-                .map(
-                  (collision) => ListTile(
-                    dense: true,
-                    title: Text(
-                      '${collision.entry.oldName}  →  ${collision.entry.targetName}',
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
+          child: Scrollbar(
+            controller: _batchRenameCollisionController,
+            thumbVisibility: true,
+            interactive: true,
+            child: ListView(
+              controller: _batchRenameCollisionController,
+              children: collisions
+                  .map(
+                    (collision) => ListTile(
+                      dense: true,
+                      title: Text(
+                        '${collision.entry.oldName}  →  ${collision.entry.targetName}',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        collision.isDuplicatePlan
+                            ? 'Duplicates another generated name'
+                            : 'Already exists: ${collision.occupantName}',
+                      ),
                     ),
-                    subtitle: Text(
-                      collision.isDuplicatePlan
-                          ? 'Duplicates another generated name'
-                          : 'Already exists: ${collision.occupantName}',
-                    ),
-                  ),
-                )
-                .toList(),
+                  )
+                  .toList(),
+            ),
           ),
         ),
         actions: [
@@ -2253,27 +2873,33 @@ class StorageTabState extends ConsumerState<StorageTab>
       content: SizedBox(
         width: 460,
         height: 360,
-        child: ListView.builder(
-          itemCount: results.length,
-          itemBuilder: (context, index) {
-            final result = results[index];
-            return ListTile(
-              dense: true,
-              title: Text(
-                '${result.entry.oldName}  →  ${result.status == 'Skipped' ? 'Skipped' : result.entry.targetName}',
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-              subtitle: result.error == null ? null : Text(result.error!),
-              leading: Icon(
-                result.status.startsWith('Renamed')
-                    ? Icons.check_circle_outline
-                    : result.status == 'Skipped'
-                    ? Icons.skip_next
-                    : Icons.error_outline,
-              ),
-            );
-          },
+        child: Scrollbar(
+          controller: _batchRenameResultsController,
+          thumbVisibility: true,
+          interactive: true,
+          child: ListView.builder(
+            controller: _batchRenameResultsController,
+            itemCount: results.length,
+            itemBuilder: (context, index) {
+              final result = results[index];
+              return ListTile(
+                dense: true,
+                title: Text(
+                  '${result.entry.oldName}  →  ${result.status == 'Skipped' ? 'Skipped' : result.entry.targetName}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: result.error == null ? null : Text(result.error!),
+                leading: Icon(
+                  result.status.startsWith('Renamed')
+                      ? Icons.check_circle_outline
+                      : result.status == 'Skipped'
+                      ? Icons.skip_next
+                      : Icons.error_outline,
+                ),
+              );
+            },
+          ),
         ),
       ),
       actions: [
@@ -2322,13 +2948,11 @@ class StorageTabState extends ConsumerState<StorageTab>
     required String extensionNote,
     String initialName = '',
   }) async {
-    return showDialog<String>(
-      context: context,
-      builder: (_) => _NewNameDialog(
-        title: title,
-        extensionNote: extensionNote,
-        initialName: initialName,
-      ),
+    return showNameEntryDialog(
+      context,
+      title: title,
+      extensionNote: extensionNote,
+      initialName: initialName,
     );
   }
 
@@ -2470,6 +3094,8 @@ class StorageTabState extends ConsumerState<StorageTab>
           value: 'select_all',
           child: Text(allItemsSelected ? 'Unselect All' : 'Select All'),
         ),
+        if (_selectedCompressionItems().length == _selected.length)
+          const PopupMenuItem(value: 'compress', child: Text('Compress')),
         const PopupMenuItem(value: 'rename', child: Text('Rename')),
         PopupMenuItem(
           value: 'copy',
@@ -2488,6 +3114,13 @@ class StorageTabState extends ConsumerState<StorageTab>
         ),
         const PopupMenuItem(value: 'properties', child: Text('Properties')),
       ];
+      final selectedArchiveFiles = _selectedArchiveFiles();
+      if (selectedArchiveFiles.length == _selected.length) {
+        entries.insertAll(0, const [
+          PopupMenuItem(value: 'extract_here', child: Text('Extract here')),
+          PopupMenuItem(value: 'extract_to', child: Text('Extract to...')),
+        ]);
+      }
       if (_selected.length == 1) {
         final selectedPath = _selected.first;
         final selectedItem = _items
@@ -2603,6 +3236,17 @@ class StorageTabState extends ConsumerState<StorageTab>
       case 'open_as':
         _showOpenAsCategories();
         break;
+      case 'extract_here':
+        if (_dir != null) {
+          unawaited(_extractSelectedArchives(_dir!.path));
+        }
+        break;
+      case 'extract_to':
+        unawaited(_extractSelectedArchivesToPickedFolder());
+        break;
+      case 'compress':
+        unawaited(_compressSelectedItems());
+        break;
       case 'copy':
       case 'cut':
         final itemsByPath = {for (final item in _items) item.path: item};
@@ -2617,6 +3261,7 @@ class StorageTabState extends ConsumerState<StorageTab>
           );
           break;
         }
+
         setState(() {
           _selected.clear();
           _selectionMode = false;
@@ -2627,6 +3272,132 @@ class StorageTabState extends ConsumerState<StorageTab>
         }
         break;
     }
+  }
+
+  List<File> _selectedArchiveFiles() {
+    final selectedItems = _items
+        .where((item) => _selected.contains(item.path))
+        .toList(growable: false);
+    if (selectedItems.length != _selected.length ||
+        selectedItems.any((item) => item is! File)) {
+      return const [];
+    }
+    final files = selectedItems.cast<File>();
+    if (files.any((file) => _categoryForFile(file) != 'Archives')) {
+      return const [];
+    }
+    return files;
+  }
+
+  List<FileSystemEntity> _selectedCompressionItems() {
+    final selectedItems = _items
+        .where((item) => _selected.contains(item.path))
+        .toList(growable: false);
+    if (selectedItems.length != _selected.length ||
+        selectedItems.any((item) => item is! File && item is! Directory)) {
+      return const [];
+    }
+    return selectedItems;
+  }
+
+  Future<void> _compressSelectedItems() async {
+    final directory = _dir;
+    final items = _selectedCompressionItems();
+    if (directory == null || items.isEmpty) {
+      _message('Compress is not available: select files or folders first');
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    final outcome = await showDialog<ArchiveCompressionOutcome>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => ArchiveCompressionDialog(
+        sourcePaths: items.map((item) => item.path).toList(growable: false),
+        destinationPath: directory.path,
+        onBackgroundComplete: (result) async {
+          final outputParent = result.outputPath.replaceFirst(
+            RegExp(r'[/\\][^/\\]+$'),
+            '',
+          );
+          String? refreshError;
+          try {
+            await StorageTabState.refreshMountedDirectories({
+              directory.path,
+              outputParent,
+            });
+          } catch (error) {
+            refreshError = 'Could not refresh after compression: $error';
+          }
+          final message = [
+            if (result.error != null) result.error!,
+            if (result.error == null)
+              result.cancelled
+                  ? 'Compression cancelled'
+                  : 'Compression complete: ${_displayName(result.outputPath)}',
+            if (refreshError != null) refreshError,
+          ].join('\n');
+          messenger.showSnackBar(SnackBar(content: Text(message)));
+        },
+      ),
+    );
+    if (!mounted || outcome == null) return;
+    if (outcome.runningInBackground) {
+      setState(() {
+        _selected.clear();
+        _selectionMode = false;
+      });
+      return;
+    }
+    final outputParent = outcome.outputPath.replaceFirst(
+      RegExp(r'[/\\][^/\\]+$'),
+      '',
+    );
+    await StorageTabState.refreshMountedDirectories({
+      directory.path,
+      outputParent,
+    });
+    if (!mounted || outcome.cancelled) return;
+    setState(() {
+      _selected.clear();
+      _selectionMode = false;
+    });
+  }
+
+  Future<void> _extractSelectedArchivesToPickedFolder() async {
+    final destination = await showDialog<String>(
+      context: context,
+      builder: (_) => const ArchiveFolderPickerDialog(),
+    );
+    if (!mounted || destination == null) return;
+    await _extractSelectedArchives(destination);
+  }
+
+  Future<void> _extractSelectedArchives(String destination) async {
+    final archives = _selectedArchiveFiles();
+    if (archives.isEmpty) return;
+    setState(() {
+      _selected.clear();
+      _selectionMode = false;
+    });
+    void openArchive(int index) {
+      if (index >= archives.length) return;
+      final archive = archives[index];
+      TabsManager.instance.openArchiveManagerTab(
+        archive.path,
+        allowDuplicate: true,
+        autoExtractTo: destination,
+        closeAfterAutoExtraction: true,
+        onAutoExtractionComplete: () async {
+          await StorageTabState.refreshMountedDirectories({
+            destination,
+            archive.parent.path,
+          });
+          openArchive(index + 1);
+        },
+      );
+    }
+
+    openArchive(0);
   }
 
   Future<void> _toggleSelectedQuickAccess() async {
@@ -2723,6 +3494,42 @@ class StorageTabState extends ConsumerState<StorageTab>
     bool allowBuiltInHandlers = true,
   }) async {
     final extension = _fileExtension(_displayName(file.path));
+    if (category == 'Video') {
+      final videoExtensions = ref
+          .read(fileTypeCategoriesProvider)
+          .firstWhere(
+            (entry) => entry.name == 'Video',
+            orElse: () => const FileTypeCategory(name: 'Video', extensions: []),
+          )
+          .extensions
+          .map(FileTypeCategory.normalizeExtension)
+          .toSet();
+      final playlist = _items
+          .whereType<File>()
+          .where(
+            (entry) => videoExtensions.contains(
+              FileTypeCategory.normalizeExtension(
+                _fileExtension(_displayName(entry.path)),
+              ),
+            ),
+          )
+          .map(
+            (entry) => VideoPlayerItem(
+              path: entry.path,
+              name: _displayName(entry.path),
+            ),
+          )
+          .toList(growable: false);
+      await openVideoFile(
+        context,
+        ref,
+        path: file.path,
+        name: _displayName(file.path),
+        playlist: playlist,
+        currentIndex: playlist.indexWhere((entry) => entry.path == file.path),
+      );
+      return;
+    }
     var effectiveCategory = category;
     if (checkSavedDefault &&
         extension.isNotEmpty &&
@@ -2747,6 +3554,20 @@ class StorageTabState extends ConsumerState<StorageTab>
             file.path,
             imagePaths: _visibleImagePaths(),
           );
+          return;
+        }
+        if (savedDefault.isVideoPlayer) {
+          if (!mounted) return;
+          await openVideoFile(
+            context,
+            ref,
+            path: file.path,
+            name: _displayName(file.path),
+          );
+          return;
+        }
+        if (savedDefault.isArchiveManager) {
+          TabsManager.instance.openArchiveManagerTab(file.path);
           return;
         }
         final packageName = savedDefault.packageName;
@@ -2830,29 +3651,26 @@ class StorageTabState extends ConsumerState<StorageTab>
     if (!mounted) return;
     final canUseTextEditor =
         allowBuiltInHandlers &&
-        (effectiveCategory == 'Text' || effectiveCategory == 'Others');
+        extension.toLowerCase() != '.apk' &&
+        (effectiveCategory == 'Text' ||
+            effectiveCategory == 'Others' ||
+            (effectiveCategory == 'Documents' &&
+                _categoryForFile(file) == 'Text'));
     final canUseImageViewer =
         allowBuiltInHandlers &&
+        extension.toLowerCase() != '.apk' &&
         (effectiveCategory == 'Image' || effectiveCategory == 'Others');
-    if (apps.isEmpty && !canUseTextEditor && !canUseImageViewer) {
+    final canUseArchiveManager =
+        allowBuiltInHandlers && effectiveCategory == 'Archives';
+    if (apps.isEmpty &&
+        !canUseTextEditor &&
+        !canUseImageViewer &&
+        !canUseArchiveManager) {
       _message(
         'No installed applications can open this file as $effectiveCategory',
       );
       return;
     }
-
-    final Uint8List? builtInIcon;
-    try {
-      builtInIcon = await ref
-          .read(openWithRepositoryProvider)
-          .getOwnApplicationIcon();
-    } catch (error) {
-      if (mounted) {
-        _message('Could not load the built-in app icon: $error');
-      }
-      return;
-    }
-    if (!mounted) return;
 
     final selection = await showDialog<_OpenWithSelection>(
       context: context,
@@ -2862,6 +3680,28 @@ class StorageTabState extends ConsumerState<StorageTab>
           builder: (context, setDialogState) => SimpleDialog(
             title: Text('Open as $effectiveCategory'),
             children: [
+              if (canUseArchiveManager)
+                SimpleDialogOption(
+                  onPressed: () => Navigator.pop(
+                    dialogContext,
+                    _OpenWithSelection(
+                      app: OpenWithApp(
+                        name: 'Archive Manager (built-in)',
+                        packageName: DefaultFileApp.archiveManagerHandlerId,
+                        mimeType: 'application/x-archive',
+                      ),
+                      saveAsDefault: saveAsDefault,
+                      isArchiveManager: true,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      _builtInAppIcon(),
+                      const SizedBox(width: 12),
+                      const Text('Archive Manager (built-in)'),
+                    ],
+                  ),
+                ),
               if (canUseImageViewer)
                 SimpleDialogOption(
                   onPressed: () => Navigator.pop(
@@ -2871,7 +3711,6 @@ class StorageTabState extends ConsumerState<StorageTab>
                         name: 'Image Viewer (built-in)',
                         packageName: DefaultFileApp.imageViewerHandlerId,
                         mimeType: 'image/*',
-                        iconBytes: builtInIcon,
                       ),
                       saveAsDefault: saveAsDefault,
                       isImageViewer: true,
@@ -2879,14 +3718,7 @@ class StorageTabState extends ConsumerState<StorageTab>
                   ),
                   child: Row(
                     children: [
-                      _openWithAppIcon(
-                        OpenWithApp(
-                          name: 'Image Viewer (built-in)',
-                          packageName: DefaultFileApp.imageViewerHandlerId,
-                          mimeType: 'image/*',
-                          iconBytes: builtInIcon,
-                        ),
-                      ),
+                      _builtInAppIcon(),
                       const SizedBox(width: 12),
                       const Text('Image Viewer (built-in)'),
                     ],
@@ -2901,7 +3733,6 @@ class StorageTabState extends ConsumerState<StorageTab>
                         name: 'Text Editor (built-in)',
                         packageName: DefaultFileApp.textEditorHandlerId,
                         mimeType: 'text/plain',
-                        iconBytes: builtInIcon,
                       ),
                       isTextEditor: true,
                       saveAsDefault: saveAsDefault,
@@ -2909,37 +3740,19 @@ class StorageTabState extends ConsumerState<StorageTab>
                   ),
                   child: Row(
                     children: [
-                      _openWithAppIcon(
-                        OpenWithApp(
-                          name: 'Text Editor (built-in)',
-                          packageName: DefaultFileApp.textEditorHandlerId,
-                          mimeType: 'text/plain',
-                          iconBytes: builtInIcon,
-                        ),
-                      ),
+                      _builtInAppIcon(),
                       const SizedBox(width: 12),
                       const Text('Text Editor (built-in)'),
                     ],
                   ),
                 ),
               for (final app in apps)
-                SimpleDialogOption(
-                  onPressed: () => Navigator.pop(
+                OpenWithAppOption(
+                  app: app,
+                  label: open_with_label.shortenOpenWithAppName(app.name),
+                  onTap: () => Navigator.pop(
                     dialogContext,
                     _OpenWithSelection(app: app, saveAsDefault: saveAsDefault),
-                  ),
-                  child: Row(
-                    children: [
-                      _openWithAppIcon(app),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          open_with_label.shortenOpenWithAppName(app.name),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ],
                   ),
                 ),
               if (extension.isNotEmpty)
@@ -2967,14 +3780,24 @@ class StorageTabState extends ConsumerState<StorageTab>
     if (!mounted || selection == null) return;
 
     if (selection.saveAsDefault && extension.isNotEmpty) {
-      final defaultApp = selection.isTextEditor || selection.isImageViewer
+      final isBuiltIn =
+          selection.isTextEditor ||
+          selection.isImageViewer ||
+          selection.isArchiveManager;
+      final defaultApp = isBuiltIn
           ? DefaultFileApp(
               extension: extension,
               handlerId: selection.isTextEditor
                   ? DefaultFileApp.textEditorHandlerId
-                  : DefaultFileApp.imageViewerHandlerId,
+                  : selection.isImageViewer
+                  ? DefaultFileApp.imageViewerHandlerId
+                  : DefaultFileApp.archiveManagerHandlerId,
               category: effectiveCategory,
-              mimeType: selection.isTextEditor ? 'text/plain' : 'image/*',
+              mimeType: selection.isTextEditor
+                  ? 'text/plain'
+                  : selection.isImageViewer
+                  ? 'image/*'
+                  : 'application/x-archive',
             )
           : DefaultFileApp(
               extension: extension,
@@ -3001,6 +3824,10 @@ class StorageTabState extends ConsumerState<StorageTab>
         file.path,
         imagePaths: _visibleImagePaths(),
       );
+      return;
+    }
+    if (selection.isArchiveManager) {
+      TabsManager.instance.openArchiveManagerTab(file.path);
       return;
     }
     final selectedApp = selection.app;
@@ -3556,11 +4383,10 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
 
     _directoryCache.removeWhere((path, _) {
-      final cachePath = path.startsWith('imageStorage:')
-          ? path.substring('imageStorage:'.length)
-          : path.startsWith('documentStorage:')
-          ? path.substring('documentStorage:'.length)
-          : path;
+      final cachePath = path.replaceFirst(
+        RegExp(r'^(image|document|audio|archive)Storage:'),
+        '',
+      );
       return isAffectedPath(cachePath);
     });
     _subfolderCache.removeWhere((path, _) => isAffectedPath(path));
@@ -3912,7 +4738,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     );
     _reportCurrentLocation(path);
     setState(() => _showBreadcrumbPath = false);
-    _loadRoot(path, forceRefresh: true);
+    _loadRoot(path);
   }
 
   String? _immediateChildPath(String ancestorPath, String descendantPath) {
@@ -4313,26 +5139,62 @@ class StorageTabState extends ConsumerState<StorageTab>
       previous,
       next,
     ) {
-      if ((!widget.documentOnly && !widget.imageOnly) || _dir == null) return;
+      if (!_isCategoryTab || _dir == null) return;
       _imageContentCache.removeWhere((key, _) => key.startsWith('documents:'));
+      _imageContentCache.removeWhere((key, _) => key.startsWith('audio:'));
       _imageContentCache.clear();
       _itemCountCache.clear();
-      _loadRoot(_dir!.path, forceRefresh: true);
+      if (ref.read(appSettingsProvider).includeOtherDrivesInCategoryPages &&
+          _dir != null &&
+          _normalizedPath(_dir!.path) ==
+              _normalizedPath(_categoryInitialPath ?? '')) {
+        unawaited(_refreshCategoryDriveOptions(_allCategoryDrives));
+      } else if (_dir != null) {
+        _loadRoot(_dir!.path, forceRefresh: true);
+      }
     });
     ref.listen<AppSettings>(appSettingsProvider, (previous, next) {
+      if (_isCategoryTab &&
+          previous?.includeOtherDrivesInCategoryPages !=
+              next.includeOtherDrivesInCategoryPages) {
+        unawaited(_refreshCategoryDriveOptions(_allCategoryDrives));
+      }
       if (previous?.showHiddenFiles != next.showHiddenFiles ||
-          previous?.showNomediaFiles != next.showNomediaFiles) {
+          previous?.showNomediaFiles != next.showNomediaFiles ||
+          (_isCategoryTab &&
+              previous?.hideAndroidFoldersInCategoryPages !=
+                  next.hideAndroidFoldersInCategoryPages)) {
         _directoryCache.clear();
         _imageContentCache.clear();
         _subfolderCache.clear();
         _itemCountCache.clear();
-        if (_dir != null) _loadRoot(_dir!.path, forceRefresh: true);
+        if (_isCategoryTab &&
+            next.includeOtherDrivesInCategoryPages &&
+            _dir != null &&
+            _normalizedPath(_dir!.path) ==
+                _normalizedPath(_categoryInitialPath ?? '')) {
+          unawaited(_refreshCategoryDriveOptions(_allCategoryDrives));
+        } else if (_dir != null) {
+          _loadRoot(_dir!.path, forceRefresh: true);
+        }
       }
     });
+    ref.listen<AsyncValue<List<StorageDevice>>>(
+      availableStorageDevicesProvider,
+      (_, next) {
+        final devices = next.asData?.value;
+        if (devices == null || !_isCategoryTab || !mounted) return;
+        unawaited(_refreshCategoryDriveOptions(devices));
+      },
+    );
     final settings = ref.watch(appSettingsProvider);
+    final toolbarHeight =
+        (kToolbarHeight * 0.80 + (settings.textSizeOffset - 1) * 2)
+            .clamp(40, kToolbarHeight)
+            .toDouble();
     return Scaffold(
       appBar: AppBar(
-        toolbarHeight: kToolbarHeight * 0.80,
+        toolbarHeight: toolbarHeight,
         leading: _showBreadcrumbPath
             ? IconButton(
                 icon: const Icon(Icons.arrow_back),
@@ -4368,7 +5230,7 @@ class StorageTabState extends ConsumerState<StorageTab>
             : SizedBox(
                 width: double.infinity,
                 child: InkWell(
-                  onTap: _dir == null
+                  onTap: _dir == null || _showCategoryDrivePicker
                       ? null
                       : () => setState(() => _showBreadcrumbPath = true),
                   child: SizedBox(
@@ -4376,7 +5238,11 @@ class StorageTabState extends ConsumerState<StorageTab>
                     child: Align(
                       alignment: Alignment.centerLeft,
                       child: MarqueeText(
-                        _dir == null ? 'Storage' : _displayName(_dir!.path),
+                        _showCategoryDrivePicker
+                            ? widget.displayName ?? 'Category'
+                            : _dir == null
+                            ? 'Storage'
+                            : _displayName(_dir!.path),
                         style: const TextStyle(fontSize: 19),
                         styleMode: MarqueeStyle.pauseAndLoop,
                       ),
@@ -4387,22 +5253,17 @@ class StorageTabState extends ConsumerState<StorageTab>
         actions: [
           if (!_selectionMode)
             IconButton(
-              tooltip: 'Refresh',
+              tooltip: _isRefreshing ? 'Refreshing...' : 'Refresh',
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(),
-              onPressed: _dir == null
+              onPressed:
+                  (_dir == null && !_showCategoryDrivePicker) || _isRefreshing
                   ? null
-                  : () {
-                      if (_showBreadcrumbPath) {
-                        setState(() => _showBreadcrumbPath = false);
-                      }
-                      _loadRoot(
-                        _dir!.path,
-                        forceRefresh: true,
-                        userInitiatedRefresh: true,
-                      );
-                    },
-              icon: const Icon(Icons.refresh),
+                  : _refreshCurrentPage,
+              icon: Icon(
+                Icons.refresh,
+                color: _isRefreshing ? Theme.of(context).disabledColor : null,
+              ),
             ),
           if (!_selectionMode)
             SearchActionButton(
@@ -4412,8 +5273,9 @@ class StorageTabState extends ConsumerState<StorageTab>
                 if (!mounted) return;
                 if (result.isDirectory) {
                   _breadcrumbReturnPaths.clear();
+                  _beginTopScrollReset(result.path);
                   _reportCurrentLocation(result.path);
-                  await _loadRoot(result.path, forceRefresh: true);
+                  await _loadRoot(result.path);
                 } else {
                   await _openFileWithDetectedCategory(File(result.path));
                 }
@@ -4440,54 +5302,109 @@ class StorageTabState extends ConsumerState<StorageTab>
             setState(() => _showBreadcrumbPath = false);
           }
         },
-        child: _dir == null
+        child: _showCategoryDrivePicker
+            ? _buildCategoryDrivePicker()
+            : _dir == null
             ? const Center(child: CircularProgressIndicator())
             : LayoutBuilder(
                 builder: (context, constraints) {
                   final isGrid = settings.defaultViewMode == 'grid';
+                  final spacingScale = fontScaledSpacing(context, 1);
                   if (isGrid) {
                     final crossAxisExtent = constraints.maxWidth - 16;
-                    _gridColumnCount = (crossAxisExtent / (220 + 8))
-                        .ceil()
-                        .clamp(1, 1000)
-                        .toInt();
+                    _gridColumnCount =
+                        (crossAxisExtent / ((220 + 8) * spacingScale))
+                            .ceil()
+                            .clamp(1, 1000)
+                            .toInt();
                   }
                   final list = isGrid
                       ? GridView.builder(
                           controller: _listScrollController,
                           padding: const EdgeInsets.all(8),
                           gridDelegate:
-                              const SliverGridDelegateWithMaxCrossAxisExtent(
-                                maxCrossAxisExtent: 220,
-                                mainAxisExtent: 70.4,
-                                crossAxisSpacing: 8,
-                                mainAxisSpacing: 8,
+                              SliverGridDelegateWithMaxCrossAxisExtent(
+                                maxCrossAxisExtent: 220 * spacingScale,
+                                mainAxisExtent: 70.4 * spacingScale,
+                                crossAxisSpacing: 8 * spacingScale,
+                                mainAxisSpacing: 8 * spacingScale,
                               ),
                           itemCount: _displayItems.length,
-                          itemBuilder: (context, index) => _buildStorageItem(
-                            _displayItems[index],
-                            settings,
-                            grid: true,
-                          ),
+                          itemBuilder: (context, index) {
+                            final item = _displayItems[index];
+                            final key = _itemKeys.putIfAbsent(
+                              item.path,
+                              GlobalKey.new,
+                            );
+                            return KeyedSubtree(
+                              key: key,
+                              child: _buildStorageItem(
+                                item,
+                                settings,
+                                grid: true,
+                              ),
+                            );
+                          },
                         )
                       : ListView.builder(
                           controller: _listScrollController,
-                          itemExtent: _detailsEnabled(settings) ? 56 : 44,
+                          itemExtent:
+                              (_detailsEnabled(settings) ? 56 : 44) *
+                              spacingScale,
                           itemCount: _displayItems.length,
-                          itemBuilder: (context, index) =>
-                              _buildStorageItem(_displayItems[index], settings),
+                          itemBuilder: (context, index) {
+                            final item = _displayItems[index];
+                            final key = _itemKeys.putIfAbsent(
+                              item.path,
+                              GlobalKey.new,
+                            );
+                            return KeyedSubtree(
+                              key: key,
+                              child: _buildStorageItem(item, settings),
+                            );
+                          },
                         );
                   final restoring = _pendingScrollRestore != null;
-                  return Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      IgnorePointer(
-                        ignoring: restoring,
-                        child: Opacity(opacity: restoring ? 0 : 1, child: list),
-                      ),
-                      if (restoring)
-                        const Center(child: CircularProgressIndicator()),
-                    ],
+                  return NotificationListener<ScrollNotification>(
+                    onNotification: (notification) {
+                      if (notification is ScrollStartNotification) {
+                        _isListScrolling = true;
+                      } else if (notification is ScrollEndNotification) {
+                        _isListScrolling = false;
+                        final pending = _pendingScanResult;
+                        if (pending != null &&
+                            _dir != null &&
+                            _normalizedPath(_dir!.path) ==
+                                _normalizedPath(pending.directory.path)) {
+                          _pendingScanResult = null;
+                          setState(() {
+                            _dir = pending.directory;
+                            _items = pending.items;
+                          });
+                          _copySession.notifyChanged();
+                        }
+                      }
+                      return false;
+                    },
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        IgnorePointer(
+                          ignoring: restoring,
+                          child: Opacity(
+                            opacity: restoring ? 0 : 1,
+                            child: Scrollbar(
+                              controller: _listScrollController,
+                              thumbVisibility: true,
+                              interactive: true,
+                              child: list,
+                            ),
+                          ),
+                        ),
+                        if (restoring)
+                          const Center(child: CircularProgressIndicator()),
+                      ],
+                    ),
                   );
                 },
               ),
@@ -4531,7 +5448,7 @@ class StorageTabState extends ConsumerState<StorageTab>
       onTapDown: (_) {
         _longPressTriggered = false;
         _pressTimer?.cancel();
-        _pressTimer = Timer(const Duration(milliseconds: 1250), () {
+        _pressTimer = Timer(selectionLongPressDelay, () {
           if (!mounted) return;
           setState(() {
             _selectionMode = true;
@@ -4559,20 +5476,12 @@ class StorageTabState extends ConsumerState<StorageTab>
       settings.showFileSize;
 
   Widget _storageItemLeading(FileSystemEntity entity) {
-    if (widget.documentOnly && entity is File) {
-      final extension = _fileExtension(_displayName(entity.path)).toLowerCase();
-      final icon = switch (extension) {
-        '.pdf' => Icons.picture_as_pdf_outlined,
-        '.doc' || '.docx' || '.odt' || '.rtf' => Icons.description_outlined,
-        '.xls' || '.xlsx' || '.ods' || '.csv' => Icons.table_chart_outlined,
-        '.ppt' || '.pptx' || '.odp' => Icons.slideshow_outlined,
-        _ => Icons.insert_drive_file_outlined,
-      };
-      return Icon(icon, size: 24);
-    }
+    final extension = entity is File
+        ? _fileExtension(_displayName(entity.path)).toLowerCase()
+        : '';
     if (entity is File &&
         FileTypeCategory.categoryForExtension(
-              _fileExtension(_displayName(entity.path)).toLowerCase(),
+              extension,
               categories: ref.read(fileTypeCategoriesProvider),
             ) ==
             'Image') {
@@ -4588,17 +5497,37 @@ class StorageTabState extends ConsumerState<StorageTab>
             child: ImageFilePreview(
               path: entity.path,
               fit: BoxFit.cover,
-              loadingBuilder: (_) => const Icon(Icons.image_outlined, size: 24),
+              loadingBuilder: (_) =>
+                  FileTypeIcon(extension: extension, size: 24),
               errorBuilder: (_, _, _) =>
-                  const Icon(Icons.image_outlined, size: 24),
+                  FileTypeIcon(extension: extension, size: 24),
             ),
           ),
         ),
       );
     }
-    return Icon(
-      entity is Directory ? Icons.folder : Icons.insert_drive_file,
+    final drive = _storageRootPaths
+        .where(
+          (root) => _normalizedPath(
+            entity.path,
+          ).startsWith('${_normalizedPath(root)}/'),
+        )
+        .fold<String?>(null, (best, root) {
+          if (best == null || root.length > best.length) return root;
+          return best;
+        });
+    final normalizedPath = _normalizedPath(entity.path);
+    final relativePath = drive == null
+        ? null
+        : normalizedPath.substring(_normalizedPath(drive).length + 1);
+    return FileTypeIcon(
+      extension: extension,
+      isFolder: entity is Directory,
+      path: entity is File ? entity.path : null,
+      driveId: drive == null ? null : _storageIdsByRoot[_normalizedPath(drive)],
+      relativePath: relativePath,
       size: 24,
+      thumbnailSize: 36,
     );
   }
 
@@ -4608,6 +5537,11 @@ class StorageTabState extends ConsumerState<StorageTab>
     AppSettings settings,
     bool detailsEnabled,
   ) {
+    final displayName = displayFileName(
+      name,
+      showExtension: settings.showFileExtension,
+      isDirectory: entity is Directory,
+    );
     final canShowDateTime = settings.defaultViewMode != 'grid';
     final mutedStyle = Theme.of(context).textTheme.bodySmall?.copyWith(
       color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -4617,13 +5551,13 @@ class StorageTabState extends ConsumerState<StorageTab>
       fontSize: (Theme.of(context).textTheme.titleMedium?.fontSize ?? 16) + 1,
     );
     if (!detailsEnabled) {
-      return _storageItemName(name, itemNameStyle);
+      return _storageItemName(displayName, itemNameStyle);
     }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        _storageItemName(name, itemNameStyle),
+        _storageItemName(displayName, itemNameStyle),
         const SizedBox(height: 2),
         Row(
           children: [
@@ -4727,14 +5661,24 @@ class StorageTabState extends ConsumerState<StorageTab>
   }
 
   String _itemCountCachePath(String key) {
-    for (final prefix in const ['all:', 'images:', 'documents:']) {
+    for (final prefix in const [
+      'all:',
+      'images:',
+      'documents:',
+      'audio:',
+      'archives:',
+    ]) {
       if (key.startsWith(prefix)) return key.substring(prefix.length);
     }
     return key;
   }
 
   Future<int> _itemCountFor(Directory directory, AppSettings settings) {
-    final category = widget.documentOnly
+    final category = widget.audioOnly
+        ? 'audio'
+        : widget.archiveOnly
+        ? 'archives'
+        : widget.documentOnly
         ? 'documents'
         : widget.imageOnly
         ? 'images'
@@ -4747,12 +5691,13 @@ class StorageTabState extends ConsumerState<StorageTab>
       }
       final children = await directory.list(followLinks: false).toList();
       final visibleChildren = children.where((child) {
+        if (!_isInSharedScanScope(child.path)) return false;
         final name = _displayName(child.path);
         if (name == '.nomedia' && settings.showNomediaFiles) return true;
         return settings.showHiddenFiles || !name.startsWith('.');
       });
 
-      if (!widget.imageOnly && !widget.documentOnly) {
+      if (!_isCategoryTab) {
         return visibleChildren.length;
       }
 
@@ -4765,6 +5710,19 @@ class StorageTabState extends ConsumerState<StorageTab>
                     FileTypeCategory.documentsExtensions)
                 .toSet()
           : const <String>{};
+      final archiveExtensions = widget.archiveOnly
+          ? _categoryExtensions('Archives')
+          : const <String>{};
+      final audioExtensions = widget.audioOnly
+          ? (ref
+                        .read(fileTypeCategoriesProvider)
+                        .where((category) => category.name == 'Audio')
+                        .firstOrNull
+                        ?.extensions
+                        .map(FileTypeCategory.normalizeExtension) ??
+                    const <String>[])
+                .toSet()
+          : const <String>{};
       var count = 0;
       for (final child in visibleChildren) {
         if (child is File) {
@@ -4773,11 +5731,19 @@ class StorageTabState extends ConsumerState<StorageTab>
           ).toLowerCase();
           final matches = widget.documentOnly
               ? documentExtensions.contains(extension)
+              : widget.audioOnly
+              ? audioExtensions.contains(extension)
+              : widget.archiveOnly
+              ? archiveExtensions.contains(extension)
               : _isImageFile(child);
           if (matches) count++;
         } else if (child is Directory) {
           final containsMatch = widget.documentOnly
               ? await _containsDocument(child, documentExtensions)
+              : widget.audioOnly
+              ? await _containsCategoryAudio(child, audioExtensions)
+              : widget.archiveOnly
+              ? await _containsCategoryFiles(child, archiveExtensions)
               : await _containsImage(child);
           if (containsMatch) count++;
         }
@@ -4967,68 +5933,6 @@ class _BatchTextDialogState extends State<_BatchTextDialog> {
       TextButton(
         onPressed: () => Navigator.pop(context, _controller.text),
         child: const Text('Continue'),
-      ),
-    ],
-  );
-}
-
-class _NewNameDialog extends StatefulWidget {
-  final String title;
-  final String extensionNote;
-  final String initialName;
-
-  const _NewNameDialog({
-    required this.title,
-    required this.extensionNote,
-    required this.initialName,
-  });
-
-  @override
-  State<_NewNameDialog> createState() => _NewNameDialogState();
-}
-
-class _NewNameDialogState extends State<_NewNameDialog> {
-  late final TextEditingController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = TextEditingController(text: widget.initialName);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: Text(widget.title),
-    content: Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (widget.extensionNote.isNotEmpty) ...[
-          Text(widget.extensionNote),
-          const SizedBox(height: 12),
-        ],
-        TextField(
-          controller: _controller,
-          autofocus: true,
-          decoration: InputDecoration(labelText: '${widget.title} name'),
-          onSubmitted: (_) => Navigator.pop(context, _controller.text.trim()),
-        ),
-      ],
-    ),
-    actions: [
-      TextButton(
-        onPressed: () => Navigator.pop(context),
-        child: const Text('Cancel'),
-      ),
-      TextButton(
-        onPressed: () => Navigator.pop(context, _controller.text.trim()),
-        child: Text(widget.title.startsWith('Rename') ? 'Rename' : 'Create'),
       ),
     ],
   );

@@ -1,4 +1,4 @@
-enum SearchCategory { images, documents }
+enum SearchCategory { images, documents, videos, audio, archives }
 
 class SearchScope {
   const SearchScope._({
@@ -29,6 +29,12 @@ class SearchScope {
         isDriveRoot ? 'Search images' : 'Search images in $folderName',
       SearchCategory.documents =>
         isDriveRoot ? 'Search documents' : 'Search documents in $folderName',
+      SearchCategory.videos =>
+        isDriveRoot ? 'Search videos' : 'Search videos in $folderName',
+      SearchCategory.audio =>
+        isDriveRoot ? 'Search audio' : 'Search audio in $folderName',
+      SearchCategory.archives =>
+        isDriveRoot ? 'Search archives' : 'Search archives in $folderName',
       null => isDriveRoot ? 'Search in $driveName' : 'Search in $folderName',
     };
     return SearchScope._(
