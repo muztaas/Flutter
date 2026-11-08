@@ -7,6 +7,7 @@ Future<String?> showNameEntryDialog(
   String initialName = '',
 }) => showDialog<String>(
   context: context,
+  barrierDismissible: false,
   builder: (_) => _NameEntryDialog(
     title: title,
     extensionNote: extensionNote,
@@ -31,47 +32,95 @@ class _NameEntryDialog extends StatefulWidget {
 
 class _NameEntryDialogState extends State<_NameEntryDialog> {
   late final TextEditingController _controller;
+  late final FocusNode _focusNode;
 
   @override
   void initState() {
     super.initState();
-    _controller = TextEditingController(text: widget.initialName);
+    final extensionSeparator = widget.initialName.lastIndexOf('.');
+    final cursorOffset =
+        widget.title.startsWith('Rename') &&
+            extensionSeparator > 0 &&
+            extensionSeparator < widget.initialName.length - 1
+        ? extensionSeparator
+        : widget.initialName.length;
+    _controller = TextEditingController.fromValue(
+      TextEditingValue(
+        text: widget.initialName,
+        selection: TextSelection.collapsed(offset: cursorOffset),
+      ),
+    );
+    _focusNode = FocusNode()..addListener(_handleFocusChange);
+  }
+
+  void _handleFocusChange() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     _controller.dispose();
+    _focusNode.removeListener(_handleFocusChange);
+    _focusNode.dispose();
     super.dispose();
   }
 
+  void _handleTapOutside(PointerDownEvent event) {
+    final keyboardVisible =
+        _focusNode.hasFocus || MediaQuery.viewInsetsOf(context).bottom > 0;
+    if (keyboardVisible) {
+      _focusNode.unfocus();
+    } else {
+      Navigator.pop(context);
+    }
+  }
+
   @override
-  Widget build(BuildContext context) => AlertDialog(
-    title: Text(widget.title),
-    content: Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (widget.extensionNote.isNotEmpty) ...[
-          Text(widget.extensionNote),
-          const SizedBox(height: 12),
-        ],
-        TextField(
-          controller: _controller,
-          autofocus: true,
-          decoration: InputDecoration(labelText: '${widget.title} name'),
-          onSubmitted: (_) => Navigator.pop(context, _controller.text.trim()),
+  Widget build(BuildContext context) {
+    final keyboardVisible =
+        _focusNode.hasFocus || MediaQuery.viewInsetsOf(context).bottom > 0;
+    return PopScope(
+      canPop: !keyboardVisible,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && keyboardVisible) _focusNode.unfocus();
+      },
+      child: TapRegion(
+        onTapOutside: _handleTapOutside,
+        consumeOutsideTaps: true,
+        child: AlertDialog(
+          title: Text(widget.title),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (widget.extensionNote.isNotEmpty) ...[
+                Text(widget.extensionNote),
+                const SizedBox(height: 12),
+              ],
+              TextField(
+                controller: _controller,
+                focusNode: _focusNode,
+                autofocus: true,
+                decoration: InputDecoration(labelText: '${widget.title} name'),
+                onSubmitted: (_) =>
+                    Navigator.pop(context, _controller.text.trim()),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, _controller.text.trim()),
+              child: Text(
+                widget.title.startsWith('Rename') ? 'Rename' : 'Create',
+              ),
+            ),
+          ],
         ),
-      ],
-    ),
-    actions: [
-      TextButton(
-        onPressed: () => Navigator.pop(context),
-        child: const Text('Cancel'),
       ),
-      TextButton(
-        onPressed: () => Navigator.pop(context, _controller.text.trim()),
-        child: Text(widget.title.startsWith('Rename') ? 'Rename' : 'Create'),
-      ),
-    ],
-  );
+    );
+  }
 }

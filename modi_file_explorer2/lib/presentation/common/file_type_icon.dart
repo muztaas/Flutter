@@ -1,9 +1,11 @@
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers/installed_apps_providers.dart';
+import '../../core/filesystem/file_change_notifier.dart';
 import '../../core/providers/file_type_categories_provider.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../core/providers/video_providers.dart';
@@ -81,12 +83,14 @@ class _FileTypeIconState extends ConsumerState<FileTypeIcon> {
           widget.path!,
           size: 64,
         );
+        if (icon == null) await _reportMissingIfAbsent();
         if (!mounted || generation != _requestGeneration || icon == null) {
           return;
         }
         setState(() => _applicationIcon = Uint8List.fromList(icon));
       } catch (error) {
         debugPrint('Could not load an APK icon: $error');
+        await _reportMissingIfAbsent();
       }
       return;
     }
@@ -101,12 +105,27 @@ class _FileTypeIconState extends ConsumerState<FileTypeIcon> {
       final bytes = await ref
           .read(videoInformationProvider)
           .getThumbnail(video, width: 160, height: 90);
+      if (bytes == null) await _reportMissingIfAbsent();
       if (!mounted || generation != _requestGeneration || bytes == null) {
-        return;
+      return;
       }
       setState(() => _thumbnail = Uint8List.fromList(bytes));
     } catch (error) {
       debugPrint('Could not load a video thumbnail: $error');
+      await _reportMissingIfAbsent();
+    }
+  }
+
+  Future<void> _reportMissingIfAbsent() async {
+    final path = widget.path;
+    if (path == null) return;
+    try {
+      if (await FileSystemEntity.type(path, followLinks: false) ==
+          FileSystemEntityType.notFound) {
+        FileChangeNotifier.instance.reportMissing(path);
+      }
+    } on FileSystemException {
+      FileChangeNotifier.instance.reportMissing(path);
     }
   }
 

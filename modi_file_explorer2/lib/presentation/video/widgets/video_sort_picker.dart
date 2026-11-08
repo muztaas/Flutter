@@ -67,6 +67,7 @@ class _VideoSortPickerState extends State<VideoSortPicker> {
         GridView.builder(
           shrinkWrap: true,
           primary: false,
+          padding: EdgeInsets.zero,
           physics: const NeverScrollableScrollPhysics(),
           itemCount: videoSortOptions.length,
           gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -143,7 +144,7 @@ class _VideoSortPickerState extends State<VideoSortPicker> {
             );
           },
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 4),
         Row(
           children: [
             Expanded(

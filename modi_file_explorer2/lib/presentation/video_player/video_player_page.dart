@@ -5,11 +5,14 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/providers/video_providers.dart';
+import '../../core/providers/file_content_provider.dart';
 import '../../domain/entities/video_player_item.dart';
 import '../../domain/entities/video_player_state.dart';
 import '../../domain/repositories/video_player_repository.dart';
 import '../common/marquee_text.dart';
 import '../common/open_video_file.dart';
+import '../common/detected_content_recovery.dart';
+import '../common/content_sized_menu.dart';
 
 const Duration _controlsHideDelay = Duration(milliseconds: 1500);
 const Duration _systemBarsHideDelay = Duration(seconds: 2);
@@ -238,7 +241,12 @@ class _VideoPlayerPageState extends ConsumerState<VideoPlayerPage>
       if (!mounted) return;
       await _controller.setSource(_currentItem, resumePosition: resumePosition);
     } catch (error) {
-      if (mounted) _showMessage('Could not play ${_currentItem.name}: $error');
+      if (mounted) {
+        await _showPlaybackFailure(
+          'Could not play ${_currentItem.name}: $error',
+          _currentItem.path,
+        );
+      }
     }
   }
 
@@ -414,23 +422,16 @@ class _VideoPlayerPageState extends ConsumerState<VideoPlayerPage>
     _popupOpen = true;
     _controlsTimer?.cancel();
     _systemBarsTimer?.cancel();
-    final overlay = Overlay.of(context).context.findRenderObject();
-    final button = _speedButtonKey.currentContext?.findRenderObject();
-    if (overlay is! RenderBox || button is! RenderBox) {
+    final buttonContext = _speedButtonKey.currentContext;
+    if (buttonContext == null) {
       _popupOpen = false;
       _scheduleHideTimers();
       return;
     }
-    final position = button.localToGlobal(Offset.zero, ancestor: overlay);
-    final selected = await showMenu<double>(
+    final selected = await showContentMenuFromPopupEntries<double>(
       context: context,
-      position: RelativeRect.fromLTRB(
-        position.dx,
-        position.dy + button.size.height,
-        overlay.size.width - position.dx - button.size.width,
-        0,
-      ),
-      items: [
+      anchorKey: _speedButtonKey,
+      entries: [
         for (final speed in _playbackSpeeds)
           PopupMenuItem<double>(
             value: speed,
@@ -476,6 +477,37 @@ class _VideoPlayerPageState extends ConsumerState<VideoPlayerPage>
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _showPlaybackFailure(String message, String path) async {
+    try {
+      final detected = await ref.read(sniffFileContentProvider)(path);
+      if (!mounted) return;
+      final recoveryCategory = detected.isKnown &&
+              detected.category != 'Video'
+          ? detected.category
+          : null;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(message),
+            action: recoveryCategory == null
+                ? null
+                : SnackBarAction(
+                    label: 'Open as ${detected.name}',
+                    onPressed: () => openDetectedContent(
+                      context,
+                      ref,
+                      path,
+                      detected,
+                    ),
+                  ),
+          ),
+        );
+    } catch (error) {
+      if (mounted) _showMessage('$message (content check failed: $error)');
+    }
   }
 
   Future<void> _savePosition(VideoPlayerItem item, Duration position) async {

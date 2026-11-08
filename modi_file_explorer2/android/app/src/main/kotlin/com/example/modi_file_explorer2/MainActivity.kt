@@ -9,8 +9,15 @@ import android.content.ActivityNotFoundException
 import android.net.Uri
 import android.app.AlertDialog
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.pdf.PdfRenderer
 import android.media.MediaExtractor
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
@@ -20,11 +27,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.os.ParcelFileDescriptor
 import android.os.storage.StorageManager
 import android.provider.Settings
 import android.view.Surface
 import android.webkit.MimeTypeMap
 import android.app.UiModeManager
+import android.system.Os
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -42,6 +51,7 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.io.File
 import java.io.FileInputStream
+import java.io.IOException
 import java.io.ByteArrayOutputStream
 import java.net.URLConnection
 import java.security.MessageDigest
@@ -52,17 +62,264 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.UUID
+import java.util.Locale
+
+private const val MAX_PDF_BITMAP_DIMENSION = 4096
+
+private object AndroidImageEditor {
+	private data class EncodedImage(
+		val format: Bitmap.CompressFormat,
+		val bytes: ByteArray,
+	)
+
+	fun save(
+		sourcePath: String,
+		rotationDegrees: Double,
+		cropLeft: Double,
+		cropTop: Double,
+		cropRight: Double,
+		cropBottom: Double,
+		brightness: Double,
+		contrast: Double,
+		overwriteOriginal: Boolean,
+	): String {
+		val sourceFile = File(sourcePath)
+		if (!sourceFile.isFile) throw IllegalArgumentException("Source image is unavailable")
+		val originalSize = sourceFile.length()
+		if (originalSize <= 0L) throw IllegalArgumentException("Source image is empty")
+
+		val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+		BitmapFactory.decodeFile(sourcePath, bounds)
+		val sourceMime = bounds.outMimeType
+			?: throw IllegalArgumentException("Unsupported or invalid image format")
+		val preferredFormat = when (sourceMime.lowercase()) {
+			"image/png" -> Bitmap.CompressFormat.PNG
+			"image/jpeg", "image/jpg" -> Bitmap.CompressFormat.JPEG
+			else -> Bitmap.CompressFormat.JPEG
+		}
+		val normalizedRotation = ((rotationDegrees % 360.0) + 360.0) % 360.0
+		val isUnchanged = normalizedRotation < 0.0001 || 360.0 - normalizedRotation < 0.0001
+		val hasFullCrop = cropLeft <= 0.0001 && cropTop <= 0.0001 &&
+			cropRight <= 0.0001 && cropBottom <= 0.0001
+		val hasDefaultAdjustments = kotlin.math.abs(brightness) < 0.0001 &&
+			kotlin.math.abs(contrast - 1.0) < 0.0001
+		if (isUnchanged && hasFullCrop && hasDefaultAdjustments) {
+			if (overwriteOriginal) return sourceFile.absolutePath
+			val copy = uniqueFile(sourceFile, sourceFile.extension, "edited")
+			sourceFile.copyTo(copy, overwrite = false)
+			return copy.absolutePath
+		}
+
+		val decoded = BitmapFactory.decodeFile(sourcePath)
+			?: throw IllegalArgumentException("Android could not decode this image")
+		val bitmaps = mutableListOf<Bitmap>()
+		bitmaps.add(decoded)
+		fun track(bitmap: Bitmap): Bitmap {
+			if (bitmaps.none { it === bitmap }) bitmaps.add(bitmap)
+			return bitmap
+		}
+
+		var temporaryFile: File? = null
+		try {
+			val radians = Math.toRadians(normalizedRotation)
+			val cosine = kotlin.math.abs(kotlin.math.cos(radians))
+			val sine = kotlin.math.abs(kotlin.math.sin(radians))
+			val rotatedWidth = maxOf(1, kotlin.math.ceil(decoded.width * cosine + decoded.height * sine).toInt())
+			val rotatedHeight = maxOf(1, kotlin.math.ceil(decoded.height * cosine + decoded.width * sine).toInt())
+			val rotated = if (normalizedRotation < 0.0001 || 360.0 - normalizedRotation < 0.0001) {
+				decoded
+			} else {
+				val output = track(Bitmap.createBitmap(rotatedWidth, rotatedHeight, Bitmap.Config.ARGB_8888))
+				Canvas(output).apply {
+					translate(rotatedWidth / 2f, rotatedHeight / 2f)
+					rotate(normalizedRotation.toFloat())
+					drawBitmap(decoded, -decoded.width / 2f, -decoded.height / 2f, Paint(Paint.FILTER_BITMAP_FLAG))
+				}
+				output
+			}
+
+			val left = (cropLeft.coerceIn(0.0, 1.0) * rotated.width).toInt().coerceIn(0, rotated.width - 1)
+			val top = (cropTop.coerceIn(0.0, 1.0) * rotated.height).toInt().coerceIn(0, rotated.height - 1)
+			val right = (cropRight.coerceIn(0.0, 1.0) * rotated.width).toInt().coerceIn(0, rotated.width - left - 1)
+			val bottom = (cropBottom.coerceIn(0.0, 1.0) * rotated.height).toInt().coerceIn(0, rotated.height - top - 1)
+			val cropped = track(Bitmap.createBitmap(
+				rotated,
+				left,
+				top,
+				(rotated.width - left - right).coerceAtLeast(1),
+				(rotated.height - top - bottom).coerceAtLeast(1),
+			))
+
+			val contrastScale = contrast.coerceIn(0.5, 2.0).toFloat()
+			val brightnessOffset = (brightness.coerceIn(-100.0, 100.0) / 100.0 * 255.0).toFloat() +
+				128f * (1f - contrastScale)
+			val adjusted = if (kotlin.math.abs(brightnessOffset) < 0.0001f &&
+				kotlin.math.abs(contrastScale - 1f) < 0.0001f
+			) {
+				cropped
+			} else {
+				val output = track(Bitmap.createBitmap(cropped.width, cropped.height, Bitmap.Config.ARGB_8888))
+				val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+					colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+						contrastScale, 0f, 0f, 0f, brightnessOffset,
+						0f, contrastScale, 0f, 0f, brightnessOffset,
+						0f, 0f, contrastScale, 0f, brightnessOffset,
+						0f, 0f, 0f, 1f, 0f,
+					)))
+				}
+				Canvas(output).drawBitmap(cropped, 0f, 0f, paint)
+				output
+			}
+
+			var encoded = if (preferredFormat == Bitmap.CompressFormat.PNG) {
+				val png = compressPngWithinLimit(adjusted, originalSize)
+				if (png != null) {
+					EncodedImage(Bitmap.CompressFormat.PNG, png)
+				} else {
+					val jpegInput = track(flattenOnWhite(adjusted))
+					EncodedImage(Bitmap.CompressFormat.JPEG, compressJpegWithinLimit(jpegInput, originalSize))
+				}
+			} else {
+				EncodedImage(Bitmap.CompressFormat.JPEG, compressJpegWithinLimit(adjusted, originalSize))
+			}
+
+			val outputExtension = if (encoded.format == Bitmap.CompressFormat.PNG) "png" else "jpg"
+			val sourceExtensionMatches = sourceFile.extension.equals(outputExtension, ignoreCase = true) ||
+				(outputExtension == "jpg" && sourceFile.extension.equals("jpeg", ignoreCase = true))
+			val target = if (overwriteOriginal && sourceExtensionMatches) {
+				sourceFile
+			} else if (overwriteOriginal) {
+				val extensionChangedPath = File(sourceFile.parentFile, "${sourceFile.nameWithoutExtension}.$outputExtension")
+				if (extensionChangedPath.exists()) {
+					uniqueFile(sourceFile, outputExtension, "edited")
+				} else {
+					extensionChangedPath
+				}
+			} else {
+				uniqueFile(sourceFile, outputExtension, "edited")
+			}
+
+			val parent = target.parentFile ?: throw IllegalArgumentException("Image has no parent folder")
+			temporaryFile = File.createTempFile(".image-edit-", ".tmp", parent)
+			temporaryFile.writeBytes(encoded.bytes)
+			Os.rename(temporaryFile.absolutePath, target.absolutePath)
+			temporaryFile = null
+			if (overwriteOriginal && target.absolutePath != sourceFile.absolutePath && !sourceFile.delete()) {
+				target.delete()
+				throw IllegalStateException("Could not replace the original image with the new format")
+			}
+			return target.absolutePath
+		} finally {
+			temporaryFile?.delete()
+			bitmaps.forEach { if (!it.isRecycled) it.recycle() }
+		}
+	}
+
+	private fun compress(bitmap: Bitmap, format: Bitmap.CompressFormat, quality: Int): ByteArray {
+		val output = ByteArrayOutputStream()
+		if (!bitmap.compress(format, quality, output)) {
+			throw IllegalStateException("Android could not encode the edited image")
+		}
+		return output.toByteArray()
+	}
+
+	private fun flattenOnWhite(bitmap: Bitmap): Bitmap {
+		val output = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+		Canvas(output).apply {
+			drawColor(Color.WHITE)
+			drawBitmap(bitmap, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+		}
+		return output
+	}
+
+	private fun compressPngWithinLimit(bitmap: Bitmap, maximumBytes: Long): ByteArray? {
+		var working = bitmap
+		var scaledBitmap: Bitmap? = null
+		try {
+			while (true) {
+				val candidate = compress(working, Bitmap.CompressFormat.PNG, 100)
+				if (candidate.size.toLong() <= maximumBytes) return candidate
+				if (working.width == 1 && working.height == 1) return null
+				val nextWidth = (working.width * 0.8).toInt().coerceAtLeast(1)
+				val nextHeight = (working.height * 0.8).toInt().coerceAtLeast(1)
+				val next = Bitmap.createScaledBitmap(working, nextWidth, nextHeight, true)
+				if (scaledBitmap != null) scaledBitmap.recycle()
+				scaledBitmap = next
+				working = next
+			}
+		} finally {
+			scaledBitmap?.recycle()
+		}
+	}
+
+	private fun compressJpegWithinLimit(bitmap: Bitmap, maximumBytes: Long): ByteArray {
+		var working = bitmap
+		var scaledBitmap: Bitmap? = null
+		try {
+			while (true) {
+				var low = 1
+				var high = 100
+				var best: ByteArray? = null
+				while (low <= high) {
+					val quality = (low + high) / 2
+					val candidate = compress(working, Bitmap.CompressFormat.JPEG, quality)
+					if (candidate.size.toLong() <= maximumBytes) {
+						best = candidate
+						low = quality + 1
+					} else {
+						high = quality - 1
+					}
+				}
+				if (best != null) return best
+				if (working.width == 1 && working.height == 1) {
+					throw IllegalStateException("Could not encode the edited image within the original file size")
+				}
+				val nextWidth = (working.width * 0.8).toInt().coerceAtLeast(1)
+				val nextHeight = (working.height * 0.8).toInt().coerceAtLeast(1)
+				val next = Bitmap.createScaledBitmap(working, nextWidth, nextHeight, true)
+				if (scaledBitmap != null) scaledBitmap.recycle()
+				scaledBitmap = next
+				working = next
+			}
+		} finally {
+			scaledBitmap?.recycle()
+		}
+	}
+
+	private fun uniqueFile(source: File, extension: String, suffix: String): File {
+		val base = source.nameWithoutExtension
+		var index = 1
+		while (true) {
+			val nameSuffix = if (index == 1) "-$suffix" else "-$suffix-$index"
+			val candidate = File(source.parentFile, "$base$nameSuffix.$extension")
+			if (!candidate.exists()) return candidate
+			index++
+		}
+	}
+}
 
 class MainActivity : FlutterActivity() {
 	private val channelName = "modi_file_explorer2/installed_apps"
 	private val storageChannelName = "modi_file_explorer2/storage_volumes"
+	private val devicePowerChannelName = "modi_file_explorer2/device_power"
 	private val openWithChannelName = "modi_file_explorer2/open_with"
 	private val navigationModeChannelName = "modi_file_explorer2/navigation_mode"
 	private val videoMediaChannelName = "modi_file_explorer2/video_media"
 	private val videoPlayerChannelName = "modi_file_explorer2/video_player"
 	private val videoPlayerEventsChannelName = "modi_file_explorer2/video_player/events"
+	private val imageEditorChannelName = "modi_file_explorer2/image_editor"
+	private val pdfRendererChannelName = "modi_file_explorer2/pdf_renderer"
 	private val videoPlayerHandler = Handler(Looper.getMainLooper())
+	private val imageEditorExecutor = Executors.newSingleThreadExecutor()
+	private val pdfRendererExecutor = Executors.newSingleThreadExecutor()
+	private val pdfDocuments = mutableMapOf<String, PdfDocumentHandle>()
+	private val pdfRenderRequests = ConcurrentHashMap<String, AtomicBoolean>()
 	private var archivePlatformChannel: ArchivePlatformChannel? = null
+	private var audioPlaybackPlatformChannel: AudioPlaybackPlatformChannel? = null
+	private var xlsxPlatformChannel: XlsxPlatformChannel? = null
+	private var docxPlatformChannel: DocxPlatformChannel? = null
+	private var pptxPlatformChannel: PptxPlatformChannel? = null
 	private var videoPlayerEventSink: EventChannel.EventSink? = null
 	private var activeVideoPlayer: NativeVideoPlayer? = null
 	private val videoMediaExecutor = ThreadPoolExecutor(
@@ -83,6 +340,381 @@ class MainActivity : FlutterActivity() {
 		val result: MethodChannel.Result,
 		var awaitingSettingsReturn: Boolean = false,
 	)
+
+	private data class PdfDocumentHandle(
+		val renderer: PdfRenderer,
+		val fileDescriptor: ParcelFileDescriptor,
+	)
+
+	private fun postPdfError(result: MethodChannel.Result, code: String, message: String?) {
+		runOnUiThread { result.error(code, message, null) }
+	}
+
+	private fun pdfErrorCode(error: Throwable): String {
+		val message = error.message.orEmpty().lowercase()
+		return if (
+			message.contains("password") ||
+			message.contains("encrypted") ||
+			message.contains("decrypt")
+		) {
+			"PASSWORD_PROTECTED"
+		} else {
+			"INVALID_PDF"
+		}
+	}
+
+	private fun openPdfRenderer(
+		descriptor: ParcelFileDescriptor,
+		password: String?,
+	): PdfRenderer {
+		if (password == null) return PdfRenderer(descriptor)
+		if (Build.VERSION.SDK_INT < 35) {
+			throw PdfChannelException(
+				"PASSWORD_UNSUPPORTED",
+				"Password-protected PDFs require Android 15 or newer in the built-in viewer",
+			)
+		}
+		try {
+			val paramsClass = Class.forName("android.graphics.pdf.LoadParams")
+			val builderClass =
+				Class.forName("android.graphics.pdf.LoadParams\$Builder")
+			val builder = builderClass.getDeclaredConstructor().newInstance()
+			builderClass.getMethod("setPassword", String::class.java)
+				.invoke(builder, password)
+			val params = builderClass.getMethod("build").invoke(builder)
+			val constructor = PdfRenderer::class.java.getConstructor(
+				ParcelFileDescriptor::class.java,
+				paramsClass,
+			)
+			return constructor.newInstance(descriptor, params) as PdfRenderer
+		} catch (error: java.lang.reflect.InvocationTargetException) {
+			throw error.targetException
+		} catch (error: ReflectiveOperationException) {
+			throw PdfChannelException(
+				"PASSWORD_UNSUPPORTED",
+				"Password-protected PDF rendering is unavailable on this Android version",
+			)
+		}
+	}
+
+	private fun closePdfDocument(document: PdfDocumentHandle) {
+		try {
+			document.renderer.close()
+		} finally {
+			document.fileDescriptor.close()
+		}
+	}
+
+	private fun integerArgument(arguments: Map<*, *>?, name: String): Int? {
+		val number = arguments?.get(name) as? Number ?: return null
+		val value = number.toDouble()
+		if (!value.isFinite() || value % 1.0 != 0.0 ||
+			value < Int.MIN_VALUE.toDouble() || value > Int.MAX_VALUE.toDouble()
+		) {
+			return null
+		}
+		return value.toInt()
+	}
+
+	private fun registerPdfRendererChannel(flutterEngine: FlutterEngine) {
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, pdfRendererChannelName)
+			.setMethodCallHandler { call, result ->
+				val arguments = call.arguments as? Map<*, *>
+				when (call.method) {
+					"openDocument" -> {
+						val path = arguments?.get("path") as? String
+						val password = arguments?.get("password") as? String
+						if (path.isNullOrBlank()) {
+							result.error("INVALID_ARGUMENT", "A PDF file path is required", null)
+							return@setMethodCallHandler
+						}
+						try {
+							pdfRendererExecutor.execute {
+								var descriptor: ParcelFileDescriptor? = null
+								var renderer: PdfRenderer? = null
+								try {
+									val file = File(path)
+									if (!file.exists() || !file.isFile) {
+										throw PdfChannelException("FILE_NOT_FOUND", "PDF file does not exist")
+									}
+									if (!file.canRead()) {
+										throw PdfChannelException("FILE_ACCESS_DENIED", "PDF file is not readable")
+									}
+									val openedDescriptor =
+										ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+									descriptor = openedDescriptor
+									val openedRenderer = openPdfRenderer(openedDescriptor, password)
+									renderer = openedRenderer
+									if (openedRenderer.pageCount <= 0) {
+										throw PdfChannelException("EMPTY_PDF", "PDF contains no pages")
+									}
+									val firstPage = openedRenderer.openPage(0)
+									val firstPageWidth: Int
+									val firstPageHeight: Int
+									try {
+										firstPageWidth = firstPage.width
+										firstPageHeight = firstPage.height
+									} finally {
+										firstPage.close()
+									}
+									val documentId = UUID.randomUUID().toString()
+									pdfDocuments[documentId] =
+										PdfDocumentHandle(openedRenderer, openedDescriptor)
+									renderer = null
+									descriptor = null
+									val response = mapOf(
+										"documentId" to documentId,
+										"pageCount" to openedRenderer.pageCount,
+										"firstPageWidth" to firstPageWidth,
+										"firstPageHeight" to firstPageHeight,
+									)
+									runOnUiThread { result.success(response) }
+								} catch (error: Exception) {
+									try {
+										renderer?.close()
+									} catch (_: Exception) {
+									}
+									try {
+										descriptor?.close()
+									} catch (_: Exception) {
+									}
+									val code = (error as? PdfChannelException)?.code
+										?: if (error is SecurityException) {
+											if (password == null) "PASSWORD_PROTECTED" else "WRONG_PASSWORD"
+										} else {
+											pdfErrorCode(error).let { detected ->
+												if (password != null && detected == "PASSWORD_PROTECTED") {
+													"WRONG_PASSWORD"
+												} else {
+													detected
+												}
+											}
+										}
+									postPdfError(result, code, error.message)
+								}
+							}
+						} catch (_: java.util.concurrent.RejectedExecutionException) {
+							result.error("PDF_RENDER_FAILED", "PDF renderer is shutting down", null)
+						}
+					}
+					"renderPage" -> {
+						val documentId = arguments?.get("documentId") as? String
+						val pageIndex = integerArgument(arguments, "pageIndex")
+						val width = integerArgument(arguments, "width")
+						val height = integerArgument(arguments, "height")
+						val requestId = arguments?.get("requestId") as? String
+						if (
+							documentId.isNullOrBlank() || pageIndex == null || pageIndex < 0 ||
+							width == null || width <= 0 || height == null || height <= 0 ||
+							requestId.isNullOrBlank()
+						) {
+							result.error("INVALID_ARGUMENT", "A document, valid page index, size and request id are required", null)
+							return@setMethodCallHandler
+						}
+						val cancelled = AtomicBoolean(false)
+						if (pdfRenderRequests.putIfAbsent(requestId, cancelled) != null) {
+							result.error("INVALID_ARGUMENT", "A render request with this id is already active", null)
+							return@setMethodCallHandler
+						}
+						try {
+							pdfRendererExecutor.execute {
+								try {
+									if (cancelled.get()) {
+										throw PdfChannelException("RENDER_CANCELLED", "PDF render request was cancelled")
+									}
+									val document = pdfDocuments[documentId]
+										?: throw PdfChannelException("DOCUMENT_NOT_FOUND", "PDF document is not open")
+									if (pageIndex >= document.renderer.pageCount) {
+										throw PdfChannelException("INVALID_PAGE_INDEX", "PDF page index is out of range")
+									}
+									val page = document.renderer.openPage(pageIndex)
+									try {
+										if (cancelled.get()) {
+											throw PdfChannelException("RENDER_CANCELLED", "PDF render request was cancelled")
+										}
+										val bitmapWidth = width.coerceIn(1, MAX_PDF_BITMAP_DIMENSION)
+										val bitmapHeight = height.coerceIn(1, MAX_PDF_BITMAP_DIMENSION)
+										val pageScale = minOf(
+											bitmapWidth.toDouble() / page.width,
+											bitmapHeight.toDouble() / page.height,
+											MAX_PDF_BITMAP_DIMENSION.toDouble() / page.width,
+											MAX_PDF_BITMAP_DIMENSION.toDouble() / page.height,
+										)
+										val outputWidth =
+											(page.width * pageScale).toInt().coerceIn(1, MAX_PDF_BITMAP_DIMENSION)
+										val outputHeight =
+											(page.height * pageScale).toInt().coerceIn(1, MAX_PDF_BITMAP_DIMENSION)
+										val bitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+										try {
+											if (cancelled.get()) {
+												throw PdfChannelException("RENDER_CANCELLED", "PDF render request was cancelled")
+											}
+											Canvas(bitmap).drawColor(Color.WHITE)
+											page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+											val bytes = ByteArrayOutputStream().use { output ->
+												if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+													throw IOException("Could not encode rendered PDF page")
+												}
+												output.toByteArray()
+											}
+											runOnUiThread {
+												if (cancelled.get()) {
+													result.error("RENDER_CANCELLED", "PDF render request was cancelled", null)
+												} else {
+													result.success(mapOf(
+														"bytes" to bytes,
+														"pageWidth" to page.width,
+														"pageHeight" to page.height,
+													))
+												}
+											}
+										} finally {
+											bitmap.recycle()
+										}
+									} finally {
+										page.close()
+									}
+								} catch (error: Throwable) {
+									val code = (error as? PdfChannelException)?.code ?: "PDF_RENDER_FAILED"
+									postPdfError(
+										result,
+										code,
+										error.message ?: "Could not render the PDF page",
+									)
+								} finally {
+									pdfRenderRequests.remove(requestId, cancelled)
+								}
+							}
+						} catch (_: java.util.concurrent.RejectedExecutionException) {
+							pdfRenderRequests.remove(requestId, cancelled)
+							result.error("PDF_RENDER_FAILED", "PDF renderer is shutting down", null)
+						}
+					}
+					"pageInfo" -> {
+						val documentId = arguments?.get("documentId") as? String
+						val pageIndex = integerArgument(arguments, "pageIndex")
+						if (documentId.isNullOrBlank() || pageIndex == null || pageIndex < 0) {
+							result.error("INVALID_ARGUMENT", "A document and valid page index are required", null)
+							return@setMethodCallHandler
+						}
+						try {
+							pdfRendererExecutor.execute {
+								try {
+									val document = pdfDocuments[documentId]
+										?: throw PdfChannelException("DOCUMENT_NOT_FOUND", "PDF document is not open")
+									if (pageIndex >= document.renderer.pageCount) {
+										throw PdfChannelException("INVALID_PAGE_INDEX", "PDF page index is out of range")
+									}
+									val page = document.renderer.openPage(pageIndex)
+									val info = try {
+										mapOf("pageWidth" to page.width, "pageHeight" to page.height)
+									} finally {
+										page.close()
+									}
+									runOnUiThread { result.success(info) }
+								} catch (error: Exception) {
+									val code = (error as? PdfChannelException)?.code ?: "PDF_RENDER_FAILED"
+									postPdfError(result, code, error.message)
+								}
+							}
+						} catch (_: java.util.concurrent.RejectedExecutionException) {
+							result.error("PDF_RENDER_FAILED", "PDF renderer is shutting down", null)
+						}
+					}
+					"searchText" -> {
+						val documentId = arguments?.get("documentId") as? String
+						val query = arguments?.get("query") as? String
+						if (documentId.isNullOrBlank() || query == null || query.length > 256) {
+							result.error("INVALID_ARGUMENT", "A document id and search text of at most 256 characters are required", null)
+							return@setMethodCallHandler
+						}
+						if (query.isBlank()) {
+							result.success(emptyList<Int>())
+							return@setMethodCallHandler
+						}
+						try {
+							pdfRendererExecutor.execute {
+								try {
+									val document = pdfDocuments[documentId]
+										?: throw PdfChannelException("DOCUMENT_NOT_FOUND", "PDF document is not open")
+									val matches = mutableListOf<Int>()
+									var textContentsMethod: java.lang.reflect.Method? = null
+									for (pageIndex in 0 until document.renderer.pageCount) {
+										val page = document.renderer.openPage(pageIndex)
+										try {
+											val method = textContentsMethod ?: try {
+												page.javaClass.getMethod("getTextContents").also {
+													textContentsMethod = it
+												}
+											} catch (_: NoSuchMethodException) {
+												throw PdfChannelException(
+													"PDF_TEXT_SEARCH_UNAVAILABLE",
+													"PDF text search requires Android 15 or newer",
+												)
+											}
+											val textContents = method.invoke(page) as? Iterable<*>
+												?: emptyList<Any>()
+											val pageText = buildString {
+												for (content in textContents) {
+													if (content == null) continue
+													val text = content.javaClass
+														.getMethod("getText")
+														.invoke(content) as? String
+													if (text != null) append(text).append(' ')
+												}
+											}
+											if (pageText.lowercase(Locale.ROOT).contains(query.lowercase(Locale.ROOT))) {
+												matches.add(pageIndex)
+											}
+										} finally {
+											page.close()
+										}
+									}
+									runOnUiThread { result.success(matches) }
+								} catch (error: Exception) {
+									val code = (error as? PdfChannelException)?.code ?: "PDF_SEARCH_FAILED"
+									postPdfError(result, code, error.message ?: "Could not search this PDF")
+								}
+							}
+						} catch (_: java.util.concurrent.RejectedExecutionException) {
+							result.error("PDF_RENDER_FAILED", "PDF renderer is shutting down", null)
+						}
+					}
+					"cancelRender" -> {
+						val requestId = arguments?.get("requestId") as? String
+						if (requestId.isNullOrBlank()) {
+							result.error("INVALID_ARGUMENT", "A render request id is required", null)
+							return@setMethodCallHandler
+						}
+						pdfRenderRequests[requestId]?.set(true)
+						result.success(null)
+					}
+					"closeDocument" -> {
+						val documentId = arguments?.get("documentId") as? String
+						if (documentId.isNullOrBlank()) {
+							result.error("INVALID_ARGUMENT", "A document id is required", null)
+							return@setMethodCallHandler
+						}
+						try {
+							pdfRendererExecutor.execute {
+								try {
+									val document = pdfDocuments.remove(documentId)
+									if (document != null) closePdfDocument(document)
+									runOnUiThread { result.success(null) }
+								} catch (error: Exception) {
+									postPdfError(result, "PDF_RENDER_FAILED", error.message)
+								}
+							}
+						} catch (_: java.util.concurrent.RejectedExecutionException) {
+							result.error("PDF_RENDER_FAILED", "PDF renderer is shutting down", null)
+						}
+					}
+					else -> result.notImplemented()
+				}
+			}
+	}
+
+	private class PdfChannelException(val code: String, message: String) : Exception(message)
 
 	private fun drawableToPng(drawable: android.graphics.drawable.Drawable, size: Int = 64): ByteArray {
 		val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
@@ -581,6 +1213,14 @@ class MainActivity : FlutterActivity() {
 		}
 	}
 
+	override fun onNewIntent(intent: Intent) {
+		super.onNewIntent(intent)
+		setIntent(intent)
+		if (intent.getBooleanExtra(AudioPlaybackPlatformChannel.EXTRA_OPEN_AUDIO_TAB, false)) {
+			audioPlaybackPlatformChannel?.onNotificationTapped()
+		}
+	}
+
 	private fun requestUnknownSourcesPermission(
 		intent: Intent,
 		result: MethodChannel.Result,
@@ -734,10 +1374,77 @@ class MainActivity : FlutterActivity() {
 
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
 		super.configureFlutterEngine(flutterEngine)
+		audioPlaybackPlatformChannel = AudioPlaybackPlatformChannel(
+			this,
+			flutterEngine.dartExecutor.binaryMessenger,
+		)
 		archivePlatformChannel = ArchivePlatformChannel(
 			this,
 			flutterEngine.dartExecutor.binaryMessenger,
 		)
+		xlsxPlatformChannel = XlsxPlatformChannel(
+			flutterEngine.dartExecutor.binaryMessenger,
+		)
+		docxPlatformChannel = DocxPlatformChannel(
+			this,
+			flutterEngine.dartExecutor.binaryMessenger,
+		)
+		pptxPlatformChannel = PptxPlatformChannel(
+			flutterEngine.dartExecutor.binaryMessenger,
+		)
+		registerPdfRendererChannel(flutterEngine)
+
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, imageEditorChannelName)
+			.setMethodCallHandler { call, result ->
+				if (call.method != "saveEditedImage") {
+					result.notImplemented()
+					return@setMethodCallHandler
+				}
+				val arguments = call.arguments as? Map<*, *>
+				val sourcePath = arguments?.get("sourcePath") as? String
+				val rotationDegrees = (arguments?.get("rotationDegrees") as? Number)?.toDouble()
+				val cropLeft = (arguments?.get("cropLeft") as? Number)?.toDouble()
+				val cropTop = (arguments?.get("cropTop") as? Number)?.toDouble()
+				val cropRight = (arguments?.get("cropRight") as? Number)?.toDouble()
+				val cropBottom = (arguments?.get("cropBottom") as? Number)?.toDouble()
+				val brightness = (arguments?.get("brightness") as? Number)?.toDouble()
+				val contrast = (arguments?.get("contrast") as? Number)?.toDouble()
+				val overwriteOriginal = arguments?.get("overwriteOriginal") as? Boolean
+				if (
+					sourcePath.isNullOrBlank() ||
+					rotationDegrees == null ||
+					cropLeft == null ||
+					cropTop == null ||
+					cropRight == null ||
+					cropBottom == null ||
+					brightness == null ||
+					contrast == null ||
+					overwriteOriginal == null
+				) {
+					result.error("INVALID_ARGUMENT", "Image edit settings are incomplete", null)
+					return@setMethodCallHandler
+				}
+				imageEditorExecutor.execute {
+					try {
+						val savedPath = AndroidImageEditor.save(
+							sourcePath,
+							rotationDegrees,
+							cropLeft,
+							cropTop,
+							cropRight,
+							cropBottom,
+							brightness,
+							contrast,
+							overwriteOriginal,
+						)
+						runOnUiThread { result.success(savedPath) }
+					} catch (error: Exception) {
+						runOnUiThread {
+							result.error("IMAGE_EDIT_FAILED", error.message, null)
+						}
+					}
+				}
+			}
 
 		EventChannel(flutterEngine.dartExecutor.binaryMessenger, videoPlayerEventsChannelName)
 			.setStreamHandler(object : EventChannel.StreamHandler {
@@ -993,7 +1700,9 @@ class MainActivity : FlutterActivity() {
 							}
 							val authority = "$packageName.fileprovider"
 							val uri = FileProvider.getUriForFile(this, authority, file)
-							val appMimeType = resolveFileMimeType(file)
+							val appMimeType = call.argument<String>("mimeType")
+								?.takeIf { it.isNotBlank() }
+								?: resolveFileMimeType(file)
 							val apps = linkedMapOf<String, Map<String, Any?>>()
 							val intent = viewIntent(appMimeType, uri)
 							for (resolveInfo in queryActivities(intent)) {
@@ -1112,6 +1821,29 @@ class MainActivity : FlutterActivity() {
 				}
 			}
 
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, devicePowerChannelName)
+			.setMethodCallHandler { call, result ->
+				if (call.method != "getPowerState") {
+					result.notImplemented()
+					return@setMethodCallHandler
+				}
+				try {
+					val batteryManager = getSystemService(BATTERY_SERVICE) as android.os.BatteryManager
+					val powerManager = getSystemService(POWER_SERVICE) as android.os.PowerManager
+					val batteryPercent = batteryManager.getIntProperty(
+						android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY,
+					)
+					result.success(
+						mapOf(
+							"lowBattery" to (batteryPercent in 0..15),
+							"batterySaver" to powerManager.isPowerSaveMode,
+						),
+					)
+				} catch (error: Exception) {
+					result.error("POWER_STATE_UNAVAILABLE", error.message, null)
+				}
+			}
+
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, storageChannelName)
 			.setMethodCallHandler { call, result ->
 				if (call.method == "openStorageAccessSettings") {
@@ -1211,8 +1943,24 @@ class MainActivity : FlutterActivity() {
 	}
 
 	override fun onDestroy() {
+		audioPlaybackPlatformChannel?.dispose()
+		audioPlaybackPlatformChannel = null
 		activeVideoPlayer?.release()
 		activeVideoPlayer = null
+		pdfRenderRequests.values.forEach { it.set(true) }
+		try {
+			pdfRendererExecutor.execute {
+				pdfDocuments.values.toList().forEach { document ->
+					try {
+						closePdfDocument(document)
+					} catch (_: Exception) {
+					}
+				}
+				pdfDocuments.clear()
+			}
+			pdfRendererExecutor.shutdown()
+		} catch (_: java.util.concurrent.RejectedExecutionException) {
+		}
 		super.onDestroy()
 	}
 }

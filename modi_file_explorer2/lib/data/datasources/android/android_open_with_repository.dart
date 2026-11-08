@@ -10,10 +10,11 @@ class AndroidOpenWithRepository implements OpenWithRepository {
   Future<List<OpenWithApp>> listApps({
     required String path,
     required String category,
+    String? mimeType,
   }) async {
     final result = await _channel.invokeMethod<List<dynamic>>(
       'listOpenWithApps',
-      {'path': path, 'category': category},
+      {'path': path, 'category': category, 'mimeType': mimeType},
     );
     return _decodeApps(result);
   }

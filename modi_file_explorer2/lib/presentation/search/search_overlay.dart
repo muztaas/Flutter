@@ -13,6 +13,7 @@ import '../../domain/entities/search_folder_candidate.dart';
 import '../../domain/entities/search_query.dart';
 import '../../domain/entities/search_scope.dart';
 import '../../domain/entities/search_result.dart';
+import '../../domain/utils/file_visibility.dart';
 import '../../domain/utils/shared_storage_scan_scope.dart';
 import '../image_viewer/image_file_preview.dart';
 import '../common/file_type_icon.dart';
@@ -107,17 +108,21 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
     final search = ref.watch(fileSearchProvider(widget.sessionId));
     final scope = search.scope;
     final settings = ref.watch(appSettingsProvider);
-    final visibleResults =
-        scope != null &&
-            scope.category != null &&
-            settings.hideAndroidFoldersInCategoryPages
-        ? search.results
-              .where(
-                (result) =>
-                    !SharedStorageScanScope.isInsideAndroidFolder(result.path),
-              )
-              .toList(growable: false)
-        : search.results;
+    final visibleResults = search.results.where((result) {
+      if (scope != null &&
+          scope.category != null &&
+          settings.hideAndroidFoldersInCategoryPages &&
+          SharedStorageScanScope.isInsideAndroidFolder(result.path)) {
+        return false;
+      }
+      return FileVisibility.shouldShow(
+        path: result.path,
+        isDirectory: result.isDirectory,
+        showHiddenFiles: settings.showHiddenFiles,
+        blacklistedPaths: settings.blacklistedPaths,
+        whitelistedPaths: settings.whitelistedPaths,
+      );
+    }).toList(growable: false);
     final categories = ref.watch(fileTypeCategoriesProvider);
     final surface = Theme.of(context).colorScheme.surface;
     final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
@@ -799,7 +804,18 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
     final expanded = blacklist
         ? search.blacklistExpanded
         : search.whitelistExpanded;
-    final candidates = search.folderCandidates;
+    final settings = ref.read(appSettingsProvider);
+    final candidates = search.folderCandidates
+        .where(
+          (candidate) => FileVisibility.shouldShow(
+            path: candidate.path,
+            isDirectory: true,
+            showHiddenFiles: settings.showHiddenFiles,
+            blacklistedPaths: settings.blacklistedPaths,
+            whitelistedPaths: settings.whitelistedPaths,
+          ),
+        )
+        .toList(growable: false);
     final title = blacklist ? 'Blacklist' : 'Whitelist';
     final theme = Theme.of(context);
     final visibleRows = candidates.length < _folderListVisibleRows
@@ -1064,11 +1080,20 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
     final pathStyle = textTheme.bodySmall?.copyWith(
       color: Theme.of(context).colorScheme.onSurfaceVariant,
     );
-    final showDetails =
-        (result.isDirectory && settings.showFolderItemCount) ||
-        (!result.isDirectory && settings.showFileSize) ||
-        settings.showModifiedDate ||
-        settings.showModifiedTime;
+    final textScaler = MediaQuery.textScalerOf(context);
+    final textDirection = Directionality.of(context);
+    final nameLineHeight = TextPainter(
+      text: TextSpan(text: 'M', style: nameStyle),
+      maxLines: 1,
+      textDirection: textDirection,
+      textScaler: textScaler,
+    )..layout();
+    final pathLineHeight = TextPainter(
+      text: TextSpan(text: 'M', style: pathStyle),
+      maxLines: 1,
+      textDirection: textDirection,
+      textScaler: textScaler,
+    )..layout();
     final details = <String>[
       if (result.isDirectory &&
           settings.showFolderItemCount &&
@@ -1084,7 +1109,10 @@ class _SearchOverlayState extends ConsumerState<SearchOverlay> {
     return StorageEntryRow(
       leading: _resultLeading(context, result),
       detailsEnabled: true,
-      detailsHeight: showDetails ? 68 : 52,
+      detailsHeight:
+          nameLineHeight.height +
+          pathLineHeight.height * (details.isEmpty ? 1 : 2) +
+          fontScaledSpacing(context, 8),
       content: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.center,

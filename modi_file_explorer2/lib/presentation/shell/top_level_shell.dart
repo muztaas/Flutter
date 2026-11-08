@@ -8,14 +8,22 @@ import 'package:permission_handler/permission_handler.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../core/utils/startup_page_order.dart';
 import '../text_editor/text_editor_tab.dart';
+import '../common/content_sized_menu.dart';
+import '../common/animated_bar_visibility.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../settings/settings_panel.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/providers/search_provider.dart';
+import '../../core/providers/pdf_reading_progress_provider.dart';
+import '../../core/filesystem/file_change_notifier.dart';
 import '../../core/providers/storage_providers.dart';
 import '../../domain/entities/storage_device.dart';
 import '../common/marquee_text.dart';
 import '../search/search_overlay.dart';
+
+const double _closeTabTouchAreaMinimumWidth = 44;
+const double _closeTabTouchAreaPreferredFraction = 0.28;
+const double _closeTabTouchAreaMaximumFraction = 0.40;
 
 class TopLevelShell extends StatefulWidget {
   const TopLevelShell({super.key});
@@ -27,6 +35,7 @@ class TopLevelShell extends StatefulWidget {
 class _TopLevelShellState extends State<TopLevelShell>
     with WidgetsBindingObserver {
   final TabsManager tabs = TabsManager.instance;
+  late final StreamSubscription<FileChangeEvent> _fileChangeSubscription;
   DateTime? _lastBackPress;
   bool _exitConfirmationInProgress = false;
   bool _startupReady = false;
@@ -48,6 +57,9 @@ class _TopLevelShellState extends State<TopLevelShell>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     tabs.addListener(_onTabsChanged);
+    _fileChangeSubscription = FileChangeNotifier.instance.changes.listen(
+      _onFileChanges,
+    );
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) unawaited(_restoreSessionWhenReady());
     });
@@ -59,6 +71,7 @@ class _TopLevelShellState extends State<TopLevelShell>
     WidgetsBinding.instance.removeObserver(this);
     unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     tabs.removeListener(_onTabsChanged);
+    unawaited(_fileChangeSubscription.cancel());
     super.dispose();
   }
 
@@ -67,14 +80,20 @@ class _TopLevelShellState extends State<TopLevelShell>
     if (state == AppLifecycleState.paused) {
       unawaited(tabs.flushPersistedTabs());
     } else if (state == AppLifecycleState.resumed) {
-      unawaited(
-        ProviderScope.containerOf(
-          context,
-          listen: false,
-        ).read(availableStorageDevicesProvider.notifier).refresh(),
-      );
+      unawaited(_refreshAvailableStorageDevices());
       if (!tabs.restoreAttempted) unawaited(_restoreSessionWhenReady());
     }
+  }
+
+  Future<void> _refreshAvailableStorageDevices() async {
+    final container = ProviderScope.containerOf(context, listen: false);
+    final notifier = container.read(availableStorageDevicesProvider.notifier);
+    await notifier.refresh();
+    if (!mounted) return;
+    final devices =
+        container.read(availableStorageDevicesProvider).asData?.value ??
+        const <StorageDevice>[];
+    tabs.updateAvailableStorageDevices(devices);
   }
 
   Future<void> _restoreSessionWhenReady() async {
@@ -191,6 +210,65 @@ class _TopLevelShellState extends State<TopLevelShell>
       tab.isVideoPage ||
       (!tab.isImageViewer && tab.storagePath != null);
 
+  void _onFileChanges(FileChangeEvent event) {
+    if (!mounted) return;
+    unawaited(_updatePdfReadingProgressForFileChanges(event));
+    final pathsToRemove = <String>{};
+    for (final change in event.changes) {
+      if (change.kind == FileChangeKind.deleted && change.path != null) {
+        pathsToRemove.add(change.path!);
+      } else if (change.kind == FileChangeKind.renamed &&
+          change.oldPath != null) {
+        pathsToRemove.add(change.oldPath!);
+      }
+    }
+
+    if (pathsToRemove.isEmpty) return;
+    final container = ProviderScope.containerOf(context, listen: false);
+    for (final tab in tabs.tabs.where(_canSearch)) {
+      container
+          .read(fileSearchProvider(tab.sessionId).notifier)
+          .removePaths(pathsToRemove);
+    }
+  }
+
+  Future<void> _updatePdfReadingProgressForFileChanges(
+    FileChangeEvent event,
+  ) async {
+    final container = ProviderScope.containerOf(context, listen: false);
+    final repository = container.read(pdfReadingProgressRepositoryProvider);
+    for (final change in event.changes) {
+      try {
+        if (change.kind == FileChangeKind.deleted && change.path != null) {
+          tabs.markPdfTabsDeleted(change.path!);
+          final location = tabs.pdfReadingLocationForPath(change.path!);
+          await repository.removeTree(location.volumeId, location.relativePath);
+        } else if (change.kind == FileChangeKind.renamed &&
+            change.oldPath != null &&
+            change.newPath != null) {
+          await tabs.savePdfTabsBeforeMove(change.oldPath!);
+          final oldLocation = tabs.pdfReadingLocationForPath(change.oldPath!);
+          final newLocation = tabs.pdfReadingLocationForPath(change.newPath!);
+          try {
+            await repository.moveTree(
+              oldVolumeId: oldLocation.volumeId,
+              oldRelativePath: oldLocation.relativePath,
+              newVolumeId: newLocation.volumeId,
+              newRelativePath: newLocation.relativePath,
+            );
+          } catch (error) {
+            debugPrint('Could not migrate PDF reading records: $error');
+          }
+          tabs.relocatePdfTabs(change.oldPath!, change.newPath!);
+        }
+      } catch (error) {
+        debugPrint(
+          'Could not update PDF reading records after file change: $error',
+        );
+      }
+    }
+  }
+
   void _ensureSelectedTabVisible() {
     if (tabs.tabs.isEmpty) return;
     final entry = tabs.tabs[tabs.selectedIndex];
@@ -211,6 +289,9 @@ class _TopLevelShellState extends State<TopLevelShell>
     final viewer =
         selectedTab?.isImageViewer == true && selectedTab?.isFullscreen == true
         ? selectedTab
+        : selectedTab?.isPdfViewer == true &&
+              selectedTab?.isPdfSystemFullscreen == true
+        ? selectedTab
         : null;
     if (identical(viewer, _fullscreenViewer)) return;
 
@@ -218,6 +299,13 @@ class _TopLevelShellState extends State<TopLevelShell>
     _fullscreenViewer = viewer;
     if (viewer == null) {
       unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+      return;
+    }
+
+    if (viewer.isPdfViewer) {
+      unawaited(
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+      );
       return;
     }
 
@@ -297,11 +385,22 @@ class _TopLevelShellState extends State<TopLevelShell>
             _canSearch(selectedTab) &&
             ref.watch(fileSearchProvider(selectedTab.sessionId)).isOpen;
         final hideImageTabStrip =
-            selectedTab.isImageViewer && selectedTab.isFullscreen && !searchOpen;
+            (selectedTab.isImageViewer ||
+                selectedTab.isPdfViewer ||
+                selectedTab.isCsvViewer ||
+                selectedTab.isXlsxViewer ||
+                selectedTab.isDocxViewer ||
+                selectedTab.isPptxViewer) &&
+            selectedTab.isFullscreen &&
+            !searchOpen;
         return PopScope(
           canPop: false,
           onPopInvokedWithResult: (didPop, result) async {
             if (didPop) return;
+            if (hasOpenContentSizedMenu) {
+              dismissContentSizedMenu();
+              return;
+            }
             if (searchOpen) {
               ref
                   .read(fileSearchProvider(selectedTab.sessionId).notifier)
@@ -347,54 +446,73 @@ class _TopLevelShellState extends State<TopLevelShell>
                 appBar: PreferredSize(
                   preferredSize: Size.fromHeight(tabHeaderHeight),
                   child: SafeArea(
-                    child: hideImageTabStrip
-                        ? SizedBox(height: tabHeaderHeight)
-                        : Container(
-                            key: _tabHeaderKey,
-                            padding: EdgeInsets.symmetric(
-                              horizontal: 8 * tabScale,
-                            ),
-                            color: Colors.lightBlue,
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: Builder(
-                                    builder: (context) {
-                                      Widget buildTabChip(
-                                        TabEntry tab, {
-                                        required int tabIndex,
-                                        required bool isHome,
-                                      }) {
-                                        final selected =
-                                            tabIndex == tabs.selectedIndex;
-                                        final key = _tabKeys.putIfAbsent(
-                                          tab,
-                                          () => GlobalKey(),
-                                        );
-                                        return GestureDetector(
-                                          onTap: () => tabs.goTo(tabIndex),
+                    child: AnimatedBarVisibility(
+                      visible: !hideImageTabStrip,
+                      height: tabHeaderHeight,
+                      child: Container(
+                        key: _tabHeaderKey,
+                        padding: EdgeInsets.symmetric(horizontal: 8 * tabScale),
+                        color: Colors.lightBlue,
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Builder(
+                                builder: (context) {
+                                  Widget buildTabChip(
+                                    TabEntry tab, {
+                                    required int tabIndex,
+                                    required bool isHome,
+                                  }) {
+                                    final selected =
+                                        tabIndex == tabs.selectedIndex;
+                                    final key = _tabKeys.putIfAbsent(
+                                      tab,
+                                      () => GlobalKey(),
+                                    );
+                                    final tabWidth =
+                                        (isHome ? 60 : 100) * tabScale;
+                                    final closeTouchWidth = math.min(
+                                      tabWidth *
+                                          _closeTabTouchAreaMaximumFraction,
+                                      math.max(
+                                        _closeTabTouchAreaMinimumWidth *
+                                            tabScale,
+                                        tabWidth *
+                                            _closeTabTouchAreaPreferredFraction,
+                                      ),
+                                    );
+                                    return GestureDetector(
+                                      onTap: () => tabs.goTo(tabIndex),
+                                      child: SizedBox(
+                                        width: tabWidth,
+                                        child: Container(
+                                          key: key,
+                                          decoration: BoxDecoration(
+                                            color: selected
+                                                ? Theme.of(context)
+                                                      .colorScheme
+                                                      .secondaryContainer
+                                                : Colors.transparent,
+                                            borderRadius: BorderRadius.circular(
+                                              8,
+                                            ),
+                                          ),
                                           child: SizedBox(
-                                            width:
-                                                (isHome ? 60 : 100) * tabScale,
-                                            child: Container(
-                                              key: key,
-                                              padding: EdgeInsets.symmetric(
-                                                horizontal:
-                                                    (isHome ? 0 : 8) * tabScale,
-                                                vertical: 4 * tabScale,
-                                              ),
-                                              decoration: BoxDecoration(
-                                                color: selected
-                                                    ? Theme.of(context)
-                                                          .colorScheme
-                                                          .secondaryContainer
-                                                    : Colors.transparent,
-                                                borderRadius:
-                                                    BorderRadius.circular(8),
-                                              ),
-                                              child: Row(
-                                                children: [
-                                                  Expanded(
+                                            height:
+                                                closeButtonSize + 8 * tabScale,
+                                            child: Stack(
+                                              children: [
+                                                Positioned(
+                                                  left:
+                                                      (isHome ? 0 : 8) *
+                                                      tabScale,
+                                                  right: isHome
+                                                      ? 0
+                                                      : closeTouchWidth,
+                                                  top: 4 * tabScale,
+                                                  bottom: 4 * tabScale,
+                                                  child: Align(
+                                                    alignment: Alignment.center,
                                                     child: MarqueeText(
                                                       tab.title,
                                                       style: Theme.of(context)
@@ -417,25 +535,139 @@ class _TopLevelShellState extends State<TopLevelShell>
                                                       isActive: selected,
                                                     ),
                                                   ),
-                                                  if (!isHome) ...[
-                                                    SizedBox(
-                                                      width: 4 * tabScale,
-                                                    ),
-                                                    GestureDetector(
-                                                      onTap: () => unawaited(
-                                                        tabs.requestCloseTab(
-                                                          context,
-                                                          tabs.tabs.indexOf(
-                                                            tab,
+                                                ),
+                                                if (!isHome)
+                                                  Positioned(
+                                                    top: 0,
+                                                    right: 0,
+                                                    bottom: 0,
+                                                    width: closeTouchWidth,
+                                                    child: Material(
+                                                      color: Colors.transparent,
+                                                      child: InkWell(
+                                                        customBorder: const RoundedRectangleBorder(
+                                                          borderRadius:
+                                                              BorderRadius.only(
+                                                                topRight:
+                                                                    Radius.circular(
+                                                                      8,
+                                                                    ),
+                                                                bottomRight:
+                                                                    Radius.circular(
+                                                                      8,
+                                                                    ),
+                                                              ),
+                                                        ),
+                                                        onTap: () => unawaited(
+                                                          tabs.requestCloseTab(
+                                                            context,
+                                                            tabs.tabs.indexOf(
+                                                              tab,
+                                                            ),
                                                           ),
-                  ),
-                ),
-                                                      child: SizedBox(
-                                                        width: closeButtonSize,
-                                                        height: closeButtonSize,
+                                                        ),
+                                                        child: Semantics(
+                                                          button: true,
+                                                          label: 'Close tab',
+                                                          child: Align(
+                                                            alignment: Alignment
+                                                                .centerRight,
+                                                            child: Padding(
+                                                              padding:
+                                                                  EdgeInsets.only(
+                                                                    right:
+                                                                        8 *
+                                                                        tabScale,
+                                                                  ),
+                                                              child: SizedBox(
+                                                                width:
+                                                                    closeButtonSize,
+                                                                height:
+                                                                    closeButtonSize,
+                                                                child: Icon(
+                                                                  Icons.close,
+                                                                  size:
+                                                                      closeIconSize,
+                                                                  color:
+                                                                      selected
+                                                                      ? Theme.of(
+                                                                          context,
+                                                                        ).colorScheme.onSecondaryContainer
+                                                                      : null,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  }
+
+                                  final homeTab = tabs.tabs.first;
+                                  return LayoutBuilder(
+                                    builder: (context, constraints) {
+                                      final stripHeight = constraints.maxHeight;
+                                      final homeWidth = math.max(
+                                        stripHeight,
+                                        MediaQuery.sizeOf(context).width * 0.1,
+                                      );
+                                      final selected = tabs.selectedIndex == 0;
+                                      final homeKey = _tabKeys.putIfAbsent(
+                                        homeTab,
+                                        () => GlobalKey(),
+                                      );
+                                      return Row(
+                                        children: [
+                                          SizedBox(
+                                            key: homeKey,
+                                            width: homeWidth,
+                                            height: stripHeight,
+                                            child: Tooltip(
+                                              message: 'Home',
+                                              child: Semantics(
+                                                label: 'Home',
+                                                button: true,
+                                                child: Material(
+                                                  color: Colors.transparent,
+                                                  child: InkWell(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          8,
+                                                        ),
+                                                    onTap: () => tabs.goTo(0),
+                                                    child: Padding(
+                                                      padding:
+                                                          EdgeInsets.symmetric(
+                                                            vertical:
+                                                                4 * tabScale,
+                                                          ),
+                                                      child: Container(
+                                                        decoration: BoxDecoration(
+                                                          color: selected
+                                                              ? Theme.of(
+                                                                      context,
+                                                                    )
+                                                                    .colorScheme
+                                                                    .secondaryContainer
+                                                              : Colors
+                                                                    .transparent,
+                                                          borderRadius:
+                                                              BorderRadius.circular(
+                                                                8,
+                                                              ),
+                                                        ),
+                                                        alignment:
+                                                            Alignment.center,
                                                         child: Icon(
-                                                          Icons.close,
-                                                          size: closeIconSize,
+                                                          Icons.home,
+                                                          size: 22 * tabScale,
                                                           color: selected
                                                               ? Theme.of(
                                                                       context,
@@ -446,150 +678,68 @@ class _TopLevelShellState extends State<TopLevelShell>
                                                         ),
                                                       ),
                                                     ),
-                                                  ],
-                                                ],
+                                                  ),
+                                                ),
                                               ),
                                             ),
                                           ),
-                                        );
-                                      }
-
-                                      final homeTab = tabs.tabs.first;
-                                      return LayoutBuilder(
-                                        builder: (context, constraints) {
-                                          final stripHeight =
-                                              constraints.maxHeight;
-                                          final homeWidth = math.max(
-                                            stripHeight,
-                                            MediaQuery.sizeOf(context).width *
-                                                0.1,
-                                          );
-                                          final selected =
-                                              tabs.selectedIndex == 0;
-                                          final homeKey = _tabKeys.putIfAbsent(
-                                            homeTab,
-                                            () => GlobalKey(),
-                                          );
-                                          return Row(
-                                            children: [
-                                              SizedBox(
-                                                key: homeKey,
-                                                width: homeWidth,
-                                                height: stripHeight,
-                                                child: Tooltip(
-                                                  message: 'Home',
-                                                  child: Semantics(
-                                                    label: 'Home',
-                                                    button: true,
-                                                    child: Material(
-                                                      color: Colors.transparent,
-                                                      child: InkWell(
-                                                        borderRadius:
-                                                            BorderRadius.circular(
-                                                              8,
-                                                            ),
-                                                        onTap: () =>
-                                                            tabs.goTo(0),
-                                                        child: Padding(
-                                                          padding:
-                                                              EdgeInsets.symmetric(
-                                                                vertical:
-                                                                    4 * tabScale,
-                                                              ),
-                                                          child: Container(
-                                                            decoration: BoxDecoration(
-                                                              color: selected
-                                                                  ? Theme.of(
-                                                                          context,
-                                                                        )
-                                                                        .colorScheme
-                                                                        .secondaryContainer
-                                                                  : Colors
-                                                                        .transparent,
-                                                              borderRadius:
-                                                                  BorderRadius.circular(
-                                                                    8,
-                                                                  ),
-                                                            ),
-                                                            alignment:
-                                                                Alignment.center,
-                                                            child: Icon(
-                                                              Icons.home,
-                                                              size:
-                                                                  22 * tabScale,
-                                                              color: selected
-                                                                  ? Theme.of(
-                                                                          context,
-                                                                        )
-                                                                        .colorScheme
-                                                                        .onSecondaryContainer
-                                                                  : null,
-                                                            ),
+                                          SizedBox(width: 8 * tabScale),
+                                          Expanded(
+                                            child: SizedBox(
+                                              height:
+                                                  stripHeight - 6 * tabScale,
+                                              child: DragBoundary(
+                                                child: ReorderableListView.builder(
+                                                  scrollDirection:
+                                                      Axis.horizontal,
+                                                  padding: EdgeInsets.zero,
+                                                  buildDefaultDragHandles:
+                                                      false,
+                                                  dragBoundaryProvider:
+                                                      (context) =>
+                                                          DragBoundary.forRectOf(
+                                                            context,
                                                           ),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ),
-                                              ),
-                                              SizedBox(width: 8 * tabScale),
-                                              Expanded(
-                                                child: SizedBox(
-                                                  height:
-                                                      stripHeight -
-                                                      6 * tabScale,
-                                                  child: DragBoundary(
-                                                    child: ReorderableListView.builder(
-                                                      scrollDirection:
-                                                          Axis.horizontal,
-                                                      padding: EdgeInsets.zero,
-                                                      buildDefaultDragHandles:
-                                                          false,
-                                                      dragBoundaryProvider:
-                                                          (context) =>
-                                                              DragBoundary.forRectOf(
-                                                                context,
-                                                              ),
-                                                      itemCount:
-                                                          tabs.tabs.length - 1,
-                                                      onReorderItem:
-                                                          (oldIndex, newIndex) {
-                                                            tabs.reorderTab(
-                                                              oldIndex + 1,
-                                                              newIndex + 1,
-                                                            );
-                                                          },
-                                                      itemBuilder: (context, index) {
-                                                        final tabIndex =
-                                                            index + 1;
-                                                        final tab =
-                                                            tabs.tabs[tabIndex];
-                                                        return ReorderableDelayedDragStartListener(
-                                                          key: ObjectKey(tab),
-                                                          index: index,
-                                                          child: buildTabChip(
-                                                            tab,
-                                                            tabIndex: tabIndex,
-                                                            isHome: false,
-                                                          ),
+                                                  itemCount:
+                                                      tabs.tabs.length - 1,
+                                                  onReorderItem:
+                                                      (oldIndex, newIndex) {
+                                                        tabs.reorderTab(
+                                                          oldIndex + 1,
+                                                          newIndex + 1,
                                                         );
                                                       },
-                                                    ),
-                                                  ),
+                                                  itemBuilder: (context, index) {
+                                                    final tabIndex = index + 1;
+                                                    final tab =
+                                                        tabs.tabs[tabIndex];
+                                                    return ReorderableDelayedDragStartListener(
+                                                      key: ObjectKey(tab),
+                                                      index: index,
+                                                      child: buildTabChip(
+                                                        tab,
+                                                        tabIndex: tabIndex,
+                                                        isHome: false,
+                                                      ),
+                                                    );
+                                                  },
                                                 ),
                                               ),
-                                            ],
-                                          );
-                                        },
+                                            ),
+                                          ),
+                                        ],
                                       );
                                     },
-                                  ),
-                                ),
-                              ],
+                                  );
+                                },
+                              ),
                             ),
-                          ),
+                          ],
                         ),
                       ),
+                    ),
+                  ),
+                ),
                 body: AnimatedBuilder(
                   animation: tabs.copyPanelNotifier,
                   builder: (context, _) {
@@ -704,7 +854,17 @@ class _TopLevelShellState extends State<TopLevelShell>
                               physics:
                                   _edgeSwipePointer != null ||
                                       (selectedTab.isImageViewer &&
-                                          selectedTab.isImageZoomed)
+                                          selectedTab.isImageZoomed) ||
+                                      (selectedTab.isPdfViewer &&
+                                          selectedTab.isPdfZoomed) ||
+                                      (selectedTab.isCsvViewer &&
+                                          selectedTab.isCsvZoomed) ||
+                                      (selectedTab.isXlsxViewer &&
+                                          selectedTab.isCsvZoomed) ||
+                                      (selectedTab.isDocxViewer &&
+                                          selectedTab.isCsvZoomed) ||
+                                      (selectedTab.isPptxViewer &&
+                                          selectedTab.isPptxZoomed)
                                   ? const NeverScrollableScrollPhysics()
                                   : null,
                               itemCount: tabs.tabs.length,

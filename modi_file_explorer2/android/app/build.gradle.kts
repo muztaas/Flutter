@@ -27,6 +27,7 @@ android {
 
     dependencies {
         implementation("androidx.media3:media3-exoplayer:1.9.2")
+        implementation("androidx.media3:media3-session:1.9.2")
         implementation("net.lingala.zip4j:zip4j:2.11.6")
         implementation("org.apache.commons:commons-compress:1.28.0")
         implementation("org.tukaani:xz:1.12")

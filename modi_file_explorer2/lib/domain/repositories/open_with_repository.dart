@@ -6,6 +6,7 @@ abstract class OpenWithRepository {
   Future<List<OpenWithApp>> listApps({
     required String path,
     required String category,
+    String? mimeType,
   });
 
   Future<List<OpenWithApp>> listAppsForType({

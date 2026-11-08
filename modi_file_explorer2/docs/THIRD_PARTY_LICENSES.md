@@ -1,12 +1,13 @@
 # Third-party licenses
 
-This inventory covers the built-in video player dependency added to the Android
-application. Versions are those selected by the Android release runtime
-dependency graph.
+This inventory covers the built-in media-player dependencies added to the
+Android application. Versions are those selected by the Android release
+runtime dependency graph.
 
 | Component | Version | License | Purpose |
 | --- | --- | --- | --- |
-| AndroidX Media3 ExoPlayer | 1.9.2 | Apache-2.0 | Local video playback through Android's media framework |
+| AndroidX Media3 ExoPlayer | 1.9.2 | Apache-2.0 | Local audio and video playback through Android's media framework |
+| AndroidX Media3 Session | 1.9.2 | Apache-2.0 | Audio media session, foreground playback service, and media notification |
 | AndroidX Media3 Common | 1.9.2 | Apache-2.0 | Shared Media3 player APIs and data types |
 | AndroidX Media3 Container | 1.9.2 | Apache-2.0 | Media container parsing |
 | AndroidX Media3 Database | 1.9.2 | Apache-2.0 | Media3 database utilities |
@@ -86,6 +87,7 @@ second copy to the APK.
 | AndroidX Annotation / Annotation JVM | 1.8.1 | Apache-2.0 | Android API annotations |
 | AndroidX Annotation Experimental | 1.4.0 | Apache-2.0 | Experimental API annotations |
 | AndroidX Collection | 1.2.0 | Apache-2.0 | Collection utilities |
+| AndroidX Media | 1.7.0 | Apache-2.0 | Compatibility media-session APIs used by Media3 |
 | AndroidX Core | 1.13.1 | Apache-2.0 | Android platform compatibility utilities |
 | AndroidX Concurrent Futures | 1.1.0 | Apache-2.0 | Future interoperability |
 | AndroidX Interpolator | 1.0.0 | Apache-2.0 | Animation interpolation |
@@ -109,6 +111,11 @@ No Dart video-player package was added. The player does not bundle FFmpeg,
 libVLC, libmpv, codecs, or software decoders; supported formats depend on the
 Android version and device-provided media decoders. Versions above are from
 Gradle's resolved `releaseRuntimeClasspath` dependency graph.
+
+The audio player adds only the Media3 Session module; it reuses the existing
+ExoPlayer dependency. The published `media3-session:1.9.2` AAR is 905,317 bytes;
+the optimized APK increment is smaller and depends on shrinking and shared
+transitive dependencies.
 
 The full Apache License 2.0 text and Android Open Source Project attribution
 for Media3 are registered in Flutter's license registry and available from the
@@ -142,9 +149,11 @@ ownership rights for the app's own name, branding, or content.
 
 ## Release size
 
-The optimized universal APK built for this audit is 60,002,751 bytes
-(approximately 57.2 MiB). The APK contains one Android `classes.dex` of
-1,787,040 bytes (882,694 bytes compressed), which includes all Android-side
-application and plugin code, not only the player. Since there is no otherwise
-identical pre-player build for a binary comparison, the player-only delta is an
-estimate of about 1 MB; Media3 contributes no native libraries or codecs.
+The optimized universal APK built for this audit, including the built-in audio
+player, is 63,255,364 bytes (approximately 60.3 MiB). The APK contains one
+Android `classes.dex` of 2,613,736 bytes (1,297,642 bytes compressed), which
+includes all Android-side application and plugin code, not only the player.
+There is no otherwise identical pre-audio build for a reliable binary
+comparison. The audio feature adds the 905,317-byte Media3 Session AAR before
+APK shrinking and compression; Media3 contributes no native libraries or
+codecs.

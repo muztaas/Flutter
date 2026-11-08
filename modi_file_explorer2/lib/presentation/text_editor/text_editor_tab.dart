@@ -1,14 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/filesystem/file_change_notifier.dart';
 import '../../core/providers/text_file_providers.dart';
+import '../../core/providers/file_content_provider.dart';
+import '../../domain/entities/detected_file_content.dart';
+import '../common/detected_content_recovery.dart';
 
 enum TextEditorCloseDecision { save, discard, cancel }
 
 class TextEditorTab extends ConsumerStatefulWidget {
-  const TextEditorTab({super.key, required this.path});
+  const TextEditorTab({
+    super.key,
+    required this.path,
+    this.allowNonText = false,
+  });
 
   final String path;
+  final bool allowNonText;
 
   @override
   TextEditorTabState createState() => TextEditorTabState();
@@ -20,6 +29,7 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
   final FocusNode _focusNode = FocusNode();
   final ScrollController _textScrollController = ScrollController();
   Object? _loadError;
+  DetectedFileContent? _detectedContentMismatch;
   bool _loading = true;
   bool _saving = false;
   bool _dirty = false;
@@ -51,6 +61,42 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
       _loadError = null;
     });
     try {
+      final detectedContent = await ref.read(sniffFileContentProvider)(
+        widget.path,
+      );
+      if (!mounted) return;
+      _detectedContentMismatch =
+          detectedContent.isKnown && !detectedContent.isText
+          ? detectedContent
+          : null;
+      if (!widget.allowNonText && !detectedContent.isText) {
+        final openAnyway = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            content: const Text(
+              'This file does not look like text. Open anyway?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Open anyway'),
+              ),
+            ],
+          ),
+        );
+        if (!mounted) return;
+        if (openAnyway != true) {
+          setState(() {
+            _loadError = StateError('Opening was canceled');
+            _loading = false;
+          });
+          return;
+        }
+      }
       final contents = await ref
           .read(textFileRepositoryProvider)
           .readText(widget.path);
@@ -92,6 +138,16 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
   }
 
   Future<bool> saveFromClosePrompt() => _save(showFeedback: false);
+
+  Future<bool> handleWillPop({required VoidCallback onClose}) async {
+    if (_editing) {
+      _toggleEditing();
+      return true;
+    }
+
+    if (await confirmClose(context)) onClose();
+    return true;
+  }
 
   Future<bool> confirmClose(BuildContext context) async {
     if (!_dirty) return true;
@@ -150,6 +206,9 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
       await ref
           .read(textFileRepositoryProvider)
           .writeText(widget.path, contents);
+      FileChangeNotifier.instance.publish([
+        FileChange(kind: FileChangeKind.modified, path: widget.path),
+      ]);
       if (!mounted) return false;
       setState(() {
         _saving = false;
@@ -231,7 +290,16 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text('Could not open file: $_loadError'),
+                          Text(
+                            _detectedContentMismatch != null
+                                ? 'This file is ${_detectedContentMismatch!.description}, not text.'
+                                : 'Could not open file: $_loadError',
+                          ),
+                          DetectedContentRecoveryAction(
+                            path: widget.path,
+                            currentCategory: 'Text',
+                            detectedContent: _detectedContentMismatch,
+                          ),
                           const SizedBox(height: 12),
                           FilledButton(
                             onPressed: _loadFile,
@@ -255,6 +323,7 @@ class TextEditorTabState extends ConsumerState<TextEditorTab>
                       maxLines: null,
                       textAlignVertical: TextAlignVertical.top,
                       keyboardType: TextInputType.multiline,
+                      textCapitalization: TextCapitalization.sentences,
                       decoration: const InputDecoration(
                         border: OutlineInputBorder(),
                         alignLabelWithHint: true,

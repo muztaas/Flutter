@@ -49,4 +49,10 @@ class QuickAccessController
     await _repository.delete(path);
     await reload();
   }
+
+  Future<void> deleteAll(Iterable<String> paths) async {
+    await ready;
+    await _repository.deleteAll(paths);
+    await reload();
+  }
 }

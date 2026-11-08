@@ -11,8 +11,15 @@ import '../../presentation/apps/apps_tab.dart';
 import '../../presentation/storage/storage_tab.dart';
 import '../../presentation/text_editor/text_editor_tab.dart';
 import '../../presentation/image_viewer/image_viewer_tab.dart';
+import '../../presentation/pdf_viewer/pdf_viewer_tab.dart';
+import '../../presentation/spreadsheet_viewer/csv_viewer_tab.dart';
+import '../../presentation/spreadsheet_viewer/xlsx_viewer_tab.dart';
+import '../../presentation/document_viewer/docx_viewer_tab.dart';
+import '../../presentation/presentation_viewer/pptx_viewer_tab.dart';
 import '../../presentation/archive/archive_manager_page.dart';
 import '../../presentation/video/video_tab.dart';
+import '../../presentation/audio_player/audio_player_tab.dart';
+import '../../domain/repositories/audio_player_repository.dart';
 
 int _tabInstanceSequence = 0;
 
@@ -34,9 +41,15 @@ class TabEntry {
   final Future<bool> Function()? onWillPop;
   final bool Function()? hasUnsavedChanges;
   final Future<bool> Function(BuildContext context)? onCloseRequest;
+  final Future<void> Function()? onTabClosing;
   final Future<bool> Function()? saveChanges;
   TabEntry? returnToTab;
   final bool isImageViewer;
+  final bool isPdfViewer;
+  final bool isCsvViewer;
+  final bool isXlsxViewer;
+  final bool isDocxViewer;
+  final bool isPptxViewer;
   final bool isArchiveManager;
   String? archivePath;
   String archiveFolder;
@@ -50,8 +63,25 @@ class TabEntry {
   bool archiveOnly;
   bool isDeferred;
   bool isFullscreen = false;
+  bool isPdfSystemFullscreen = false;
   bool isImageZoomed = false;
+  bool isPdfZoomed = false;
+  bool isCsvZoomed = false;
+  bool isPptxZoomed = false;
+  String? pdfPath;
+  String? csvPath;
+  String? xlsxPath;
+  String? docxPath;
+  String? pptxPath;
+  String? pdfVolumeId;
+  String? pdfRelativePath;
+  bool pdfProgressEnabled = true;
+  final VoidCallback? onPdfProgressDeleted;
   final bool isVideoPage;
+  final bool isAudioPlayer;
+  String? audioPath;
+  Set<String> audioExtensions;
+  List<String>? audioQueuePaths;
   String? videoDriveId;
   String videoRelativePath;
   TabEntry({
@@ -73,13 +103,32 @@ class TabEntry {
     this.onWillPop,
     this.hasUnsavedChanges,
     this.onCloseRequest,
+    this.onTabClosing,
+    this.onPdfProgressDeleted,
+    this.pdfPath,
+    this.csvPath,
+    this.xlsxPath,
+    this.docxPath,
+    this.pptxPath,
+    this.pdfVolumeId,
+    this.pdfRelativePath,
+    this.pdfProgressEnabled = true,
     this.saveChanges,
     this.returnToTab,
     this.isImageViewer = false,
+    this.isPdfViewer = false,
+    this.isCsvViewer = false,
+    this.isXlsxViewer = false,
+    this.isDocxViewer = false,
+    this.isPptxViewer = false,
     this.isArchiveManager = false,
     this.archivePath,
     this.archiveFolder = '',
     this.isVideoPage = false,
+    this.isAudioPlayer = false,
+    this.audioPath,
+    this.audioExtensions = const {},
+    this.audioQueuePaths,
     this.videoDriveId,
     this.videoRelativePath = '',
     this.initialImagePath,
@@ -162,11 +211,14 @@ class TabsManager extends ChangeNotifier {
         pageId == 'archives' ||
         pageId == 'downloads' ||
         pageId == 'internal') {
-      final internal = devices.where((device) => device.id == 'internal').firstOrNull;
+      final internal = devices
+          .where((device) => device.id == 'internal')
+          .firstOrNull;
       if (internal == null) return;
       if (pageId == 'downloads') {
         final downloadsPath = await _downloadsPath(internal.path);
-        if (downloadsPath != null) openStorageTab(downloadsPath, title: 'Downloads');
+        if (downloadsPath != null)
+          openStorageTab(downloadsPath, title: 'Downloads');
       } else if (pageId == 'images') {
         openStorageTab(internal.path, title: 'Images', imageOnly: true);
       } else if (pageId == 'documents') {
@@ -189,14 +241,12 @@ class TabsManager extends ChangeNotifier {
 
   Future<String?> _downloadsPath(String rootPath) async {
     try {
-      await for (final entry in Directory(rootPath).list(
-        followLinks: false,
-      )) {
+      await for (final entry in Directory(rootPath).list(followLinks: false)) {
         if (entry is Directory &&
             entry.uri.pathSegments
-                .where((segment) => segment.isNotEmpty)
-                .last
-                .toLowerCase() ==
+                    .where((segment) => segment.isNotEmpty)
+                    .last
+                    .toLowerCase() ==
                 'download') {
           return entry.path;
         }
@@ -270,6 +320,7 @@ class TabsManager extends ChangeNotifier {
           );
           continue;
         }
+        if (type == 'audioPlayer') continue;
         final titleValue = item['title'];
         final title = titleValue is String ? titleValue : null;
         if (titleValue != null && title == null) {
@@ -325,6 +376,11 @@ class TabsManager extends ChangeNotifier {
           }
         } else if (type == 'textEditor' ||
             type == 'imageViewer' ||
+            type == 'pdfViewer' ||
+            type == 'csvViewer' ||
+            type == 'xlsxViewer' ||
+            type == 'docxViewer' ||
+            type == 'pptxViewer' ||
             type == 'archiveManager') {
           if (type == 'imageViewer' && imageViewerCount >= maxImageViewerTabs) {
             failures.add(
@@ -359,6 +415,51 @@ class TabsManager extends ChangeNotifier {
             imageViewerCount++;
             tab = _createImageViewerEntry(
               filePath,
+              sessionId: tabId,
+              isDeferred: true,
+            );
+            pendingOrigins[tab] = item['originTabId'] as String?;
+            pendingLegacyOrigins[tab] = item['originTabIndex'] as int?;
+          } else if (type == 'pdfViewer') {
+            tab = _createPdfViewerEntry(
+              filePath,
+              title: _validSavedTitle(title),
+              sessionId: tabId,
+              isDeferred: true,
+            );
+            pendingOrigins[tab] = item['originTabId'] as String?;
+            pendingLegacyOrigins[tab] = item['originTabIndex'] as int?;
+          } else if (type == 'csvViewer') {
+            tab = _createCsvViewerEntry(
+              filePath,
+              title: _validSavedTitle(title),
+              sessionId: tabId,
+              isDeferred: true,
+            );
+            pendingOrigins[tab] = item['originTabId'] as String?;
+            pendingLegacyOrigins[tab] = item['originTabIndex'] as int?;
+          } else if (type == 'xlsxViewer') {
+            tab = _createXlsxViewerEntry(
+              filePath,
+              title: _validSavedTitle(title),
+              sessionId: tabId,
+              isDeferred: true,
+            );
+            pendingOrigins[tab] = item['originTabId'] as String?;
+            pendingLegacyOrigins[tab] = item['originTabIndex'] as int?;
+          } else if (type == 'docxViewer') {
+            tab = _createDocxViewerEntry(
+              filePath,
+              title: _validSavedTitle(title),
+              sessionId: tabId,
+              isDeferred: true,
+            );
+            pendingOrigins[tab] = item['originTabId'] as String?;
+            pendingLegacyOrigins[tab] = item['originTabIndex'] as int?;
+          } else if (type == 'pptxViewer') {
+            tab = _createPptxViewerEntry(
+              filePath,
+              title: _validSavedTitle(title),
               sessionId: tabId,
               isDeferred: true,
             );
@@ -488,9 +589,15 @@ class TabsManager extends ChangeNotifier {
       'archiveStorage',
       'textEditor',
       'imageViewer',
+      'pdfViewer',
+      'csvViewer',
+      'xlsxViewer',
+      'docxViewer',
+      'pptxViewer',
       'archiveManager',
       'apps',
       'video',
+      'audioPlayer',
     };
     if (type is! String || !supportedTypes.contains(type)) {
       return 'unsupported tab type';
@@ -515,6 +622,11 @@ class TabsManager extends ChangeNotifier {
       }
     } else if (type == 'textEditor' ||
         type == 'imageViewer' ||
+        type == 'pdfViewer' ||
+        type == 'csvViewer' ||
+        type == 'xlsxViewer' ||
+        type == 'docxViewer' ||
+        type == 'pptxViewer' ||
         type == 'archiveManager') {
       final driveId = item['driveId'];
       final path = item['path'];
@@ -563,8 +675,9 @@ class TabsManager extends ChangeNotifier {
     final pathValue = item['path'];
     if (pathValue is! String) return 'Tab';
     final path = pathValue;
-    final isNumericRoot =
-        RegExp(r'^\d+$').hasMatch(_lastPathSegment(path, fallback: ''));
+    final isNumericRoot = RegExp(
+      r'^\d+$',
+    ).hasMatch(_lastPathSegment(path, fallback: ''));
     return storageDisplayName(
       path: path,
       isDriveRoot: isNumericRoot,
@@ -705,7 +818,8 @@ class TabsManager extends ChangeNotifier {
         (driveId == null ? null : _deviceById(driveId, _availableDevices)) ??
         _deviceForAbsolutePath(path, _availableDevices);
     final isDriveRoot =
-        (driveRoot != null && _normalizePath(path) == _normalizePath(driveRoot)) ||
+        (driveRoot != null &&
+            _normalizePath(path) == _normalizePath(driveRoot)) ||
         (titleDrive != null &&
             _normalizePath(path) == _normalizePath(titleDrive.path)) ||
         (titleDrive == null &&
@@ -725,11 +839,11 @@ class TabsManager extends ChangeNotifier {
         ? savedTitle ?? categoryTitle
         : savedTitle ??
               storageDisplayName(
-            path: path,
-            drive: titleDrive,
-            isDriveRoot: isDriveRoot,
-            fallback: title,
-          );
+                path: path,
+                drive: titleDrive,
+                isDriveRoot: isDriveRoot,
+                fallback: title,
+              );
     late final TabEntry entry;
     entry = TabEntry(
       id: imageOnly
@@ -784,6 +898,7 @@ class TabsManager extends ChangeNotifier {
     String path, {
     required String sessionId,
     required bool isDeferred,
+    bool allowNonText = false,
   }) {
     final key = GlobalKey<TextEditorTabState>();
     late final TabEntry entry;
@@ -794,7 +909,15 @@ class TabsManager extends ChangeNotifier {
       isDeferred: isDeferred,
       pageBuilder: () => entry.isDeferred
           ? const _DeferredRestoredTab()
-          : TextEditorTab(key: key, path: path),
+          : TextEditorTab(key: key, path: path, allowNonText: allowNonText),
+      onWillPop: () async {
+        final state = key.currentState;
+        if (state == null) {
+          closeTab(entry);
+          return true;
+        }
+        return state.handleWillPop(onClose: () => closeTab(entry));
+      },
       hasUnsavedChanges: () => key.currentState?.hasUnsavedChanges ?? false,
       onCloseRequest: (context) =>
           key.currentState?.confirmClose(context) ?? Future.value(true),
@@ -848,6 +971,130 @@ class TabsManager extends ChangeNotifier {
       },
     );
     return entry;
+  }
+
+  TabEntry _createPdfViewerEntry(
+    String path, {
+    required String sessionId,
+    required bool isDeferred,
+    String? title,
+    TabEntry? originTab,
+  }) {
+    final readingLocation = pdfReadingLocationForPath(path);
+    final key = GlobalKey<PdfViewerTabState>();
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'pdfViewer:$path',
+      title: title ?? _lastPathSegment(path, fallback: 'PDF'),
+      sessionId: sessionId,
+      isPdfViewer: true,
+      isDeferred: isDeferred,
+      returnToTab: originTab,
+      pdfPath: path,
+      pdfVolumeId: readingLocation.volumeId,
+      pdfRelativePath: readingLocation.relativePath,
+      pageBuilder: () => entry.isDeferred
+          ? const _DeferredRestoredTab()
+          : PdfViewerTab(
+              key: key,
+              path: entry.pdfPath!,
+              volumeId: entry.pdfVolumeId!,
+              relativePath: entry.pdfRelativePath!,
+              persistReadingProgress: entry.pdfProgressEnabled,
+              isChromeHidden: entry.isFullscreen,
+              isSystemFullscreen: entry.isPdfSystemFullscreen,
+              onChromeHiddenChanged: (hidden) =>
+                  setPdfViewerChromeHidden(entry, hidden),
+              onSystemFullscreenChanged: (fullscreen) =>
+                  setPdfViewerSystemFullscreen(entry, fullscreen),
+              onZoomChanged: (zoomed) => setPdfViewerZoomed(entry, zoomed),
+            ),
+      onWillPop: () async {
+        if (entry.isFullscreen || entry.isPdfSystemFullscreen) {
+          setPdfViewerSystemFullscreen(entry, false);
+          return true;
+        }
+        final index = _tabs.indexOf(entry);
+        if (index <= 0) return false;
+        closeTabAt(index);
+        return true;
+      },
+      onTabClosing: () =>
+          key.currentState?.saveProgressNow() ?? Future<void>.value(),
+      onPdfProgressDeleted: () => key.currentState?.stopProgressTracking(),
+    );
+    return entry;
+  }
+
+  ({String volumeId, String relativePath}) pdfReadingLocationForPath(
+    String path,
+  ) {
+    final device = _deviceForAbsolutePath(path, _availableDevices);
+    if (device == null) {
+      return (volumeId: 'path:${_normalizePath(path)}', relativePath: '');
+    }
+    final normalizedPath = _normalizePath(path);
+    final normalizedRoot = _normalizePath(device.path);
+    final relativePath = normalizedPath == normalizedRoot
+        ? ''
+        : normalizedPath.substring(normalizedRoot.length + 1);
+    return (volumeId: device.id, relativePath: relativePath);
+  }
+
+  bool _isPathWithin(String candidate, String root) {
+    final normalizedCandidate = _normalizePath(candidate);
+    final normalizedRoot = _normalizePath(root);
+    return normalizedCandidate == normalizedRoot ||
+        normalizedCandidate.startsWith('$normalizedRoot/');
+  }
+
+  Future<void> savePdfTabsBeforeMove(String oldPath) async {
+    final affected = _tabs.where(
+      (tab) =>
+          tab.isPdfViewer &&
+          tab.pdfPath != null &&
+          _isPathWithin(tab.pdfPath!, oldPath),
+    );
+    for (final tab in affected) {
+      await tab.onTabClosing?.call();
+    }
+  }
+
+  void relocatePdfTabs(String oldPath, String newPath) {
+    var changed = false;
+    for (final tab in _tabs.where((item) => item.isPdfViewer)) {
+      final path = tab.pdfPath;
+      if (path == null || !_isPathWithin(path, oldPath)) continue;
+      final normalizedOldPath = _normalizePath(oldPath);
+      final normalizedPath = _normalizePath(path);
+      final suffix = normalizedPath == normalizedOldPath
+          ? ''
+          : normalizedPath.substring(normalizedOldPath.length);
+      final relocatedPath = '${_normalizePath(newPath)}$suffix';
+      final location = pdfReadingLocationForPath(relocatedPath);
+      tab
+        ..pdfPath = relocatedPath
+        ..pdfVolumeId = location.volumeId
+        ..pdfRelativePath = location.relativePath
+        ..title = _lastPathSegment(relocatedPath, fallback: 'PDF');
+      changed = true;
+    }
+    if (changed) {
+      notifyListeners();
+      _schedulePersistTabs();
+    }
+  }
+
+  void markPdfTabsDeleted(String path) {
+    var changed = false;
+    for (final tab in _tabs.where((item) => item.isPdfViewer)) {
+      if (tab.pdfPath == null || !_isPathWithin(tab.pdfPath!, path)) continue;
+      tab
+        ..pdfProgressEnabled = false
+        ..onPdfProgressDeleted?.call();
+      changed = true;
+    }
+    if (changed) notifyListeners();
   }
 
   TabEntry _createVideoEntry({
@@ -913,9 +1160,10 @@ class TabsManager extends ChangeNotifier {
   void handOffImageViewerSwipe(TabEntry entry, int direction) {
     final selectedIndex = _selected;
     if (!_tabs.contains(entry) ||
-        !entry.isImageViewer ||
+        (!entry.isImageViewer && !entry.isPptxViewer) ||
         !identical(_tabs[selectedIndex], entry) ||
-        entry.isImageZoomed) {
+        entry.isImageZoomed ||
+        entry.isPptxZoomed) {
       return;
     }
     final targetIndex = selectedIndex + direction;
@@ -1019,10 +1267,14 @@ class TabsManager extends ChangeNotifier {
     _persistDebounce?.cancel();
     _persistDebounce = null;
     if (!_sessionReady || _restoring) return Future<void>.value();
+    final selectedTab = _tabs[_selected];
+    final persistedSelectedTab = selectedTab.isAudioPlayer
+        ? selectedTab.returnToTab ?? _tabs.first
+        : selectedTab;
     final snapshot = <String, Object?>{
       'version': 2,
-      'selectedTabId': _tabs[_selected].sessionId,
-      'items': _tabs.skip(1).map((tab) {
+      'selectedTabId': persistedSelectedTab.sessionId,
+      'items': _tabs.skip(1).where((tab) => !tab.isAudioPlayer).map((tab) {
         final common = <String, Object?>{
           'tabId': tab.sessionId,
           'title': tab.title,
@@ -1043,6 +1295,46 @@ class TabsManager extends ChangeNotifier {
             ..._fileLocationRecord(
               tab.currentImagePath ?? tab.id.substring('imageViewer:'.length),
             ),
+            'originTabId': tab.returnToTab?.sessionId,
+          };
+        }
+        if (tab.isPdfViewer) {
+          return {
+            'type': 'pdfViewer',
+            ...common,
+            ..._fileLocationRecord(tab.pdfPath!),
+            'originTabId': tab.returnToTab?.sessionId,
+          };
+        }
+        if (tab.isCsvViewer) {
+          return {
+            'type': 'csvViewer',
+            ...common,
+            ..._fileLocationRecord(tab.csvPath!),
+            'originTabId': tab.returnToTab?.sessionId,
+          };
+        }
+        if (tab.isXlsxViewer) {
+          return {
+            'type': 'xlsxViewer',
+            ...common,
+            ..._fileLocationRecord(tab.xlsxPath!),
+            'originTabId': tab.returnToTab?.sessionId,
+          };
+        }
+        if (tab.isDocxViewer) {
+          return {
+            'type': 'docxViewer',
+            ...common,
+            ..._fileLocationRecord(tab.docxPath!),
+            'originTabId': tab.returnToTab?.sessionId,
+          };
+        }
+        if (tab.isPptxViewer) {
+          return {
+            'type': 'pptxViewer',
+            ...common,
+            ..._fileLocationRecord(tab.pptxPath!),
             'originTabId': tab.returnToTab?.sessionId,
           };
         }
@@ -1211,7 +1503,98 @@ class TabsManager extends ChangeNotifier {
     _schedulePageJump(target);
   }
 
-  void openTextEditor(String path, {bool allowDuplicate = false}) {
+  TabEntry? get audioPlayerTab =>
+      _tabs.where((tab) => tab.isAudioPlayer).firstOrNull;
+
+  TabEntry? openAudioPlayerTab(
+    String path, {
+    required Set<String> extensions,
+    List<String>? queuePaths,
+    required AudioPlayerRepository repository,
+  }) {
+    final existing = audioPlayerTab;
+    if (existing != null) {
+      existing
+        ..audioPath = path
+        ..audioExtensions = Set.unmodifiable(extensions)
+        ..audioQueuePaths = queuePaths == null
+            ? null
+            : List.unmodifiable(queuePaths)
+        ..title = _lastPathSegment(path, fallback: 'Audio');
+      goTo(_tabs.indexOf(existing));
+      notifyListeners();
+      return existing;
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return null;
+    }
+    final originTab = _tabs[_selected];
+    final entry = _createAudioPlayerEntry(
+      path,
+      extensions: extensions,
+      queuePaths: queuePaths,
+      repository: repository,
+      originTab: originTab,
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry _createAudioPlayerEntry(
+    String path, {
+    required Set<String> extensions,
+    List<String>? queuePaths,
+    required AudioPlayerRepository repository,
+    required TabEntry originTab,
+  }) {
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'audioPlayer',
+      title: _lastPathSegment(path, fallback: 'Audio'),
+      isAudioPlayer: true,
+      audioPath: path,
+      audioExtensions: Set.unmodifiable(extensions),
+      audioQueuePaths: queuePaths == null
+          ? null
+          : List.unmodifiable(queuePaths),
+      returnToTab: originTab,
+      onTabClosing: repository.stop,
+      onWillPop: () async {
+        final index = _tabs.indexOf(entry);
+        if (index <= 0) return false;
+        closeTabAt(index);
+        return true;
+      },
+      pageBuilder: () => AudioPlayerTab(
+        path: entry.audioPath!,
+        extensions: entry.audioExtensions,
+        queuePaths: entry.audioQueuePaths,
+        onTitleChanged: (title) => updateAudioPlayerTitle(entry, title),
+        onBack: () => closeTab(entry),
+      ),
+    );
+    return entry;
+  }
+
+  void updateAudioPlayerTitle(TabEntry entry, String title) {
+    if (!_tabs.contains(entry) || !entry.isAudioPlayer || title.isEmpty) return;
+    if (entry.title == title) return;
+    entry.title = title;
+    notifyListeners();
+  }
+
+  void openTextEditor(
+    String path, {
+    bool allowDuplicate = false,
+    bool allowNonText = false,
+  }) {
     final id = 'textEditor:$path';
     if (!allowDuplicate) {
       final existing = _tabs.indexWhere((tab) => tab.id == id);
@@ -1227,6 +1610,7 @@ class TabsManager extends ChangeNotifier {
         path,
         sessionId: _newTabInstanceId(),
         isDeferred: false,
+        allowNonText: allowNonText,
       ),
     );
     final target = _tabs.length - 1;
@@ -1249,7 +1633,6 @@ class TabsManager extends ChangeNotifier {
         goTo(existing);
         return _tabs[existing];
       }
-
     }
     if (_tabs.where((tab) => tab.isImageViewer).length >= maxImageViewerTabs) {
       _pendingNotice = 'You can open up to $maxImageViewerTabs image viewers.';
@@ -1273,6 +1656,332 @@ class TabsManager extends ChangeNotifier {
     notifyListeners();
     _schedulePersistTabs();
     _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry? openPdfViewerTab(String path, {bool allowDuplicate = false}) {
+    final id = 'pdfViewer:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere(
+        (tab) => tab.id == id || (tab.isPdfViewer && tab.pdfPath == path),
+      );
+      if (existing >= 0) {
+        goTo(existing);
+        return _tabs[existing];
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return null;
+    }
+    final originTab = _tabs[_selected];
+    final entry = _createPdfViewerEntry(
+      path,
+      sessionId: _newTabInstanceId(),
+      isDeferred: false,
+      originTab: originTab,
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePersistTabs();
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry? openCsvViewerTab(String path, {bool allowDuplicate = false}) {
+    final id = 'csvViewer:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere(
+        (tab) => tab.id == id || (tab.isCsvViewer && tab.csvPath == path),
+      );
+      if (existing >= 0) {
+        goTo(existing);
+        return _tabs[existing];
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return null;
+    }
+    final originTab = _tabs[_selected];
+    final entry = _createCsvViewerEntry(
+      path,
+      sessionId: _newTabInstanceId(),
+      isDeferred: false,
+      originTab: originTab,
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePersistTabs();
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry? openXlsxViewerTab(String path, {bool allowDuplicate = false}) {
+    final id = 'xlsxViewer:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere(
+        (tab) => tab.id == id || (tab.isXlsxViewer && tab.xlsxPath == path),
+      );
+      if (existing >= 0) {
+        goTo(existing);
+        return _tabs[existing];
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return null;
+    }
+    final originTab = _tabs[_selected];
+    final entry = _createXlsxViewerEntry(
+      path,
+      sessionId: _newTabInstanceId(),
+      isDeferred: false,
+      originTab: originTab,
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePersistTabs();
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry? openDocxViewerTab(String path, {bool allowDuplicate = false}) {
+    final id = 'docxViewer:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere(
+        (tab) => tab.id == id || (tab.isDocxViewer && tab.docxPath == path),
+      );
+      if (existing >= 0) {
+        goTo(existing);
+        return _tabs[existing];
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return null;
+    }
+    final originTab = _tabs[_selected];
+    final entry = _createDocxViewerEntry(
+      path,
+      sessionId: _newTabInstanceId(),
+      isDeferred: false,
+      originTab: originTab,
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePersistTabs();
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry? openPptxViewerTab(String path, {bool allowDuplicate = false}) {
+    final id = 'pptxViewer:$path';
+    if (!allowDuplicate) {
+      final existing = _tabs.indexWhere(
+        (tab) => tab.id == id || (tab.isPptxViewer && tab.pptxPath == path),
+      );
+      if (existing >= 0) {
+        goTo(existing);
+        return _tabs[existing];
+      }
+    }
+    if (_tabs.length >= maxOpenTabs) {
+      _pendingNotice = 'You can open up to $maxOpenTabs tabs.';
+      notifyListeners();
+      return null;
+    }
+    final originTab = _tabs[_selected];
+    final entry = _createPptxViewerEntry(
+      path,
+      sessionId: _newTabInstanceId(),
+      isDeferred: false,
+      originTab: originTab,
+    );
+    _tabs.add(entry);
+    final target = _tabs.length - 1;
+    _leaveFullscreenViewer();
+    _selected = target;
+    notifyListeners();
+    _schedulePersistTabs();
+    _schedulePageJump(target);
+    return entry;
+  }
+
+  TabEntry _createCsvViewerEntry(
+    String path, {
+    required String sessionId,
+    required bool isDeferred,
+    String? title,
+    TabEntry? originTab,
+  }) {
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'csvViewer:$path',
+      title: title ?? _lastPathSegment(path, fallback: 'Spreadsheet'),
+      sessionId: sessionId,
+      isCsvViewer: true,
+      isDeferred: isDeferred,
+      returnToTab: originTab,
+      csvPath: path,
+      pageBuilder: () => entry.isDeferred
+          ? const _DeferredRestoredTab()
+          : CsvViewerTab(
+              path: entry.csvPath!,
+              isChromeHidden: entry.isFullscreen,
+              onChromeHiddenChanged: (hidden) =>
+                  setOfficeViewerChromeHidden(entry, hidden),
+              onZoomChanged: (zoomed) => setCsvViewerZoomed(entry, zoomed),
+            ),
+      onWillPop: () async {
+        if (entry.isFullscreen) {
+          setOfficeViewerChromeHidden(entry, false);
+          return true;
+        }
+        final index = _tabs.indexOf(entry);
+        if (index <= 0) return false;
+        closeTabAt(index);
+        return true;
+      },
+    );
+    return entry;
+  }
+
+  TabEntry _createXlsxViewerEntry(
+    String path, {
+    required String sessionId,
+    required bool isDeferred,
+    String? title,
+    TabEntry? originTab,
+  }) {
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'xlsxViewer:$path',
+      title: title ?? _lastPathSegment(path, fallback: 'Spreadsheet'),
+      sessionId: sessionId,
+      isXlsxViewer: true,
+      isDeferred: isDeferred,
+      returnToTab: originTab,
+      xlsxPath: path,
+      pageBuilder: () => entry.isDeferred
+          ? const _DeferredRestoredTab()
+          : XlsxViewerTab(
+              path: entry.xlsxPath!,
+              isChromeHidden: entry.isFullscreen,
+              onChromeHiddenChanged: (hidden) =>
+                  setOfficeViewerChromeHidden(entry, hidden),
+              onZoomChanged: (zoomed) => setCsvViewerZoomed(entry, zoomed),
+            ),
+      onWillPop: () async {
+        if (entry.isFullscreen) {
+          setOfficeViewerChromeHidden(entry, false);
+          return true;
+        }
+        final index = _tabs.indexOf(entry);
+        if (index <= 0) return false;
+        closeTabAt(index);
+        return true;
+      },
+    );
+    return entry;
+  }
+
+  TabEntry _createDocxViewerEntry(
+    String path, {
+    required String sessionId,
+    required bool isDeferred,
+    String? title,
+    TabEntry? originTab,
+  }) {
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'docxViewer:$path',
+      title: title ?? _lastPathSegment(path, fallback: 'Document'),
+      sessionId: sessionId,
+      isDocxViewer: true,
+      isDeferred: isDeferred,
+      returnToTab: originTab,
+      docxPath: path,
+      pageBuilder: () => entry.isDeferred
+          ? const _DeferredRestoredTab()
+          : DocxViewerTab(
+              path: entry.docxPath!,
+              isChromeHidden: entry.isFullscreen,
+              onChromeHiddenChanged: (hidden) =>
+                  setOfficeViewerChromeHidden(entry, hidden),
+              onZoomChanged: (zoomed) => setCsvViewerZoomed(entry, zoomed),
+            ),
+      onWillPop: () async {
+        if (entry.isFullscreen) {
+          setOfficeViewerChromeHidden(entry, false);
+          return true;
+        }
+        final index = _tabs.indexOf(entry);
+        if (index <= 0) return false;
+        closeTabAt(index);
+        return true;
+      },
+    );
+    return entry;
+  }
+
+  TabEntry _createPptxViewerEntry(
+    String path, {
+    required String sessionId,
+    required bool isDeferred,
+    String? title,
+    TabEntry? originTab,
+  }) {
+    final readingLocation = pdfReadingLocationForPath(path);
+    late final TabEntry entry;
+    entry = TabEntry(
+      id: 'pptxViewer:$path',
+      title: title ?? _lastPathSegment(path, fallback: 'Presentation'),
+      sessionId: sessionId,
+      isPptxViewer: true,
+      isDeferred: isDeferred,
+      returnToTab: originTab,
+      pptxPath: path,
+      pageBuilder: () => entry.isDeferred
+          ? const _DeferredRestoredTab()
+          : PptxViewerTab(
+              path: entry.pptxPath!,
+              volumeId: readingLocation.volumeId,
+              relativePath: readingLocation.relativePath,
+              isChromeHidden: entry.isFullscreen,
+              onChromeHiddenChanged: (hidden) =>
+                  setOfficeViewerChromeHidden(entry, hidden),
+              onZoomChanged: (zoomed) => setPptxViewerZoomed(entry, zoomed),
+              onBoundaryHandoff: (direction) =>
+                  handOffImageViewerSwipe(entry, direction),
+            ),
+      onWillPop: () async {
+        if (entry.isFullscreen) {
+          setOfficeViewerChromeHidden(entry, false);
+          return true;
+        }
+        final index = _tabs.indexOf(entry);
+        if (index <= 0) return false;
+        closeTabAt(index);
+        return true;
+      },
+    );
     return entry;
   }
 
@@ -1381,6 +2090,72 @@ class TabsManager extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setPdfViewerChromeHidden(TabEntry entry, bool hidden) {
+    if (!_tabs.contains(entry) ||
+        !entry.isPdfViewer ||
+        entry.isFullscreen == hidden) {
+      return;
+    }
+    entry.isFullscreen = hidden;
+    notifyListeners();
+  }
+
+  void setOfficeViewerChromeHidden(TabEntry entry, bool hidden) {
+    if (!_tabs.contains(entry) ||
+        (!entry.isCsvViewer &&
+            !entry.isXlsxViewer &&
+            !entry.isDocxViewer &&
+            !entry.isPptxViewer) ||
+        entry.isFullscreen == hidden) {
+      return;
+    }
+    entry.isFullscreen = hidden;
+    notifyListeners();
+  }
+
+  void setCsvViewerZoomed(TabEntry entry, bool zoomed) {
+    if (!_tabs.contains(entry) ||
+        (!entry.isCsvViewer && !entry.isXlsxViewer && !entry.isDocxViewer) ||
+        entry.isCsvZoomed == zoomed) {
+      return;
+    }
+    entry.isCsvZoomed = zoomed;
+    notifyListeners();
+  }
+
+  void setPptxViewerZoomed(TabEntry entry, bool zoomed) {
+    if (!_tabs.contains(entry) ||
+        !entry.isPptxViewer ||
+        entry.isPptxZoomed == zoomed) {
+      return;
+    }
+    entry.isPptxZoomed = zoomed;
+    notifyListeners();
+  }
+
+  void setPdfViewerSystemFullscreen(TabEntry entry, bool fullscreen) {
+    if (!_tabs.contains(entry) ||
+        !entry.isPdfViewer ||
+        (entry.isPdfSystemFullscreen == fullscreen &&
+            entry.isFullscreen == fullscreen)) {
+      return;
+    }
+    entry
+      ..isPdfSystemFullscreen = fullscreen
+      ..isFullscreen = fullscreen;
+    notifyListeners();
+  }
+
+  void setPdfViewerZoomed(TabEntry entry, bool zoomed) {
+    if (!_tabs.contains(entry) ||
+        !entry.isPdfViewer ||
+        entry.isPdfZoomed == zoomed) {
+      return;
+    }
+    entry.isPdfZoomed = zoomed;
+    notifyListeners();
+  }
+
   void setImageViewerZoomed(TabEntry entry, bool isZoomed) {
     if (!_tabs.contains(entry) ||
         !entry.isImageViewer ||
@@ -1395,6 +2170,17 @@ class TabsManager extends ChangeNotifier {
     if (_selected < 0 || _selected >= _tabs.length) return;
     final selectedTab = _tabs[_selected];
     if (selectedTab.isImageViewer && selectedTab.isFullscreen) {
+      selectedTab.isFullscreen = false;
+    } else if (selectedTab.isPdfViewer &&
+        (selectedTab.isFullscreen || selectedTab.isPdfSystemFullscreen)) {
+      selectedTab
+        ..isFullscreen = false
+        ..isPdfSystemFullscreen = false;
+    } else if ((selectedTab.isCsvViewer ||
+            selectedTab.isXlsxViewer ||
+            selectedTab.isDocxViewer ||
+            selectedTab.isPptxViewer) &&
+        selectedTab.isFullscreen) {
       selectedTab.isFullscreen = false;
     }
   }
@@ -1425,7 +2211,23 @@ class TabsManager extends ChangeNotifier {
     if (idx <= 0 || idx >= _tabs.length) return; // never close home
     final closingSelectedTab = idx == _selected;
     final closingTab = _tabs[idx];
-    final returnToTab = closingTab.isImageViewer || closingTab.isArchiveManager
+    final onTabClosing = closingTab.onTabClosing;
+    if (onTabClosing != null) {
+      unawaited(
+        onTabClosing().catchError((Object error, StackTrace stackTrace) {
+          debugPrint('[TabsManager] Could not stop audio playback: $error');
+        }),
+      );
+    }
+    final returnToTab =
+        closingTab.isImageViewer ||
+            closingTab.isPdfViewer ||
+            closingTab.isCsvViewer ||
+            closingTab.isXlsxViewer ||
+            closingTab.isDocxViewer ||
+            closingTab.isPptxViewer ||
+            closingTab.isArchiveManager ||
+            closingTab.isAudioPlayer
         ? closingTab.returnToTab
         : null;
     _tabs.removeAt(idx);

@@ -23,6 +23,7 @@ void main() {
     yield LicenseEntryWithLineBreaks(
       const [
         'AndroidX Media3 ExoPlayer 1.9.2',
+        'AndroidX Media3 Session 1.9.2',
         'AndroidX Media3 Common 1.9.2',
         'AndroidX Media3 Container 1.9.2',
         'AndroidX Media3 Database 1.9.2',
@@ -33,6 +34,7 @@ void main() {
         'AndroidX Annotation JVM 1.8.1',
         'AndroidX Annotation Experimental 1.4.0',
         'AndroidX Collection 1.2.0',
+        'AndroidX Media 1.7.0',
         'AndroidX Core 1.13.1',
         'AndroidX Concurrent Futures 1.1.0',
         'AndroidX Interpolator 1.0.0',
@@ -179,9 +181,7 @@ class MyApp extends ConsumerWidget {
                           child: BackdropFilter(
                             filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
                             child: ColoredBox(
-                              color: colorScheme.surface.withValues(
-                                alpha: 0.3,
-                              ),
+                              color: colorScheme.surface.withValues(alpha: 0.3),
                             ),
                           ),
                         ),

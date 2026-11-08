@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,8 +10,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../../core/constants/selection_long_press_delay.dart';
+import '../../core/filesystem/file_change_notifier.dart';
+import '../../core/filesystem/refresh_coordinator.dart';
 import '../../core/providers/search_provider.dart';
 import '../../core/providers/settings_provider.dart';
+import '../../core/providers/storage_providers.dart';
 import '../../core/providers/video_providers.dart';
 import '../../core/utils/file_name_comparator.dart';
 import '../../core/utils/font_scaled_spacing.dart';
@@ -22,14 +27,17 @@ import '../../domain/entities/search_scope.dart';
 import '../../domain/entities/video_file.dart';
 import '../../domain/entities/video_folder.dart';
 import '../../domain/entities/video_index_record.dart';
+import '../../domain/entities/video_library_scan.dart';
 import '../../domain/entities/video_information.dart';
 import '../../domain/entities/video_path_properties.dart';
 import '../../domain/entities/video_status_target.dart';
 import '../../domain/entities/video_player_item.dart';
+import '../../domain/utils/file_visibility.dart';
 import '../../domain/utils/shared_storage_scan_scope.dart';
 import '../common/marquee_text.dart';
 import '../common/name_entry_dialog.dart';
 import '../common/open_video_file.dart';
+import '../common/content_sized_menu.dart';
 import 'video_settings_page.dart';
 import 'widgets/video_sort_picker.dart';
 
@@ -69,17 +77,34 @@ class VideoTabState extends ConsumerState<VideoTab>
   final ScrollController _itemsScrollController = ScrollController();
   final Set<String> _selectedPaths = {};
   List<VideoStatusTarget> _pendingCopyTargets = [];
+  late final StreamSubscription<FileChangeEvent> _fileChangeSubscription;
+  final List<FileChange> _pendingFileChanges = [];
+  bool _applyingFileChanges = false;
+  final Object _refreshOwner = Object();
   final GlobalKey _menuButtonKey = GlobalKey();
   final Map<String, GlobalKey> _folderRowKeys = {};
   List<Object>? _stableEntries;
+  _VideoListingData? _memoizedListing;
+  VideoLibraryScan? _memoizedSourceLibrary;
+  Map<String, VideoIndexRecord>? _memoizedSourceStatusRecords;
+  VideoLibraryScan? _pendingLibrary;
+  _VisibilitySettingsKey? _pendingVisibilityKey;
+  Map<String, VideoIndexRecord>? _pendingStatusRecords;
+  bool _listingBuildPending = false;
+  int _listingBuildGeneration = 0;
+  Object? _listingError;
   bool _permissionPromptVisible = false;
   bool _permissionPromptScheduled = false;
+  final Map<String, List<Object>> _sortedEntriesByKey = {};
 
   @override
   bool get wantKeepAlive => true;
 
   @override
   void dispose() {
+    _listingBuildGeneration++;
+    unawaited(_fileChangeSubscription.cancel());
+    RefreshCoordinator.instance.cancelOwner(_refreshOwner);
     _itemsScrollController.dispose();
     super.dispose();
   }
@@ -89,6 +114,9 @@ class VideoTabState extends ConsumerState<VideoTab>
     super.didChangeDependencies();
     if (_initialLoadStarted) return;
     _initialLoadStarted = true;
+    _fileChangeSubscription = FileChangeNotifier.instance.changes.listen(
+      _queueFileChanges,
+    );
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _loadInitial();
     });
@@ -203,12 +231,28 @@ class VideoTabState extends ConsumerState<VideoTab>
     final controller = ref.read(videoTabProvider(widget.sessionId).notifier);
     try {
       final permissionGranted = await _hasStoragePermission();
-      await controller.refresh(
-        permissionGranted: permissionGranted,
-        settings: ref.read(videoPageSettingsProvider),
+      final current = ref.read(videoTabProvider(widget.sessionId));
+      final driveId = current.library?.drive.id ?? widget.initialDriveId;
+      final locationAdjusted = await RefreshCoordinator.instance.run<bool>(
+        scope: 'video:${widget.sessionId}:${driveId ?? 'internal'}',
+        owner: _refreshOwner,
+        priority: RefreshPriority.visiblePage,
+        work: (token) async {
+          token.throwIfCancelled();
+          final adjusted = await controller.refresh(
+            permissionGranted: permissionGranted,
+            settings: ref.read(videoPageSettingsProvider),
+          );
+          return RefreshWorkResult(adjusted);
+        },
       );
-      _reportLocation();
+      if (locationAdjusted && mounted) {
+        _reportLocation();
+        _showMessage('This folder is no longer available. Showing its parent.');
+      }
       if (!permissionGranted) _showStoragePermissionPrompt();
+    } on RefreshCancelled {
+      return;
     } catch (error) {
       controller.reportFailure(error);
     }
@@ -246,13 +290,20 @@ class VideoTabState extends ConsumerState<VideoTab>
     final settings = ref.read(videoPageSettingsProvider);
     final controller = ref.read(videoTabProvider(widget.sessionId).notifier);
     final leftFolder = state.folderPath;
+    final navigationTimer = Stopwatch()..start();
     if (settings.viewMode == 'allFolders') {
       controller.returnToRoot();
     } else {
       controller.goUp();
     }
     _stableEntries = null;
-    _reportLocation();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (kDebugMode) {
+        debugPrint(
+          'Video navigation back first frame: ${navigationTimer.elapsedMicroseconds}us',
+        );
+      }
+    });
     if (settings.viewMode == 'allFolders') {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
@@ -299,21 +350,12 @@ class VideoTabState extends ConsumerState<VideoTab>
   Future<void> _showAnchoredMenu(List<PopupMenuEntry<String>> items) async {
     final buttonContext = _menuButtonKey.currentContext;
     if (buttonContext == null) return;
-    final renderObject = buttonContext.findRenderObject();
-    if (renderObject is! RenderBox) return;
-    final position = renderObject.localToGlobal(Offset.zero);
-    final size = renderObject.size;
     setVideoMenuOpen(true);
     try {
-      final selection = await showMenu<String>(
+      final selection = await showContentSizedMenu<String>(
         context: context,
-        position: RelativeRect.fromLTRB(
-          position.dx,
-          position.dy + size.height,
-          position.dx + size.width,
-          0,
-        ),
-        items: items,
+        anchorContext: buttonContext,
+        items: contentMenuItemsFromPopupEntries(items),
       );
       if (selection != null) await _handleMenuAction(selection);
     } finally {
@@ -370,7 +412,7 @@ class VideoTabState extends ConsumerState<VideoTab>
           PopupMenuItem(
             value: 'sort_picker',
             enabled: false,
-            padding: const EdgeInsets.all(8),
+            padding: const EdgeInsets.symmetric(horizontal: 4),
             child: SizedBox(
               width: 320,
               child: VideoSortPicker(
@@ -379,7 +421,7 @@ class VideoTabState extends ConsumerState<VideoTab>
                 applyFieldImmediately: false,
                 onChanged: (field, ascending) {
                   unawaited(_saveSort(field, ascending));
-                  Navigator.of(context).pop();
+                  dismissContentSizedMenu();
                 },
               ),
             ),
@@ -537,21 +579,24 @@ class VideoTabState extends ConsumerState<VideoTab>
             .toList(),
     };
     if (settings.viewMode == 'files') return videos;
+    final visibleVideoFolders = <String>{};
+    final visibleVideoParents = <String>{};
+    for (final video in visibleVideos) {
+      visibleVideoParents.add(video.parentRelativePath);
+      var parent = video.parentRelativePath;
+      while (parent.isNotEmpty) {
+        visibleVideoFolders.add(parent);
+        final separator = parent.lastIndexOf('/');
+        parent = separator < 0 ? '' : parent.substring(0, separator);
+      }
+    }
     final folders = library.folders.where((folder) {
       if (!_isVisibleFolder(folder, settings)) return false;
-      if (!library.videos.any(
-        (video) =>
-            _isVisibleFile(video, settings) &&
-            video.relativePath.startsWith('${folder.relativePath}/'),
-      )) {
+      if (!visibleVideoFolders.contains(folder.relativePath)) {
         return false;
       }
       if (settings.viewMode == 'allFolders' && state.folderPath.isEmpty) {
-        return library.videos.any(
-          (video) =>
-              _isVisibleFile(video, settings) &&
-              video.parentRelativePath == folder.relativePath,
-        );
+        return visibleVideoParents.contains(folder.relativePath);
       }
       if (settings.viewMode == 'allFolders') return false;
       final separator = folder.relativePath.lastIndexOf('/');
@@ -826,6 +871,7 @@ class VideoTabState extends ConsumerState<VideoTab>
     if (!mounted) return;
     var renamed = 0;
     Object? failure;
+    final changes = <FileChange>[];
     for (var index = 0; index < targets.length; index++) {
       final target = targets[index];
       final sourceName = target.relativePath.split('/').last;
@@ -844,11 +890,33 @@ class VideoTabState extends ConsumerState<VideoTab>
               newName: newName,
             );
         renamed++;
+        final oldPath = _absolutePathFor(target.driveId, target.relativePath);
+        final newPath = _absolutePathFor(
+          target.driveId,
+          _joinRelativePath(
+            target.relativePath.contains('/')
+                ? target.relativePath.substring(
+                    0,
+                    target.relativePath.lastIndexOf('/'),
+                  )
+                : '',
+            newName,
+          ),
+        );
+        if (oldPath != null && newPath != null) {
+          changes.add(
+            FileChange(
+              kind: FileChangeKind.renamed,
+              oldPath: oldPath,
+              newPath: newPath,
+            ),
+          );
+        }
       } catch (error) {
         failure ??= error;
       }
     }
-    await _refresh();
+    FileChangeNotifier.instance.publish(changes);
     _exitSelection();
     _showMessage(
       renamed > 0
@@ -939,6 +1007,7 @@ class VideoTabState extends ConsumerState<VideoTab>
     }
     var deleted = 0;
     Object? failure;
+    final changes = <FileChange>[];
     for (final target in targets) {
       try {
         await ref
@@ -948,11 +1017,15 @@ class VideoTabState extends ConsumerState<VideoTab>
               relativePath: target.relativePath,
             );
         deleted++;
+        final path = _absolutePathFor(target.driveId, target.relativePath);
+        if (path != null) {
+          changes.add(FileChange(kind: FileChangeKind.deleted, path: path));
+        }
       } catch (error) {
         failure ??= error;
       }
     }
-    await _refresh();
+    FileChangeNotifier.instance.publish(changes);
     _exitSelection();
     _showMessage(
       deleted > 0
@@ -975,6 +1048,7 @@ class VideoTabState extends ConsumerState<VideoTab>
     var copied = 0;
     Object? failure;
     String? applyToAll;
+    final changes = <FileChange>[];
     for (final source in List<VideoStatusTarget>.of(_pendingCopyTargets)) {
       final sourceName = source.relativePath.split('/').last;
       final targetRelativePath = '${state.folderPath}/$sourceName';
@@ -1018,12 +1092,24 @@ class VideoTabState extends ConsumerState<VideoTab>
               replaceExisting: replace,
             );
         copied++;
+        final path = _absolutePathFor(
+          library.drive.id,
+          _joinRelativePath(state.folderPath, targetName),
+        );
+        if (path != null) {
+          changes.add(
+            FileChange(
+              kind: replace ? FileChangeKind.modified : FileChangeKind.created,
+              path: path,
+            ),
+          );
+        }
       } catch (error) {
         failure ??= error;
       }
     }
     if (!mounted) return;
-    await _refresh();
+    FileChangeNotifier.instance.publish(changes);
     setState(() => _pendingCopyTargets = []);
     _showMessage(
       copied > 0
@@ -1033,6 +1119,58 @@ class VideoTabState extends ConsumerState<VideoTab>
           : 'Paste failed: $failure',
     );
   }
+
+  String? _absolutePathFor(String driveId, String relativePath) {
+    final currentDrive = ref
+        .read(videoTabProvider(widget.sessionId))
+        .library
+        ?.drive;
+    final drivePath = currentDrive?.id == driveId
+        ? currentDrive!.path
+        : (ref.read(availableStorageDevicesProvider).asData?.value ?? const [])
+              .where((device) => device.id == driveId)
+              .firstOrNull
+              ?.path;
+    if (drivePath == null) return null;
+    final relative = relativePath.replaceAll('/', Platform.pathSeparator);
+    return relative.isEmpty
+        ? drivePath
+        : '$drivePath${Platform.pathSeparator}$relative';
+  }
+
+  void _queueFileChanges(FileChangeEvent event) {
+    if (!mounted) return;
+    _pendingFileChanges.addAll(event.changes);
+    if (_applyingFileChanges) return;
+    unawaited(_drainVideoFileChanges());
+  }
+
+  Future<void> _drainVideoFileChanges() async {
+    _applyingFileChanges = true;
+    try {
+      while (mounted && _pendingFileChanges.isNotEmpty) {
+        final changes = List<FileChange>.of(_pendingFileChanges);
+        _pendingFileChanges.clear();
+        try {
+          await ref
+              .read(videoTabProvider(widget.sessionId).notifier)
+              .applyFileChanges(FileChangeEvent(changes));
+        } catch (error) {
+          if (mounted) {
+            _showMessage('Could not sync changed video files: $error');
+          }
+        }
+      }
+    } finally {
+      _applyingFileChanges = false;
+      if (mounted && _pendingFileChanges.isNotEmpty) {
+        unawaited(_drainVideoFileChanges());
+      }
+    }
+  }
+
+  String _joinRelativePath(String parent, String name) =>
+      parent.isEmpty ? name : '$parent/$name';
 
   Future<String?> _showPasteConflict(String name) => showDialog<String>(
     context: context,
@@ -1114,6 +1252,18 @@ class VideoTabState extends ConsumerState<VideoTab>
         .toDouble();
     final state = ref.watch(videoTabProvider(widget.sessionId));
     final indexing = ref.watch(videoIndexingProvider(widget.sessionId));
+    final selectableEntries = _selectionMode
+        ? _currentSelectableEntries(state, settings)
+        : const <Object>[];
+    final selectedCount = selectableEntries
+        .where(
+          (entry) => _selectedPaths.contains(
+            entry is VideoFile
+                ? 'file:${entry.relativePath}'
+                : 'folder:${(entry as VideoFolder).relativePath}',
+          ),
+        )
+        .length;
     final statusRecords =
         ref.watch(videoStatusRecordsProvider(widget.sessionId)).valueOrNull ??
         const <String, VideoIndexRecord>{};
@@ -1132,7 +1282,6 @@ class VideoTabState extends ConsumerState<VideoTab>
     ref.listen<VideoPageSettings>(videoPageSettingsProvider, (previous, next) {
       if (previous?.viewMode != next.viewMode) {
         ref.read(videoTabProvider(widget.sessionId).notifier).returnToRoot();
-        _reportLocation();
       }
       if (previous?.showHiddenFilesAndFolders !=
               next.showHiddenFilesAndFolders ||
@@ -1140,23 +1289,24 @@ class VideoTabState extends ConsumerState<VideoTab>
         ref
             .read(videoTabProvider(widget.sessionId).notifier)
             .reconcileVisibility(next);
-        _reportLocation();
       }
     });
     ref.listen<AppSettings>(appSettingsProvider, (previous, next) {
-      if (previous?.hideAndroidFoldersInCategoryPages ==
-          next.hideAndroidFoldersInCategoryPages) {
-        return;
-      }
       final currentState = ref.read(videoTabProvider(widget.sessionId));
-      if (next.hideAndroidFoldersInCategoryPages &&
+      if (previous?.hideAndroidFoldersInCategoryPages !=
+              next.hideAndroidFoldersInCategoryPages &&
+          next.hideAndroidFoldersInCategoryPages &&
           SharedStorageScanScope.isInsideAndroidFolder(
             currentState.folderPath,
           )) {
         ref.read(videoTabProvider(widget.sessionId).notifier).returnToRoot();
-        _reportLocation();
       }
-      if (mounted) setState(() {});
+      if (previous?.hideAndroidFoldersInCategoryPages !=
+              next.hideAndroidFoldersInCategoryPages ||
+          previous?.blacklistedPaths != next.blacklistedPaths ||
+          previous?.whitelistedPaths != next.whitelistedPaths) {
+        if (mounted) setState(() {});
+      }
     });
 
     return Scaffold(
@@ -1198,7 +1348,7 @@ class VideoTabState extends ConsumerState<VideoTab>
                 Expanded(
                   child: _selectionMode
                       ? Text(
-                          '${_selectedPaths.length} selected',
+                          '$selectedCount/${selectableEntries.length} selected',
                           style: const TextStyle(fontSize: 19),
                         )
                       : _showVideoSettings
@@ -1390,6 +1540,178 @@ class VideoTabState extends ConsumerState<VideoTab>
     );
   }
 
+  _VideoListingData? _listingData({
+    required VideoLibraryScan library,
+    required String currentPath,
+    required VideoPageSettings settings,
+    required _VisibilitySettingsKey visibilityKey,
+    required Map<String, VideoIndexRecord> indexingRecords,
+    required Map<String, VideoIndexRecord> statusRecords,
+  }) {
+    final cached = _memoizedListing;
+    if (cached != null &&
+        identical(_memoizedSourceLibrary, library) &&
+        cached.visibilityKey == visibilityKey &&
+        identical(_memoizedSourceStatusRecords, statusRecords)) {
+      if (!identical(cached.settings, settings) ||
+          !identical(cached.indexingRecords, indexingRecords)) {
+        _sortedEntriesByKey.clear();
+        _memoizedListing = cached.withSettingsAndIndexing(
+          settings,
+          indexingRecords,
+        );
+      }
+      return _listingForPath(_memoizedListing!, currentPath);
+    }
+    if (_listingError != null) {
+      if (identical(_pendingLibrary, library) &&
+          _pendingVisibilityKey == visibilityKey &&
+          identical(_pendingStatusRecords, statusRecords)) {
+        return null;
+      }
+      _listingError = null;
+    }
+    if (_listingBuildPending &&
+        identical(_pendingLibrary, library) &&
+        _pendingVisibilityKey == visibilityKey &&
+        identical(_pendingStatusRecords, statusRecords)) {
+      if (cached == null) return null;
+      return _listingForPath(cached, currentPath);
+    }
+
+    _sortedEntriesByKey.clear();
+    _listingBuildPending = true;
+    _pendingLibrary = library;
+    _pendingVisibilityKey = visibilityKey;
+    _pendingStatusRecords = statusRecords;
+    final generation = ++_listingBuildGeneration;
+    final timer = Stopwatch()..start();
+    unawaited(
+      compute(_buildVideoListingTree, (
+        library: library,
+        settings: settings,
+        visibilityKey: visibilityKey,
+        statusRecords: statusRecords,
+      )).then(
+        (tree) {
+          if (!mounted || generation != _listingBuildGeneration) return;
+          if (kDebugMode) {
+            debugPrint(
+              'Video tree build: ${timer.elapsedMicroseconds}us '
+              '(${tree.visibleVideos.length} videos, '
+              '${tree.visibleFolders.length} folders)',
+            );
+          }
+          setState(() {
+            _memoizedListing = tree.withSettingsAndIndexing(
+              ref.read(videoPageSettingsProvider),
+              ref.read(videoIndexingProvider(widget.sessionId)).records,
+              statusRecords: statusRecords,
+            );
+            _memoizedSourceLibrary = library;
+            _memoizedSourceStatusRecords = statusRecords;
+            _listingBuildPending = false;
+            _listingError = null;
+          });
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          if (!mounted || generation != _listingBuildGeneration) return;
+          debugPrint('Could not build the Video folder tree: $error');
+          setState(() {
+            _listingBuildPending = false;
+            _listingError = error;
+          });
+        },
+      ),
+    );
+    return null;
+  }
+
+  _VideoListingData _listingForPath(
+    _VideoListingData data,
+    String currentPath,
+  ) {
+    final settings = data.settings;
+    final sortKey = [
+      identityHashCode(data.library),
+      identityHashCode(data.indexingRecords),
+      identityHashCode(data.statusRecords),
+      settings.viewMode,
+      settings.sortField,
+      settings.sortAscending,
+      currentPath,
+    ].join(':');
+    final sortedEntries = _sortedEntriesByKey.putIfAbsent(sortKey, () {
+      final folders = settings.viewMode == 'folders'
+          ? List<VideoFolder>.of(
+              data.foldersByParentPath[currentPath] ?? const [],
+            )
+          : settings.viewMode == 'allFolders' && currentPath.isEmpty
+          ? data.visibleFolders
+                .where(
+                  (folder) =>
+                      (data.directVideoCountsByFolder[folder.relativePath] ??
+                          0) >
+                      0,
+                )
+                .toList()
+          : <VideoFolder>[];
+      final videos = switch (settings.viewMode) {
+        'files' => List<VideoFile>.of(data.visibleVideos),
+        'allFolders' || 'folders' => List<VideoFile>.of(
+          data.videosByParentPath[currentPath] ?? const [],
+        ),
+        _ => <VideoFile>[],
+      };
+      folders.sort(
+        (left, right) => _compareFolders(
+          left,
+          right,
+          settings.sortField,
+          settings.sortAscending,
+          data.directVideoCountsByFolder,
+          data.videoSizesByFolder,
+          data.latestPlayedByFolder,
+        ),
+      );
+      videos.sort((left, right) {
+        final leftInfo = data.indexingRecords[left.relativePath]?.information;
+        final rightInfo = data.indexingRecords[right.relativePath]?.information;
+        return _compareVideos(
+          left,
+          right,
+          leftInfo,
+          rightInfo,
+          data.statusRecords[left.relativePath],
+          data.statusRecords[right.relativePath],
+          settings.sortField,
+          settings.sortAscending,
+        );
+      });
+      return [...folders, ...videos];
+    });
+
+    final result = _VideoListingData(
+      library: data.library,
+      currentPath: currentPath,
+      settings: data.settings,
+      visibilityKey: data.visibilityKey,
+      indexingRecords: data.indexingRecords,
+      statusRecords: data.statusRecords,
+      visibleVideos: data.visibleVideos,
+      visibleFolders: data.visibleFolders,
+      directVideoCountsByFolder: data.directVideoCountsByFolder,
+      videoSizesByFolder: data.videoSizesByFolder,
+      latestPlayedByFolder: data.latestPlayedByFolder,
+      childFolderCountsByPath: data.childFolderCountsByPath,
+      foldersByParentPath: data.foldersByParentPath,
+      videosByParentPath: data.videosByParentPath,
+      entries: sortedEntries,
+    );
+    _memoizedListing = result;
+    return result;
+  }
+
   Widget _buildBody(
     BuildContext context,
     VideoLibraryTabState state,
@@ -1438,131 +1760,56 @@ class VideoTabState extends ConsumerState<VideoTab>
     final library = state.library;
     if (library == null) return const Center(child: Text('No videos found'));
     final currentPath = state.folderPath;
-    final visibleVideos = library.videos
-        .where((video) => _isVisibleFile(video, settings))
-        .toList(growable: false);
-    final foldersContainingVisibleVideos = <String>{};
-    final videoSizesByFolder = <String, int>{};
-    final directVideoCountsByFolder = <String, int>{};
-    final latestPlayedByFolder = <String, DateTime>{};
-    for (final video in visibleVideos) {
-      var parent = video.parentRelativePath;
-      if (statusRecords[video.relativePath]?.status == VideoStatus.newVideo) {
-        while (parent.isNotEmpty) {
-          directVideoCountsByFolder.update(
-            'new:$parent',
-            (count) => count + 1,
-            ifAbsent: () => 1,
-          );
-          final separator = parent.lastIndexOf('/');
-          parent = separator < 0 ? '' : parent.substring(0, separator);
-        }
-        parent = video.parentRelativePath;
-      }
-      if (parent.isNotEmpty) {
-        directVideoCountsByFolder.update(
-          parent,
-          (count) => count + 1,
-          ifAbsent: () => 1,
-        );
-      }
-      while (parent.isNotEmpty) {
-        foldersContainingVisibleVideos.add(parent);
-        videoSizesByFolder.update(
-          parent,
-          (size) => size + video.size,
-          ifAbsent: () => video.size,
-        );
-        final playedAt = statusRecords[video.relativePath]?.playedAt;
-        if (playedAt != null &&
-            (latestPlayedByFolder[parent]?.isBefore(playedAt) ?? true)) {
-          latestPlayedByFolder[parent] = playedAt;
-        }
-        final separator = parent.lastIndexOf('/');
-        parent = separator < 0 ? '' : parent.substring(0, separator);
-      }
-    }
-    final visibleFolders = library.folders
-        .where((folder) {
-          if (!_isVisibleFolder(folder, settings) ||
-              !foldersContainingVisibleVideos.contains(folder.relativePath)) {
-            return false;
-          }
-          return true;
-        })
-        .toList(growable: false);
-    final childFolderCountsByPath = <String, int>{};
-    for (final folder in visibleFolders) {
-      final separator = folder.relativePath.lastIndexOf('/');
-      final parent = separator < 0
-          ? ''
-          : folder.relativePath.substring(0, separator);
-      childFolderCountsByPath.update(
-        parent,
-        (count) => count + 1,
-        ifAbsent: () => 1,
-      );
-    }
-    final folders = switch (settings.viewMode) {
-      'allFolders' when currentPath.isEmpty =>
-        visibleFolders
-            .where(
-              (folder) =>
-                  (directVideoCountsByFolder[folder.relativePath] ?? 0) > 0,
-            )
-            .toList(),
-      'folders' => visibleFolders.where((folder) {
-        final separator = folder.relativePath.lastIndexOf('/');
-        final parent = separator < 0
-            ? ''
-            : folder.relativePath.substring(0, separator);
-        return parent == currentPath;
-      }).toList(),
-      _ => <VideoFolder>[],
-    };
-    final videos = switch (settings.viewMode) {
-      'files' => visibleVideos.toList(),
-      'allFolders' =>
-        visibleVideos
-            .where((video) => video.parentRelativePath == currentPath)
-            .toList(),
-      'folders' =>
-        visibleVideos
-            .where((video) => video.parentRelativePath == currentPath)
-            .toList(),
-      _ => <VideoFile>[],
-    };
-    folders.sort(
-      (left, right) => _compareFolders(
-        left,
-        right,
-        settings.sortField,
-        settings.sortAscending,
-        directVideoCountsByFolder,
-        videoSizesByFolder,
-        latestPlayedByFolder,
-      ),
+    final appSettings = ref.watch(appSettingsProvider);
+    final visibilityKey = _VisibilitySettingsKey(
+      showHidden: settings.showHiddenFilesAndFolders,
+      recognizeNomedia: settings.recognizeNomedia,
+      hideAndroidFolders: appSettings.hideAndroidFoldersInCategoryPages,
+      blacklistedPaths: appSettings.blacklistedPaths,
+      whitelistedPaths: appSettings.whitelistedPaths,
     );
-    videos.sort((left, right) {
-      final leftInfo = indexing.records[left.relativePath]?.information;
-      final rightInfo = indexing.records[right.relativePath]?.information;
-      return _compareVideos(
-        left,
-        right,
-        leftInfo,
-        rightInfo,
-        statusRecords[left.relativePath],
-        statusRecords[right.relativePath],
-        settings.sortField,
-        settings.sortAscending,
+    final listing = _listingData(
+      library: library,
+      currentPath: currentPath,
+      settings: settings,
+      visibilityKey: visibilityKey,
+      indexingRecords: indexing.records,
+      statusRecords: statusRecords,
+    );
+    if (listing == null) {
+      final error = _listingError;
+      if (error == null) {
+        return const Center(child: CircularProgressIndicator());
+      }
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Could not build the Video folder tree: $error'),
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: () => setState(() {
+                  _listingError = null;
+                  _listingBuildPending = false;
+                }),
+                child: const Text('Try again'),
+              ),
+            ],
+          ),
+        ),
       );
-    });
-    final computedEntries = <Object>[...folders, ...videos];
+    }
+    final directVideoCountsByFolder = listing.directVideoCountsByFolder;
+    final videoSizesByFolder = listing.videoSizesByFolder;
+    final childFolderCountsByPath = listing.childFolderCountsByPath;
+    final computedEntries = listing.entries;
     final entries = (_isScrolling || _isMenuOpen) && _stableEntries != null
         ? _stableEntries!
         : computedEntries;
     if (!_isScrolling && !_isMenuOpen) {
-      _stableEntries = List<Object>.of(computedEntries);
+      _stableEntries = computedEntries;
     }
     Widget buildEntry(
       BuildContext itemContext,
@@ -1590,11 +1837,19 @@ class VideoTabState extends ConsumerState<VideoTab>
               _toggleSelection('folder:${entry.relativePath}');
               return;
             }
+            final navigationTimer = Stopwatch()..start();
             ref
                 .read(videoTabProvider(widget.sessionId).notifier)
                 .openFolder(entry.relativePath);
             _stableEntries = null;
-            _reportLocation();
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (kDebugMode) {
+                debugPrint(
+                  'Video folder navigation first frame: '
+                  '${navigationTimer.elapsedMicroseconds}us',
+                );
+              }
+            });
           },
           onLongPress: () => _beginSelection('folder:${entry.relativePath}'),
         );
@@ -1669,6 +1924,42 @@ class VideoTabState extends ConsumerState<VideoTab>
                         final spacing = fontScaledSpacing(context, 8);
                         final cellWidth =
                             (usableWidth - spacing * (columns - 1)) / columns;
+                        final settingsScale = fontScaledSpacing(context, 1);
+                        final videoDetailFields = [
+                          settings.showResolution,
+                          settings.showFrameRate,
+                          settings.showFileExtension,
+                          settings.showSize,
+                          settings.showDate,
+                          settings.showPlayedTime,
+                        ].where((enabled) => enabled).length;
+                        final videoCellHeight =
+                            (cellWidth - 24) * 9 / 16 +
+                            settingsScale *
+                                (4 +
+                                    36 +
+                                    videoDetailFields * 14 +
+                                    (settings.showPath ? 14 : 0) +
+                                    (settings.showLength &&
+                                            !settings.displayLengthOverThumbnail
+                                        ? 14
+                                        : 0));
+                        final folderDetailFields =
+                            (settings.showContents ? 2 : 0) +
+                            (settings.showSize ? 1 : 0) +
+                            (settings.showDate ? 1 : 0);
+                        final folderCellHeight =
+                            (cellWidth - 16) * 9 / 16 +
+                            settingsScale *
+                                (16 +
+                                    4 +
+                                    28 +
+                                    folderDetailFields * 14 +
+                                    (settings.showPath ? 14 : 0));
+                        final gridCellHeight = videoCellHeight.clamp(
+                          folderCellHeight,
+                          double.infinity,
+                        );
                         return GridView.builder(
                           controller: _itemsScrollController,
                           padding: const EdgeInsets.all(8),
@@ -1678,8 +1969,7 @@ class VideoTabState extends ConsumerState<VideoTab>
                                 crossAxisCount: columns,
                                 crossAxisSpacing: spacing,
                                 mainAxisSpacing: spacing,
-                                mainAxisExtent:
-                                    270 * fontScaledSpacing(context, 1),
+                                mainAxisExtent: gridCellHeight,
                               ),
                           itemBuilder: (context, index) => buildEntry(
                             context,
@@ -1702,17 +1992,49 @@ class VideoTabState extends ConsumerState<VideoTab>
     );
   }
 
-  bool _isVisibleFile(VideoFile file, VideoPageSettings settings) =>
-      (settings.showHiddenFilesAndFolders || !file.isHidden) &&
-      (!settings.recognizeNomedia || !file.isInsideNomedia) &&
-      (!ref.read(appSettingsProvider).hideAndroidFoldersInCategoryPages ||
-          !SharedStorageScanScope.isInsideAndroidFolder(file.relativePath));
+  bool _isVisibleFile(VideoFile file, VideoPageSettings settings) {
+    final appSettings = ref.read(appSettingsProvider);
+    final root = ref
+        .read(videoTabProvider(widget.sessionId))
+        .library
+        ?.drive
+        .path;
+    final path = root == null
+        ? file.relativePath
+        : _absoluteVideoPath(root, file.relativePath);
+    return FileVisibility.shouldShow(
+          path: path,
+          isDirectory: false,
+          showHiddenFiles: settings.showHiddenFilesAndFolders,
+          blacklistedPaths: appSettings.blacklistedPaths,
+          whitelistedPaths: appSettings.whitelistedPaths,
+        ) &&
+        (!settings.recognizeNomedia || !file.isInsideNomedia) &&
+        (!appSettings.hideAndroidFoldersInCategoryPages ||
+            !SharedStorageScanScope.isInsideAndroidFolder(file.relativePath));
+  }
 
-  bool _isVisibleFolder(VideoFolder folder, VideoPageSettings settings) =>
-      (settings.showHiddenFilesAndFolders || !folder.isHidden) &&
-      (!settings.recognizeNomedia || !folder.isInsideNomedia) &&
-      (!ref.read(appSettingsProvider).hideAndroidFoldersInCategoryPages ||
-          !SharedStorageScanScope.isInsideAndroidFolder(folder.relativePath));
+  bool _isVisibleFolder(VideoFolder folder, VideoPageSettings settings) {
+    final appSettings = ref.read(appSettingsProvider);
+    final root = ref
+        .read(videoTabProvider(widget.sessionId))
+        .library
+        ?.drive
+        .path;
+    final path = root == null
+        ? folder.relativePath
+        : _absoluteVideoPath(root, folder.relativePath);
+    return FileVisibility.shouldShow(
+          path: path,
+          isDirectory: true,
+          showHiddenFiles: settings.showHiddenFilesAndFolders,
+          blacklistedPaths: appSettings.blacklistedPaths,
+          whitelistedPaths: appSettings.whitelistedPaths,
+        ) &&
+        (!settings.recognizeNomedia || !folder.isInsideNomedia) &&
+        (!appSettings.hideAndroidFoldersInCategoryPages ||
+            !SharedStorageScanScope.isInsideAndroidFolder(folder.relativePath));
+  }
 
   SearchScope? _searchScope(VideoLibraryTabState state) {
     final library = state.library;
@@ -1749,7 +2071,6 @@ class VideoTabState extends ConsumerState<VideoTab>
     ref
         .read(videoTabProvider(widget.sessionId).notifier)
         .openFolder(relativePath);
-    _reportLocation();
   }
 
   String _normalizePath(String path) =>
@@ -1791,6 +2112,239 @@ class VideoTabState extends ConsumerState<VideoTab>
     ),
   );
 }
+
+@immutable
+class _VisibilitySettingsKey {
+  const _VisibilitySettingsKey({
+    required this.showHidden,
+    required this.recognizeNomedia,
+    required this.hideAndroidFolders,
+    required this.blacklistedPaths,
+    required this.whitelistedPaths,
+  });
+
+  final bool showHidden;
+  final bool recognizeNomedia;
+  final bool hideAndroidFolders;
+  final List<String> blacklistedPaths;
+  final List<String> whitelistedPaths;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _VisibilitySettingsKey &&
+      showHidden == other.showHidden &&
+      recognizeNomedia == other.recognizeNomedia &&
+      hideAndroidFolders == other.hideAndroidFolders &&
+      listEquals(blacklistedPaths, other.blacklistedPaths) &&
+      listEquals(whitelistedPaths, other.whitelistedPaths);
+
+  @override
+  int get hashCode => Object.hash(
+    showHidden,
+    recognizeNomedia,
+    hideAndroidFolders,
+    Object.hashAll(blacklistedPaths),
+    Object.hashAll(whitelistedPaths),
+  );
+}
+
+class _VideoListingData {
+  const _VideoListingData({
+    required this.library,
+    required this.currentPath,
+    required this.settings,
+    required this.visibilityKey,
+    required this.indexingRecords,
+    required this.statusRecords,
+    required this.visibleVideos,
+    required this.visibleFolders,
+    required this.directVideoCountsByFolder,
+    required this.videoSizesByFolder,
+    required this.latestPlayedByFolder,
+    required this.childFolderCountsByPath,
+    required this.foldersByParentPath,
+    required this.videosByParentPath,
+    required this.entries,
+  });
+
+  final VideoLibraryScan library;
+  final String currentPath;
+  final VideoPageSettings settings;
+  final _VisibilitySettingsKey visibilityKey;
+  final Map<String, VideoIndexRecord> indexingRecords;
+  final Map<String, VideoIndexRecord> statusRecords;
+  final List<VideoFile> visibleVideos;
+  final List<VideoFolder> visibleFolders;
+  final Map<String, int> directVideoCountsByFolder;
+  final Map<String, int> videoSizesByFolder;
+  final Map<String, DateTime> latestPlayedByFolder;
+  final Map<String, int> childFolderCountsByPath;
+  final Map<String, List<VideoFolder>> foldersByParentPath;
+  final Map<String, List<VideoFile>> videosByParentPath;
+  final List<Object> entries;
+
+  _VideoListingData withSettingsAndIndexing(
+    VideoPageSettings settings,
+    Map<String, VideoIndexRecord> records, {
+    Map<String, VideoIndexRecord>? statusRecords,
+  }) => _VideoListingData(
+    library: library,
+    currentPath: currentPath,
+    settings: settings,
+    visibilityKey: visibilityKey,
+    indexingRecords: records,
+    statusRecords: statusRecords ?? this.statusRecords,
+    visibleVideos: visibleVideos,
+    visibleFolders: visibleFolders,
+    directVideoCountsByFolder: directVideoCountsByFolder,
+    videoSizesByFolder: videoSizesByFolder,
+    latestPlayedByFolder: latestPlayedByFolder,
+    childFolderCountsByPath: childFolderCountsByPath,
+    foldersByParentPath: foldersByParentPath,
+    videosByParentPath: videosByParentPath,
+    entries: entries,
+  );
+}
+
+_VideoListingData _buildVideoListingTree(
+  ({
+    VideoLibraryScan library,
+    VideoPageSettings settings,
+    _VisibilitySettingsKey visibilityKey,
+    Map<String, VideoIndexRecord> statusRecords,
+  })
+  input,
+) {
+  final library = input.library;
+  final settings = input.settings;
+  final visibilityKey = input.visibilityKey;
+  final statusRecords = input.statusRecords;
+  final visibleVideos = library.videos
+      .where((video) {
+        final path = _absoluteVideoPath(library.drive.path, video.relativePath);
+        return FileVisibility.shouldShow(
+              path: path,
+              isDirectory: false,
+              showHiddenFiles: visibilityKey.showHidden,
+              blacklistedPaths: visibilityKey.blacklistedPaths,
+              whitelistedPaths: visibilityKey.whitelistedPaths,
+            ) &&
+            (!settings.recognizeNomedia || !video.isInsideNomedia) &&
+            (!visibilityKey.hideAndroidFolders ||
+                !SharedStorageScanScope.isInsideAndroidFolder(
+                  video.relativePath,
+                ));
+      })
+      .toList(growable: false);
+  final foldersContainingVisibleVideos = <String>{};
+  final videoSizesByFolder = <String, int>{};
+  final directVideoCountsByFolder = <String, int>{};
+  final latestPlayedByFolder = <String, DateTime>{};
+  for (final video in visibleVideos) {
+    var parent = video.parentRelativePath;
+    if (statusRecords[video.relativePath]?.status == VideoStatus.newVideo) {
+      while (parent.isNotEmpty) {
+        directVideoCountsByFolder.update(
+          'new:$parent',
+          (count) => count + 1,
+          ifAbsent: () => 1,
+        );
+        final separator = parent.lastIndexOf('/');
+        parent = separator < 0 ? '' : parent.substring(0, separator);
+      }
+      parent = video.parentRelativePath;
+    }
+    if (parent.isNotEmpty) {
+      directVideoCountsByFolder.update(
+        parent,
+        (count) => count + 1,
+        ifAbsent: () => 1,
+      );
+    }
+    while (parent.isNotEmpty) {
+      foldersContainingVisibleVideos.add(parent);
+      videoSizesByFolder.update(
+        parent,
+        (size) => size + video.size,
+        ifAbsent: () => video.size,
+      );
+      final playedAt = statusRecords[video.relativePath]?.playedAt;
+      if (playedAt != null &&
+          (latestPlayedByFolder[parent]?.isBefore(playedAt) ?? true)) {
+        latestPlayedByFolder[parent] = playedAt;
+      }
+      final separator = parent.lastIndexOf('/');
+      parent = separator < 0 ? '' : parent.substring(0, separator);
+    }
+  }
+  final visibleFolders = library.folders
+      .where((folder) {
+        final path = _absoluteVideoPath(
+          library.drive.path,
+          folder.relativePath,
+        );
+        return FileVisibility.shouldShow(
+              path: path,
+              isDirectory: true,
+              showHiddenFiles: visibilityKey.showHidden,
+              blacklistedPaths: visibilityKey.blacklistedPaths,
+              whitelistedPaths: visibilityKey.whitelistedPaths,
+            ) &&
+            (!settings.recognizeNomedia || !folder.isInsideNomedia) &&
+            (!visibilityKey.hideAndroidFolders ||
+                !SharedStorageScanScope.isInsideAndroidFolder(
+                  folder.relativePath,
+                )) &&
+            foldersContainingVisibleVideos.contains(folder.relativePath);
+      })
+      .toList(growable: false);
+  final childFolderCountsByPath = <String, int>{};
+  final foldersByParentPath = <String, List<VideoFolder>>{};
+  for (final folder in visibleFolders) {
+    final separator = folder.relativePath.lastIndexOf('/');
+    final parent = separator < 0
+        ? ''
+        : folder.relativePath.substring(0, separator);
+    foldersByParentPath.putIfAbsent(parent, () => []).add(folder);
+    childFolderCountsByPath.update(
+      parent,
+      (count) => count + 1,
+      ifAbsent: () => 1,
+    );
+  }
+  final videosByParentPath = <String, List<VideoFile>>{};
+  for (final video in visibleVideos) {
+    videosByParentPath
+        .putIfAbsent(video.parentRelativePath, () => [])
+        .add(video);
+  }
+  return _VideoListingData(
+    library: library,
+    currentPath: '',
+    settings: settings,
+    visibilityKey: visibilityKey,
+    indexingRecords: const {},
+    statusRecords: statusRecords,
+    visibleVideos: visibleVideos,
+    visibleFolders: visibleFolders,
+    directVideoCountsByFolder: directVideoCountsByFolder,
+    videoSizesByFolder: videoSizesByFolder,
+    latestPlayedByFolder: latestPlayedByFolder,
+    childFolderCountsByPath: childFolderCountsByPath,
+    foldersByParentPath: foldersByParentPath,
+    videosByParentPath: videosByParentPath,
+    entries: const [],
+  );
+}
+
+Widget _newVideoBorder(double radius) => IgnorePointer(
+  child: DecoratedBox(
+    decoration: BoxDecoration(
+      border: Border.all(color: const Color(0xFFE53935), width: 2),
+      borderRadius: BorderRadius.circular(radius),
+    ),
+  ),
+);
 
 class _VideoFileRow extends ConsumerStatefulWidget {
   const _VideoFileRow({
@@ -1842,8 +2396,7 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
     super.initState();
     _videoInformationService = ref.read(videoInformationProvider);
     _record = widget.status;
-    _loadInformation();
-    if (widget.settings.showThumbnail) _loadThumbnail();
+    _scheduleMediaLoads();
   }
 
   @override
@@ -1867,16 +2420,29 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
       if (videoChanged || thumbnailSizeChanged) {
         _thumbnail = null;
         _thumbnailFailed = false;
-        _loadInformation();
-        if (widget.settings.showThumbnail) _loadThumbnail();
+        _scheduleMediaLoads();
       }
     }
     if (!oldWidget.settings.showThumbnail &&
         widget.settings.showThumbnail &&
         _thumbnail == null &&
         !_thumbnailFailed) {
-      _loadThumbnail();
+      _scheduleMediaLoads();
     }
+  }
+
+  void _scheduleMediaLoads() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final settings = widget.settings;
+      if (settings.showResolution ||
+          settings.showFrameRate ||
+          settings.showLength ||
+          videoSortNeedsInformation(settings.sortField)) {
+        unawaited(_loadInformation());
+      }
+      if (settings.showThumbnail) unawaited(_loadThumbnail());
+    });
   }
 
   Future<void> _loadInformation() async {
@@ -1928,136 +2494,129 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
     List<String> details,
     String path,
     String? duration,
+    bool isNew,
   ) {
     final settings = widget.settings;
     final contentWidth = (widget.gridCellWidth ?? 220) - 24;
     final thumbnailHeight = contentWidth * 9 / 16;
-    return SizedBox(
-      height: 258,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          SizedBox(
-            height: thumbnailHeight,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: settings.showThumbnail && _thumbnail != null
-                      ? ClipRRect(
-                          borderRadius: BorderRadius.circular(6),
-                          child: Image.memory(
-                            _thumbnail!,
-                            fit: BoxFit.cover,
-                            cacheWidth: contentWidth.round() * 2,
-                            cacheHeight: (thumbnailHeight * 2).round(),
-                            errorBuilder: (_, _, _) => Icon(
-                              Icons.play_arrow,
-                              size: 56,
-                              color: fileTypeColor(
-                                context,
-                                FileTypeColor.video,
-                              ),
-                            ),
-                          ),
-                        )
-                      : Center(
-                          child: Icon(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(
+          height: thumbnailHeight,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: settings.showThumbnail && _thumbnail != null
+                    ? ClipRRect(
+                        borderRadius: BorderRadius.circular(6),
+                        child: Image.memory(
+                          _thumbnail!,
+                          fit: BoxFit.cover,
+                          cacheWidth: contentWidth.round() * 2,
+                          cacheHeight: (thumbnailHeight * 2).round(),
+                          errorBuilder: (_, _, _) => Icon(
                             Icons.play_arrow,
                             size: 56,
                             color: fileTypeColor(context, FileTypeColor.video),
                           ),
                         ),
+                      )
+                    : Center(
+                        child: Icon(
+                          Icons.play_arrow,
+                          size: 56,
+                          color: fileTypeColor(context, FileTypeColor.video),
+                        ),
+                      ),
+              ),
+              if (duration != null && settings.displayLengthOverThumbnail)
+                Positioned(
+                  right: 4,
+                  bottom: 4,
+                  child: _DurationBadge(duration: duration),
                 ),
-                if (duration != null && settings.displayLengthOverThumbnail)
-                  Positioned(
-                    right: 4,
-                    bottom: 4,
-                    child: _DurationBadge(duration: duration),
+              if (widget.selectionMode)
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  child: Checkbox(
+                    value: widget.selected,
+                    onChanged: (_) => widget.onTap(),
+                    visualDensity: VisualDensity.compact,
                   ),
-                if (widget.selectionMode)
-                  Positioned(
-                    left: 0,
-                    top: 0,
-                    child: Checkbox(
-                      value: widget.selected,
-                      onChanged: (_) => widget.onTap(),
-                      visualDensity: VisualDensity.compact,
-                    ),
-                  ),
-                if (!widget.selectionMode)
-                  Positioned(
-                    right: 0,
-                    top: 0,
-                    child: Material(
-                      color: theme.colorScheme.surface.withValues(alpha: 0.8),
-                      shape: const CircleBorder(),
-                      child: SizedBox(
-                        width: 36,
-                        height: 36,
-                        child: PopupMenuButton<String>(
+                ),
+              if (!widget.selectionMode)
+                Positioned(
+                  right: 0,
+                  top: 0,
+                  child: Material(
+                    color: theme.colorScheme.surface.withValues(alpha: 0.8),
+                    shape: const CircleBorder(),
+                    child: SizedBox(
+                      width: 36,
+                      height: 36,
+                      child: ContentSizedMenuButton<String>(
+                        builder: (context, openMenu) => IconButton(
                           tooltip: 'Video options',
                           padding: EdgeInsets.zero,
                           iconSize: 20,
-                          onOpened: () => widget.onMenuStateChanged(true),
-                          onCanceled: () => widget.onMenuStateChanged(false),
-                          onSelected: (value) {
-                            widget.onMenuStateChanged(false);
-                            widget.onOptions(value);
-                          },
-                          itemBuilder: (_) => const [
-                            PopupMenuItem(
-                              value: 'properties',
-                              child: Text('Properties'),
-                            ),
-                            PopupMenuItem(
-                              value: 'rename',
-                              child: Text('Rename'),
-                            ),
-                            PopupMenuItem(
-                              value: 'delete',
-                              child: Text('Delete'),
-                            ),
-                            PopupMenuItem(
-                              value: 'label',
-                              child: Text('Update tag'),
-                            ),
-                          ],
+                          onPressed: openMenu,
                           icon: const Icon(Icons.more_vert),
                         ),
+                        onOpened: () => widget.onMenuStateChanged(true),
+                        onCanceled: () => widget.onMenuStateChanged(false),
+                        onSelected: (value) {
+                          widget.onMenuStateChanged(false);
+                          widget.onOptions(value);
+                        },
+                        itemBuilder: (_) => const [
+                          PopupMenuItem(
+                            value: 'label',
+                            child: Text('Update Tag'),
+                          ),
+                          PopupMenuItem(value: 'rename', child: Text('Rename')),
+                          PopupMenuItem(value: 'delete', child: Text('Delete')),
+                          PopupMenuItem(
+                            value: 'properties',
+                            child: Text('Properties'),
+                          ),
+                        ],
                       ),
                     ),
                   ),
-              ],
+                ),
+              if (isNew) Positioned.fill(child: _newVideoBorder(6)),
+            ],
+          ),
+        ),
+        SizedBox(height: fontScaledSpacing(context, 4)),
+        _VideoNameText(name: name, settings: settings, color: nameColor),
+        if (details.isNotEmpty)
+          Padding(
+            padding: EdgeInsets.only(top: fontScaledSpacing(context, 2)),
+            child: Text(details.join(' · '), style: _detailStyle(theme)),
+          ),
+        if (settings.showPath)
+          Padding(
+            padding: EdgeInsets.only(top: fontScaledSpacing(context, 1)),
+            child: MarqueeText(
+              path,
+              style: _pathStyle(theme),
+              styleMode: MarqueeStyle.pauseAndLoop,
             ),
           ),
-          SizedBox(height: fontScaledSpacing(context, 4)),
-          _VideoNameText(name: name, settings: settings, color: nameColor),
-          if (details.isNotEmpty)
-            Padding(
-              padding: EdgeInsets.only(top: fontScaledSpacing(context, 2)),
-              child: Text(details.join(' · '), style: _detailStyle(theme)),
-            ),
-          if (settings.showPath)
-            Padding(
-              padding: EdgeInsets.only(top: fontScaledSpacing(context, 1)),
-              child: MarqueeText(
-                path,
-                style: _pathStyle(theme),
-                styleMode: MarqueeStyle.pauseAndLoop,
-              ),
-            ),
-          if (duration != null && !settings.displayLengthOverThumbnail)
-            Align(
-              alignment: Alignment.centerRight,
-              child: Text(duration, style: _detailStyle(theme)),
-            ),
-        ],
-      ),
+        if (duration != null && !settings.displayLengthOverThumbnail)
+          Align(
+            alignment: Alignment.centerRight,
+            child: Text(duration, style: _detailStyle(theme)),
+          ),
+      ],
     );
   }
 
@@ -2112,10 +2671,17 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
 
     final nameColor = switch (_record?.status) {
       VideoStatus.lastPlayed => theme.colorScheme.error,
-      VideoStatus.inProgress => theme.colorScheme.primary,
-      VideoStatus.finished => theme.colorScheme.onSurfaceVariant,
+      VideoStatus.inProgress =>
+        theme.brightness == Brightness.dark
+            ? Colors.lightBlue.shade400
+            : Colors.lightBlue.shade700,
+      VideoStatus.finished =>
+        theme.brightness == Brightness.dark
+            ? Colors.grey.shade700
+            : Colors.grey.shade600,
       _ => theme.colorScheme.onSurface,
     };
+    final isNew = _record?.status == VideoStatus.newVideo;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTapDown: (details) {
@@ -2147,16 +2713,10 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
           color: widget.selected
               ? theme.colorScheme.secondaryContainer.withValues(alpha: 0.35)
               : null,
-          border: _record?.status == VideoStatus.newVideo
-              ? Border(
-                  left: BorderSide(color: theme.colorScheme.error, width: 6),
-                )
-              : null,
         ),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const SizedBox(width: 3),
             Expanded(
               child: Padding(
                 padding: EdgeInsets.symmetric(
@@ -2172,6 +2732,7 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
                         details,
                         path,
                         duration,
+                        isNew,
                       )
                     : Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2229,6 +2790,8 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
                                       bottom: 2,
                                       child: _DurationBadge(duration: duration),
                                     ),
+                                  if (isNew)
+                                    Positioned.fill(child: _newVideoBorder(4)),
                                 ],
                               ),
                             )
@@ -2236,13 +2799,20 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
                             SizedBox(
                               width: 80,
                               height: 48,
-                              child: Icon(
-                                Icons.play_arrow,
-                                size: 20,
-                                color: fileTypeColor(
-                                  context,
-                                  FileTypeColor.video,
-                                ),
+                              child: Stack(
+                                fit: StackFit.expand,
+                                children: [
+                                  Icon(
+                                    Icons.play_arrow,
+                                    size: 20,
+                                    color: fileTypeColor(
+                                      context,
+                                      FileTypeColor.video,
+                                    ),
+                                  ),
+                                  if (isNew)
+                                    Positioned.fill(child: _newVideoBorder(4)),
+                                ],
                               ),
                             ),
                           const SizedBox(width: 10),
@@ -2288,10 +2858,14 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
                             SizedBox(
                               width: 32,
                               height: 48,
-                              child: PopupMenuButton<String>(
-                                tooltip: 'Video options',
-                                padding: EdgeInsets.zero,
-                                iconSize: 20,
+                              child: ContentSizedMenuButton<String>(
+                                builder: (context, openMenu) => IconButton(
+                                  tooltip: 'Video options',
+                                  padding: EdgeInsets.zero,
+                                  iconSize: 20,
+                                  onPressed: openMenu,
+                                  icon: const Icon(Icons.more_vert),
+                                ),
                                 onOpened: () => widget.onMenuStateChanged(true),
                                 onCanceled: () =>
                                     widget.onMenuStateChanged(false),
@@ -2301,8 +2875,8 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
                                 },
                                 itemBuilder: (_) => const [
                                   PopupMenuItem(
-                                    value: 'properties',
-                                    child: Text('Properties'),
+                                    value: 'label',
+                                    child: Text('Update Tag'),
                                   ),
                                   PopupMenuItem(
                                     value: 'rename',
@@ -2313,11 +2887,10 @@ class _VideoFileRowState extends ConsumerState<_VideoFileRow> {
                                     child: Text('Delete'),
                                   ),
                                   PopupMenuItem(
-                                    value: 'label',
-                                    child: Text('Update tag'),
+                                    value: 'properties',
+                                    child: Text('Properties'),
                                   ),
                                 ],
-                                icon: const Icon(Icons.more_vert),
                               ),
                             ),
                         ],
@@ -2388,65 +2961,62 @@ class _VideoFolderRow extends StatelessWidget {
         child: isGrid
             ? Padding(
                 padding: const EdgeInsets.all(8),
-                child: SizedBox(
-                  height: 254,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      SizedBox(
-                        height: ((gridCellWidth ?? 220) - 16) * 9 / 16,
-                        child: Stack(
-                          children: [
-                            Center(
-                              child: Icon(
-                                Icons.folder_outlined,
-                                size: 64,
-                                color: fileTypeColor(
-                                  context,
-                                  FileTypeColor.folder,
-                                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    SizedBox(
+                      height: ((gridCellWidth ?? 220) - 16) * 9 / 16,
+                      child: Stack(
+                        children: [
+                          Center(
+                            child: Icon(
+                              Icons.folder_outlined,
+                              size: 64,
+                              color: fileTypeColor(
+                                context,
+                                FileTypeColor.folder,
                               ),
                             ),
-                            if (newVideoCount > 0)
-                              Positioned(
-                                top: 4,
-                                right: 4,
-                                child: _NewVideosBadge(count: newVideoCount),
+                          ),
+                          if (newVideoCount > 0)
+                            Positioned(
+                              top: 4,
+                              right: 4,
+                              child: _NewVideosBadge(count: newVideoCount),
+                            ),
+                          if (selectionMode)
+                            Positioned(
+                              top: 0,
+                              left: 0,
+                              child: Checkbox(
+                                value: selected,
+                                onChanged: (_) => onTap(),
+                                visualDensity: VisualDensity.compact,
                               ),
-                            if (selectionMode)
-                              Positioned(
-                                top: 0,
-                                left: 0,
-                                child: Checkbox(
-                                  value: selected,
-                                  onChanged: (_) => onTap(),
-                                  visualDensity: VisualDensity.compact,
-                                ),
-                              ),
-                          ],
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    _VideoNameText(name: name, settings: settings),
+                    if (details.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Text(
+                          details.join(' · '),
+                          style: _detailStyle(theme),
                         ),
                       ),
-                      const SizedBox(height: 4),
-                      _VideoNameText(name: name, settings: settings),
-                      if (details.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 2),
-                          child: Text(
-                            details.join(' · '),
-                            style: _detailStyle(theme),
-                          ),
+                    if (settings.showPath)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 1),
+                        child: MarqueeText(
+                          path,
+                          style: _pathStyle(theme),
+                          styleMode: MarqueeStyle.pauseAndLoop,
                         ),
-                      if (settings.showPath)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 1),
-                          child: MarqueeText(
-                            path,
-                            style: _pathStyle(theme),
-                            styleMode: MarqueeStyle.pauseAndLoop,
-                          ),
-                        ),
-                    ],
-                  ),
+                      ),
+                  ],
                 ),
               )
             : Padding(

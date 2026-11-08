@@ -1,14 +1,17 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../data/datasources/android/android_video_repository.dart';
 import '../../data/datasources/android/android_video_player_controller.dart';
+import '../filesystem/file_change_notifier.dart';
 import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/video_library_scan.dart';
 import '../../domain/entities/video_path_properties.dart';
 import '../../domain/entities/video_file.dart';
+import '../../domain/entities/video_folder.dart';
 import '../../domain/entities/video_index_record.dart';
 import '../../domain/repositories/video_repository.dart';
 import '../../domain/repositories/video_player_repository.dart';
@@ -141,7 +144,9 @@ final videoStatusRefreshProvider = StateProvider<int>((ref) => 0);
 final videoStatusRecordsProvider = FutureProvider.autoDispose
     .family<Map<String, VideoIndexRecord>, String>((ref, sessionId) async {
       ref.watch(videoStatusRefreshProvider);
-      final library = ref.watch(videoTabProvider(sessionId)).library;
+      final library = ref.watch(
+        videoTabProvider(sessionId).select((state) => state.library),
+      );
       if (library == null) return const {};
       return ref
           .watch(videoInformationProvider)
@@ -486,13 +491,20 @@ class VideoLibraryTabState {
 }
 
 class VideoTabController extends StateNotifier<VideoLibraryTabState> {
-  VideoTabController(this._scanLibrary, this._extensions, this._repository)
-    : super(const VideoLibraryTabState());
+  VideoTabController(
+    this._scanLibrary,
+    this._extensions,
+    this._repository, {
+    this._loadSnapshot,
+  }) : super(const VideoLibraryTabState());
 
   final Future<VideoLibraryScan?> Function(Set<String> extensions) _scanLibrary;
   final Future<Set<String>> Function() _extensions;
   final VideoRepository _repository;
+  final Future<VideoLibraryScan?> Function(Set<String> extensions)?
+  _loadSnapshot;
   bool _loadStarted = false;
+  bool _scanInProgress = false;
 
   Future<void> load({
     required bool permissionGranted,
@@ -507,25 +519,170 @@ class VideoTabController extends StateNotifier<VideoLibraryTabState> {
       requestedDriveId: initialDriveId,
       requestedPath: initialRelativePath,
       settings: settings,
+      useCachedSnapshot: true,
     );
   }
 
-  Future<void> refresh({
+  Future<bool> refresh({
     required bool permissionGranted,
     required VideoPageSettings settings,
+    bool showLoading = false,
   }) => _scan(
     permissionGranted: permissionGranted,
     requestedDriveId: state.library?.drive.id,
     requestedPath: state.folderPath,
     settings: settings,
+    showLoading: showLoading,
+    useCachedSnapshot: false,
   );
 
-  Future<void> _scan({
+  Future<void> applyFileChanges(FileChangeEvent event) async {
+    final library = state.library;
+    if (library == null) return;
+    final root = library.drive.path
+        .replaceAll('\\', '/')
+        .replaceAll(RegExp(r'/+$'), '');
+    String? relativePath(String? path) {
+      if (path == null) return null;
+      final normalized = path.replaceAll('\\', '/');
+      if (normalized == root) return '';
+      if (!normalized.startsWith('$root/')) return null;
+      return normalized.substring(root.length + 1);
+    }
+
+    String replacePrefix(String value, String oldPrefix, String newPrefix) =>
+        value == oldPrefix
+        ? newPrefix
+        : '$newPrefix${value.substring(oldPrefix.length)}';
+
+    var videos = List<VideoFile>.of(library.videos);
+    var folders = List<VideoFolder>.of(library.folders);
+    for (final change in event.changes) {
+      if (change.kind == FileChangeKind.deleted ||
+          (change.kind == FileChangeKind.refreshRequired &&
+              change.path != null)) {
+        final removed = relativePath(change.path);
+        if (removed == null) continue;
+        await _repository.forgetPath(
+          driveId: library.drive.id,
+          relativePath: removed,
+        );
+        videos.removeWhere(
+          (video) =>
+              video.relativePath == removed ||
+              video.relativePath.startsWith('$removed/'),
+        );
+        folders.removeWhere(
+          (folder) =>
+              folder.relativePath == removed ||
+              folder.relativePath.startsWith('$removed/'),
+        );
+      } else if (change.kind == FileChangeKind.renamed) {
+        final oldPath = relativePath(change.oldPath);
+        final newPath = relativePath(change.newPath);
+        if (oldPath == null || newPath == null) continue;
+        for (final video in videos.where(
+          (video) =>
+              video.relativePath == oldPath ||
+              video.relativePath.startsWith('$oldPath/'),
+        )) {
+          final movedPath = replacePrefix(video.relativePath, oldPath, newPath);
+          final name = movedPath.split('/').last;
+          final dot = name.lastIndexOf('.');
+          await _repository.moveRecord(
+            video,
+            VideoFile(
+              driveId: video.driveId,
+              relativePath: movedPath,
+              name: name,
+              extension: dot < 0 ? '' : name.substring(dot).toLowerCase(),
+              size: video.size,
+              modified: video.modified,
+              isHidden: movedPath
+                  .split('/')
+                  .any((part) => part.startsWith('.')),
+              isInsideNomedia: video.isInsideNomedia,
+            ),
+          );
+        }
+        videos = videos.map((video) {
+          if (video.relativePath != oldPath &&
+              !video.relativePath.startsWith('$oldPath/')) {
+            return video;
+          }
+          final movedPath = replacePrefix(video.relativePath, oldPath, newPath);
+          final name = movedPath.split('/').last;
+          final dot = name.lastIndexOf('.');
+          return VideoFile(
+            driveId: video.driveId,
+            relativePath: movedPath,
+            name: name,
+            extension: dot < 0 ? '' : name.substring(dot).toLowerCase(),
+            size: video.size,
+            modified: video.modified,
+            isHidden: movedPath.split('/').any((part) => part.startsWith('.')),
+            isInsideNomedia: video.isInsideNomedia,
+          );
+        }).toList();
+        folders = folders.map((folder) {
+          if (folder.relativePath != oldPath &&
+              !folder.relativePath.startsWith('$oldPath/')) {
+            return folder;
+          }
+          final movedPath = replacePrefix(
+            folder.relativePath,
+            oldPath,
+            newPath,
+          );
+          return VideoFolder(
+            driveId: folder.driveId,
+            relativePath: movedPath,
+            name: movedPath.split('/').last,
+            isHidden: movedPath.split('/').any((part) => part.startsWith('.')),
+            isInsideNomedia: folder.isInsideNomedia,
+            modified: folder.modified,
+          );
+        }).toList();
+      }
+    }
+    folders = await _foldersForVideos(videos, folders);
+    if (state.library != library) return;
+    final updatedLibrary = VideoLibraryScan(
+      drive: library.drive,
+      videos: videos,
+      folders: folders,
+    );
+    state = state.copyWith(library: updatedLibrary, clearError: true);
+  }
+
+  Future<List<VideoFolder>> _foldersForVideos(
+    List<VideoFile> videos,
+    List<VideoFolder> existing,
+  ) async {
+    final timer = Stopwatch()..start();
+    final folders = await compute(
+      _buildFoldersForVideos,
+      (videos: videos, existing: existing),
+    );
+    if (kDebugMode) {
+      debugPrint(
+        'Video folder tree build: ${timer.elapsedMicroseconds}us '
+        '(${videos.length} videos, ${folders.length} folders)',
+      );
+    }
+    return folders;
+  }
+
+  Future<bool> _scan({
     required bool permissionGranted,
     required String? requestedDriveId,
     required String requestedPath,
     required VideoPageSettings settings,
+    bool showLoading = true,
+    bool useCachedSnapshot = false,
   }) async {
+    if (_scanInProgress) return false;
+    _scanInProgress = true;
     if (!permissionGranted) {
       state = state.copyWith(
         isLoading: false,
@@ -533,15 +690,59 @@ class VideoTabController extends StateNotifier<VideoLibraryTabState> {
         hasLoaded: true,
         clearError: true,
       );
-      return;
+      _scanInProgress = false;
+      return false;
     }
-    state = state.copyWith(
-      isLoading: true,
-      permissionDenied: false,
-      clearError: true,
-    );
     try {
-      final library = await _scanLibrary(await _extensions());
+      final extensions = await _extensions();
+      VideoLibraryScan? cachedLibrary;
+      if (useCachedSnapshot &&
+          _loadSnapshot != null &&
+          (requestedDriveId == null || requestedDriveId == 'internal')) {
+        final snapshotTimer = Stopwatch()..start();
+        cachedLibrary = await _loadSnapshot(extensions);
+        if (kDebugMode) {
+          debugPrint(
+            'Video snapshot read: ${snapshotTimer.elapsedMicroseconds}us '
+            '(${cachedLibrary?.videos.length ?? 0} videos)',
+          );
+        }
+      }
+      if (cachedLibrary != null) {
+        cachedLibrary = VideoLibraryScan(
+          drive: cachedLibrary.drive,
+          videos: cachedLibrary.videos,
+          folders: await _foldersForVideos(cachedLibrary.videos, const []),
+        );
+        final visibleFolderPaths = _visibleFolderPaths(cachedLibrary, settings);
+        final requestedSegments = requestedPath
+            .replaceAll('\\', '/')
+            .split('/')
+            .where((segment) => segment.isNotEmpty)
+            .toList();
+        var restoredPath = requestedSegments.join('/');
+        while (restoredPath.isNotEmpty &&
+            !visibleFolderPaths.contains(restoredPath)) {
+          requestedSegments.removeLast();
+          restoredPath = requestedSegments.join('/');
+        }
+        state = state.copyWith(
+          library: cachedLibrary,
+          folderPath: restoredPath,
+          isLoading: false,
+          permissionDenied: false,
+          hasLoaded: true,
+          clearError: true,
+        );
+      }
+      state = state.copyWith(
+        isLoading: showLoading && cachedLibrary == null
+            ? true
+            : state.isLoading,
+        permissionDenied: false,
+        clearError: true,
+      );
+      final library = await _scanLibrary(extensions);
       if (library == null) {
         state = state.copyWith(
           library: null,
@@ -550,16 +751,26 @@ class VideoTabController extends StateNotifier<VideoLibraryTabState> {
           hasLoaded: true,
           error: StateError('Internal storage is unavailable.'),
         );
-        return;
+        return false;
       }
       await _repository.synchronizeSnapshot(library);
-      final requestedSegments = requestedPath
+      final snapshotRepository = _repository;
+      if (snapshotRepository is VideoLibrarySnapshotRepository) {
+        await (snapshotRepository as VideoLibrarySnapshotRepository)
+            .saveVideoLibrarySnapshot(library);
+      }
+      final liveState = state;
+      final liveDriveId = liveState.library?.drive.id ?? requestedDriveId;
+      final livePath = liveState.library == null
+          ? requestedPath
+          : liveState.folderPath;
+      final requestedSegments = livePath
           .replaceAll('\\', '/')
           .split('/')
           .where((segment) => segment.isNotEmpty)
           .toList();
       final canRestoreDrive =
-          requestedDriveId == null || requestedDriveId == library.drive.id;
+          liveDriveId == null || liveDriveId == library.drive.id;
       final visibleFolderPaths = _visibleFolderPaths(library, settings);
       var restorePath = canRestoreDrive ? requestedSegments.join('/') : '';
       while (restorePath.isNotEmpty &&
@@ -567,15 +778,27 @@ class VideoTabController extends StateNotifier<VideoLibraryTabState> {
         requestedSegments.removeLast();
         restorePath = requestedSegments.join('/');
       }
+      final locationAdjusted = restorePath != livePath;
+      final previousLibrary = liveState.library;
+      final libraryChanged = previousLibrary == null
+          ? true
+          : !await compute(
+              _sameVideoLibrary,
+              (left: previousLibrary, right: library),
+            );
       state = state.copyWith(
-        library: library,
+        library: libraryChanged ? library : previousLibrary,
         folderPath: restorePath,
         isLoading: false,
         hasLoaded: true,
         clearError: true,
       );
+      return locationAdjusted;
     } catch (error) {
       state = state.copyWith(isLoading: false, hasLoaded: true, error: error);
+      return false;
+    } finally {
+      _scanInProgress = false;
     }
   }
 
@@ -628,12 +851,84 @@ final videoTabProvider = StateNotifierProvider.autoDispose
             <String>{};
       }
 
+      final scanLibrary = ref.read(scanVideoLibraryProvider);
       return VideoTabController(
-        (extensions) => ref.read(scanVideoLibraryProvider)(extensions),
+        scanLibrary.call,
         videoExtensions,
         ref.read(videoRepositoryProvider),
+        loadSnapshot: scanLibrary.loadSnapshot,
       );
     });
+
+bool _sameVideoLibrary(
+  ({VideoLibraryScan left, VideoLibraryScan right}) input,
+) {
+  final left = input.left;
+  final right = input.right;
+  if (left.drive.id != right.drive.id ||
+      left.videos.length != right.videos.length ||
+      left.folders.length != right.folders.length) {
+    return false;
+  }
+  final rightVideos = {for (final video in right.videos) video.relativePath: video};
+  for (final video in left.videos) {
+    final other = rightVideos[video.relativePath];
+    if (other == null ||
+        video.name != other.name ||
+        video.extension != other.extension ||
+        video.size != other.size ||
+        video.modified != other.modified ||
+        video.isHidden != other.isHidden ||
+        video.isInsideNomedia != other.isInsideNomedia) {
+      return false;
+    }
+  }
+  final rightFolders = {
+    for (final folder in right.folders) folder.relativePath: folder,
+  };
+  for (final folder in left.folders) {
+    final other = rightFolders[folder.relativePath];
+    if (other == null ||
+        folder.name != other.name ||
+        folder.isHidden != other.isHidden ||
+        folder.isInsideNomedia != other.isInsideNomedia ||
+        folder.modified != other.modified) {
+      return false;
+    }
+  }
+  return true;
+}
+
+List<VideoFolder> _buildFoldersForVideos(
+  ({List<VideoFile> videos, List<VideoFolder> existing}) input,
+) {
+  final videos = input.videos;
+  final existing = input.existing;
+  final known = {for (final folder in existing) folder.relativePath: folder};
+  final paths = <String, VideoFile>{};
+  for (final video in videos) {
+    var folderPath = video.parentRelativePath;
+    while (folderPath.isNotEmpty) {
+      paths.putIfAbsent(folderPath, () => video);
+      final separator = folderPath.lastIndexOf('/');
+      folderPath = separator < 0 ? '' : folderPath.substring(0, separator);
+    }
+  }
+  return paths.entries.map((entry) {
+    final saved = known[entry.key];
+    if (saved != null) return saved;
+    final video = entry.value;
+    final segments = entry.key.split('/');
+    return VideoFolder(
+      driveId: video.driveId,
+      relativePath: entry.key,
+      name: segments.last,
+      isHidden: segments.any((segment) => segment.startsWith('.')),
+      isInsideNomedia: video.isInsideNomedia,
+      modified: video.modified,
+    );
+  }).toList();
+}
 
 Set<String> _visibleFolderPaths(
   VideoLibraryScan library,

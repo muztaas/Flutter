@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11,10 +13,14 @@ import '../../core/constants/branding.dart';
 import '../../core/utils/extension_parser.dart';
 import '../../core/utils/startup_page_order.dart';
 import '../../domain/entities/default_file_app.dart';
+import '../../domain/entities/file_system_entry.dart';
 import '../../domain/entities/file_type_category.dart';
 import '../../domain/entities/open_with_app.dart';
 import '../../domain/entities/storage_device.dart';
+import '../../domain/utils/storage_display_name.dart';
 import '../about/about_page.dart';
+import '../common/content_sized_menu.dart';
+import '../common/marquee_text.dart';
 import '../video/widgets/video_sort_picker.dart';
 
 const _appThemeChannel = MethodChannel('modi_file_explorer2/app_theme');
@@ -446,7 +452,7 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel>
                                           ),
                                           ExpansionTile(
                                             title: Text(
-                                              'Files',
+                                              'Files and Folders',
                                               key: ValueKey(
                                                 'settings-files-${settings.fontSize}',
                                               ),
@@ -504,23 +510,6 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel>
                                               ),
                                               _SettingsSwitch(
                                                 title:
-                                                    'Hide Android folders in category pages',
-                                                value: settings
-                                                    .hideAndroidFoldersInCategoryPages,
-                                                onChanged: (value) => _saveSetting(
-                                                  context,
-                                                  () => ref
-                                                      .read(
-                                                        appSettingsProvider
-                                                            .notifier,
-                                                      )
-                                                      .setHideAndroidFoldersInCategoryPages(
-                                                        value,
-                                                      ),
-                                                ),
-                                              ),
-                                              _SettingsSwitch(
-                                                title:
                                                     'Show .nomedia files in Recent',
                                                 value: settings
                                                     .showNomediaFilesInRecent,
@@ -555,6 +544,23 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel>
                                               ),
                                               _SettingsSwitch(
                                                 title:
+                                                    'Hide Android folders in category pages',
+                                                value: settings
+                                                    .hideAndroidFoldersInCategoryPages,
+                                                onChanged: (value) => _saveSetting(
+                                                  context,
+                                                  () => ref
+                                                      .read(
+                                                        appSettingsProvider
+                                                            .notifier,
+                                                      )
+                                                      .setHideAndroidFoldersInCategoryPages(
+                                                        value,
+                                                      ),
+                                                ),
+                                              ),
+                                              _SettingsSwitch(
+                                                title:
                                                     'Show Android folder files in Recent',
                                                 value: settings
                                                     .showAndroidFolderFilesInRecent,
@@ -569,6 +575,11 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel>
                                                         value,
                                                       ),
                                                 ),
+                                              ),
+                                              _BlackAndWhiteListsSection(
+                                                saveSetting: _saveSetting,
+                                                tabHeaderHeight:
+                                                    _tabHeaderHeight,
                                               ),
                                               _DefaultAppsSection(
                                                 saveSetting: _saveSetting,
@@ -649,21 +660,21 @@ class _SettingsPanelState extends ConsumerState<SettingsPanel>
                                                       : null,
                                                 ),
                                               ),
-                                              ListTile(
-                                                title: const Text('About'),
-                                                onTap: () {
-                                                  Navigator.of(context).push(
-                                                    MaterialPageRoute(
-                                                      builder: (_) =>
-                                                          const AboutPage(),
-                                                    ),
-                                                  );
-                                                },
-                                              ),
                                             ],
                                           ),
                                           _VideoSettingsSection(
                                             saveSetting: _saveSetting,
+                                          ),
+                                          ListTile(
+                                            title: const Text('About'),
+                                            onTap: () {
+                                              Navigator.of(context).push(
+                                                MaterialPageRoute(
+                                                  builder: (_) =>
+                                                      const AboutPage(),
+                                                ),
+                                              );
+                                            },
                                           ),
                                         ],
                                       ),
@@ -754,45 +765,14 @@ class _TabSettingsSection extends ConsumerWidget {
             },
           ),
         ),
-        ListTile(
-          title: const Text('Always open these tabs on startup'),
-          subtitle: Wrap(
-            spacing: 4,
-            runSpacing: 4,
-            children: [
-              for (final page in orderedAlwaysOpenTabs)
-                InputChip(
-                  label: Text(_startupLabel(page, devices)),
-                  onDeleted: () {
-                    final pages = [...orderedAlwaysOpenTabs]..remove(page);
-                    saveSetting(
-                      context,
-                      () => ref
-                          .read(appSettingsProvider.notifier)
-                          .setAlwaysOpenTabs(pages),
-                    );
-                  },
-                ),
-              PopupMenuButton<String>(
-                tooltip: 'Add startup tab',
-                onSelected: (page) => saveSetting(
-                  context,
-                  () => ref
-                      .read(appSettingsProvider.notifier)
-                      .setAlwaysOpenTabs([...orderedAlwaysOpenTabs, page]),
-                ),
-                itemBuilder: (context) => [
-                  for (final choice in alwaysOpenChoices.where(
-                    (choice) => !settings.alwaysOpenTabs.contains(choice.$1),
-                  ))
-                    PopupMenuItem(value: choice.$1, child: Text(choice.$2)),
-                ],
-                child: const Padding(
-                  padding: EdgeInsets.all(8),
-                  child: Icon(Icons.add),
-                ),
-              ),
-            ],
+        _AlwaysOpenTabsListSection(
+          pages: orderedAlwaysOpenTabs,
+          choices: alwaysOpenChoices,
+          devices: devices,
+          onSave: (pages) => saveSetting(
+            context,
+            () =>
+                ref.read(appSettingsProvider.notifier).setAlwaysOpenTabs(pages),
           ),
         ),
         ListTile(
@@ -808,6 +788,524 @@ class _TabSettingsSection extends ConsumerWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class _AlwaysOpenTabsListSection extends StatefulWidget {
+  const _AlwaysOpenTabsListSection({
+    required this.pages,
+    required this.choices,
+    required this.devices,
+    required this.onSave,
+  });
+
+  final List<String> pages;
+  final List<(String, String)> choices;
+  final List<StorageDevice> devices;
+  final Future<void> Function(List<String> pages) onSave;
+
+  @override
+  State<_AlwaysOpenTabsListSection> createState() =>
+      _AlwaysOpenTabsListSectionState();
+}
+
+class _AlwaysOpenTabsListSectionState
+    extends State<_AlwaysOpenTabsListSection> {
+  bool _isListExpanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = widget.pages;
+    final availableChoices = widget.choices
+        .where((choice) => !pages.contains(choice.$1))
+        .toList(growable: false);
+    final listHeight = (pages.length * 56.0).clamp(0.0, 5 * 56.0);
+    return Column(
+      children: [
+        ListTile(
+          title: const Text('Always open these tabs on startup'),
+          subtitle: _isListExpanded ? Text('${pages.length} tabs') : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: _isListExpanded
+                    ? 'Hide startup tabs'
+                    : 'Show startup tabs',
+                onPressed: () =>
+                    setState(() => _isListExpanded = !_isListExpanded),
+                icon: Icon(
+                  _isListExpanded
+                      ? Icons.keyboard_arrow_up
+                      : Icons.keyboard_arrow_down,
+                ),
+              ),
+              ContentSizedMenuButton<String>(
+                builder: (context, openMenu) => IconButton(
+                  tooltip: 'Add startup tab',
+                  onPressed: availableChoices.isEmpty ? null : openMenu,
+                  icon: const Icon(Icons.add),
+                ),
+                onSelected: (page) => widget.onSave([...pages, page]),
+                itemBuilder: (context) => [
+                  for (final choice in availableChoices)
+                    PopupMenuItem(value: choice.$1, child: Text(choice.$2)),
+                ],
+              ),
+            ],
+          ),
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 200),
+          alignment: Alignment.topCenter,
+          child: _isListExpanded && pages.isNotEmpty
+              ? SizedBox(
+                  height: listHeight,
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemExtent: 56,
+                    itemCount: pages.length,
+                    itemBuilder: (context, index) {
+                      final page = pages[index];
+                      return ListTile(
+                        dense: true,
+                        title: MarqueeText(
+                          _startupLabel(page, widget.devices),
+                          style: Theme.of(context).textTheme.bodyMedium,
+                          styleMode: MarqueeStyle.pauseAndLoop,
+                        ),
+                        trailing: IconButton(
+                          tooltip: 'Remove startup tab',
+                          icon: const Icon(Icons.close),
+                          onPressed: () {
+                            final remaining = [...pages]..remove(page);
+                            widget.onSave(remaining);
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
+      ],
+    );
+  }
+}
+
+class _BlackAndWhiteListsSection extends ConsumerWidget {
+  const _BlackAndWhiteListsSection({
+    required this.saveSetting,
+    required this.tabHeaderHeight,
+  });
+
+  final Future<void> Function(
+    BuildContext context,
+    Future<void> Function() save,
+  )
+  saveSetting;
+  final double tabHeaderHeight;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settings = ref.watch(appSettingsProvider);
+    return ExpansionTile(
+      title: const Text('Black and White lists'),
+      children: [
+        _PathListSection(
+          title: 'Black list',
+          paths: settings.blacklistedPaths,
+          saveSetting: saveSetting,
+          tabHeaderHeight: tabHeaderHeight,
+          save: ref.read(appSettingsProvider.notifier).setBlacklistedPaths,
+        ),
+        _PathListSection(
+          title: 'White list',
+          paths: settings.whitelistedPaths,
+          saveSetting: saveSetting,
+          tabHeaderHeight: tabHeaderHeight,
+          save: ref.read(appSettingsProvider.notifier).setWhitelistedPaths,
+        ),
+      ],
+    );
+  }
+}
+
+class _PathListSection extends StatefulWidget {
+  const _PathListSection({
+    required this.title,
+    required this.paths,
+    required this.saveSetting,
+    required this.tabHeaderHeight,
+    required this.save,
+  });
+
+  final String title;
+  final List<String> paths;
+  final Future<void> Function(
+    BuildContext context,
+    Future<void> Function() save,
+  )
+  saveSetting;
+  final double tabHeaderHeight;
+  final Future<void> Function(List<String>) save;
+
+  @override
+  State<_PathListSection> createState() => _PathListSectionState();
+}
+
+class _PathListSectionState extends State<_PathListSection> {
+  bool _isListExpanded = false;
+
+  Future<void> _addPath(BuildContext context) async {
+    if (widget.paths.length >= 99) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${widget.title} can contain up to 99 items.')),
+      );
+      return;
+    }
+    final picked = await showDialog<_PickedPath>(
+      context: context,
+      barrierDismissible: true,
+      useSafeArea: false,
+      builder: (_) => _PathPickerDialog(
+        tabHeaderHeight: widget.tabHeaderHeight,
+        existingPaths: widget.paths,
+      ),
+    );
+    if (picked == null || !context.mounted) return;
+    await widget.saveSetting(
+      context,
+      () => widget.save([...widget.paths, picked.path]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final paths = widget.paths;
+    final maxListHeight = 5 * 56.0;
+    final listHeight = (paths.length * 56.0).clamp(0.0, maxListHeight);
+    return Column(
+      children: [
+        ListTile(
+          title: Text(widget.title),
+          subtitle: _isListExpanded ? Text('${paths.length}/99') : null,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: _isListExpanded
+                    ? 'Hide ${widget.title.toLowerCase()} items'
+                    : 'Show ${widget.title.toLowerCase()} items',
+                onPressed: () =>
+                    setState(() => _isListExpanded = !_isListExpanded),
+                icon: Icon(
+                  _isListExpanded
+                      ? Icons.keyboard_arrow_up
+                      : Icons.keyboard_arrow_down,
+                ),
+              ),
+              IconButton(
+                tooltip: 'Add to ${widget.title}',
+                onPressed: paths.length >= 99 ? null : () => _addPath(context),
+                icon: const Icon(Icons.add),
+              ),
+            ],
+          ),
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 200),
+          alignment: Alignment.topCenter,
+          child: _isListExpanded && paths.isNotEmpty
+              ? SizedBox(
+                  height: listHeight,
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemExtent: 56,
+                    itemCount: paths.length,
+                    itemBuilder: (context, index) {
+                      final path = paths[index];
+                      return ListTile(
+                        dense: true,
+                        title: MarqueeText(
+                          path,
+                          style: Theme.of(context).textTheme.bodyMedium,
+                          styleMode: MarqueeStyle.pauseAndLoop,
+                        ),
+                        trailing: IconButton(
+                          tooltip: 'Remove from ${widget.title}',
+                          icon: const Icon(Icons.close),
+                          onPressed: () {
+                            final next = [...paths]..remove(path);
+                            widget.saveSetting(
+                              context,
+                              () => widget.save(next),
+                            );
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
+      ],
+    );
+  }
+}
+
+class _PickedPath {
+  const _PickedPath(this.path);
+
+  final String path;
+}
+
+class _PathPickerDialog extends ConsumerStatefulWidget {
+  const _PathPickerDialog({
+    required this.tabHeaderHeight,
+    required this.existingPaths,
+  });
+
+  final double tabHeaderHeight;
+  final List<String> existingPaths;
+
+  @override
+  ConsumerState<_PathPickerDialog> createState() => _PathPickerDialogState();
+}
+
+class _PathPickerDialogState extends ConsumerState<_PathPickerDialog> {
+  List<StorageDevice> _drives = const [];
+  List<FileSystemEntry> _entries = const [];
+  StorageDevice? _drive;
+  String? _path;
+  String? _error;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadDrives());
+  }
+
+  Future<void> _loadDrives() async {
+    try {
+      final drives = await ref
+          .read(storageRepositoryProvider)
+          .listStorageDevices(includeUsage: false);
+      if (!mounted) return;
+      setState(() {
+        _drives = drives;
+        _loading = false;
+        _error = drives.isEmpty ? 'No storage drives are available.' : null;
+      });
+      if (drives.length == 1) {
+        await _openDirectory(drives.single, drives.single.path);
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Could not list storage drives: $error';
+      });
+    }
+  }
+
+  Future<void> _openDirectory(StorageDevice drive, String path) async {
+    setState(() {
+      _drive = drive;
+      _path = path;
+      _loading = true;
+      _error = null;
+      _entries = const [];
+    });
+    try {
+      final entries = await ref
+          .read(storageRepositoryProvider)
+          .listDirectory(path);
+      entries.sort((left, right) {
+        if (left.isDirectory != right.isDirectory) {
+          return left.isDirectory ? -1 : 1;
+        }
+        return left.name.toLowerCase().compareTo(right.name.toLowerCase());
+      });
+      if (!mounted) return;
+      setState(() {
+        _entries = entries;
+        _loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Could not read this folder: $error';
+      });
+    }
+  }
+
+  bool _samePath(String left, String right) =>
+      left
+          .replaceAll('\\', '/')
+          .replaceFirst(RegExp(r'/+$'), '')
+          .toLowerCase() ==
+      right
+          .replaceAll('\\', '/')
+          .replaceFirst(RegExp(r'/+$'), '')
+          .toLowerCase();
+
+  String? get _parentPath {
+    final path = _path;
+    final drive = _drive;
+    if (path == null || drive == null || _samePath(path, drive.path)) {
+      return null;
+    }
+    final normalized = path
+        .replaceAll('\\', '/')
+        .replaceFirst(RegExp(r'/+$'), '');
+    final separator = normalized.lastIndexOf('/');
+    if (separator < 0) return drive.path;
+    final parent = normalized.substring(0, separator);
+    return parent.isEmpty ? '/' : parent;
+  }
+
+  void _goBack() {
+    final parent = _parentPath;
+    if (parent != null && _drive != null) {
+      unawaited(_openDirectory(_drive!, parent));
+      return;
+    }
+    setState(() {
+      _drive = null;
+      _path = null;
+      _entries = const [];
+    });
+  }
+
+  void _selectPath(String path) {
+    Navigator.of(context).pop(_PickedPath(path));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screen = MediaQuery.sizeOf(context);
+    final viewPadding = MediaQuery.viewPaddingOf(context);
+    final topOffset = viewPadding.top + widget.tabHeaderHeight;
+    final availableHeight = (screen.height - topOffset - viewPadding.bottom)
+        .clamp(0.0, double.infinity);
+    final width = screen.width * 0.8;
+    final height = availableHeight * 0.8;
+    final bottomInset = viewPadding.bottom + availableHeight * 0.2;
+    final showBack =
+        _path != null && (_parentPath != null || _drives.length > 1);
+    final rowCount = _path == null ? _drives.length : _entries.length;
+    return Dialog(
+      alignment: Alignment.topCenter,
+      insetPadding: EdgeInsets.fromLTRB(
+        screen.width * 0.1,
+        topOffset,
+        screen.width * 0.1,
+        bottomInset,
+      ),
+      constraints: BoxConstraints(
+        minWidth: width,
+        maxWidth: width,
+        minHeight: height,
+        maxHeight: height,
+      ),
+      child: SizedBox(
+        width: width,
+        height: height,
+        child: Column(
+          children: [
+            if (showBack)
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.arrow_back),
+                title: MarqueeText(
+                  _parentPath == null
+                      ? 'Storage drives'
+                      : storageDisplayName(path: _parentPath!),
+                  style: Theme.of(context).textTheme.bodyMedium,
+                  styleMode: MarqueeStyle.pauseAndLoop,
+                ),
+                onTap: _goBack,
+              ),
+            Expanded(
+              child: _loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _error != null
+                  ? Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Text(_error!),
+                      ),
+                    )
+                  : Scrollbar(
+                      thumbVisibility: rowCount > 4,
+                      child: ListView.builder(
+                        itemExtent: 48,
+                        itemCount: rowCount,
+                        itemBuilder: (context, index) {
+                          if (_path == null) {
+                            final drive = _drives[index];
+                            return ListTile(
+                              dense: true,
+                              leading: const Icon(Icons.sd_storage_outlined),
+                              title: MarqueeText(
+                                storageDisplayName(
+                                  path: drive.path,
+                                  drive: drive,
+                                ),
+                                style: Theme.of(context).textTheme.bodyMedium,
+                                styleMode: MarqueeStyle.pauseAndLoop,
+                              ),
+                              onTap: () =>
+                                  unawaited(_openDirectory(drive, drive.path)),
+                            );
+                          }
+                          final entry = _entries[index];
+                          final alreadyAdded = widget.existingPaths.any(
+                            (path) => _samePath(path, entry.path),
+                          );
+                          return ListTile(
+                            dense: true,
+                            leading: Icon(
+                              entry.isDirectory
+                                  ? Icons.folder_outlined
+                                  : Icons.insert_drive_file_outlined,
+                            ),
+                            title: MarqueeText(
+                              entry.name,
+                              style: Theme.of(context).textTheme.bodyMedium,
+                              styleMode: MarqueeStyle.pauseAndLoop,
+                            ),
+                            trailing: SizedBox(
+                              width: width * 0.16,
+                              child: IconButton(
+                                tooltip: alreadyAdded
+                                    ? 'Already in this list'
+                                    : entry.isDirectory
+                                    ? 'Add folder'
+                                    : 'Add file',
+                                icon: const Icon(Icons.add),
+                                onPressed: alreadyAdded
+                                    ? null
+                                    : () => _selectPath(entry.path),
+                              ),
+                            ),
+                            onTap: entry.isDirectory
+                                ? () => unawaited(
+                                    _openDirectory(_drive!, entry.path),
+                                  )
+                                : null,
+                          );
+                        },
+                      ),
+                    ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -851,6 +1349,9 @@ class _VideoSettingsSection extends ConsumerWidget {
     final fontSize = ref.watch(appSettingsProvider).fontSize;
     final controller = ref.read(videoPageSettingsProvider.notifier);
     final headingStyle = Theme.of(context).textTheme.titleMedium;
+    final choiceStyle = headingStyle?.copyWith(
+      fontSize: (headingStyle.fontSize ?? 14) - 2,
+    );
     Future<void> update(VideoPageSettings next) =>
         saveSetting(context, () => controller.update(next));
 
@@ -905,8 +1406,15 @@ class _VideoSettingsSection extends ConsumerWidget {
                 children: [
                   ChoiceChip(
                     avatar: const Icon(Icons.view_list, size: 16),
-                    label: Text('List', style: headingStyle),
+                    label: Text('List', style: choiceStyle),
                     selected: settings.layout == 'list',
+                    showCheckmark: false,
+                    selectedColor: Color.alphaBlend(
+                      Theme.of(
+                        context,
+                      ).colorScheme.primary.withValues(alpha: 0.12),
+                      Theme.of(context).colorScheme.secondaryContainer,
+                    ),
                     onSelected: (_) =>
                         update(settings.copyWith(layout: 'list')),
                     visualDensity: VisualDensity.compact,
@@ -915,8 +1423,15 @@ class _VideoSettingsSection extends ConsumerWidget {
                   ),
                   ChoiceChip(
                     avatar: const Icon(Icons.grid_view, size: 16),
-                    label: Text('Grid', style: headingStyle),
+                    label: Text('Grid', style: choiceStyle),
                     selected: settings.layout == 'grid',
+                    showCheckmark: false,
+                    selectedColor: Color.alphaBlend(
+                      Theme.of(
+                        context,
+                      ).colorScheme.primary.withValues(alpha: 0.12),
+                      Theme.of(context).colorScheme.secondaryContainer,
+                    ),
                     onSelected: (_) =>
                         update(settings.copyWith(layout: 'grid')),
                     visualDensity: VisualDensity.compact,
@@ -1119,10 +1634,19 @@ class _VideoModeChoice extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final headingStyle = Theme.of(context).textTheme.titleMedium;
+    final choiceStyle = headingStyle?.copyWith(
+      fontSize: (headingStyle.fontSize ?? 14) - 2,
+    );
+    final colorScheme = Theme.of(context).colorScheme;
     return ChoiceChip(
       avatar: Icon(icon, size: 16),
-      label: Text(label, style: headingStyle),
+      label: Text(label, style: choiceStyle),
       selected: selected,
+      showCheckmark: false,
+      selectedColor: Color.alphaBlend(
+        colorScheme.primary.withValues(alpha: 0.12),
+        colorScheme.secondaryContainer,
+      ),
       onSelected: (_) => onTap(),
       visualDensity: VisualDensity.compact,
       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -1386,8 +1910,18 @@ class _DefaultAppsSection extends ConsumerWidget {
         selected.packageName == DefaultFileApp.imageViewerHandlerId;
     final isVideoPlayer =
         selected.packageName == DefaultFileApp.videoPlayerHandlerId;
+    final isAudioPlayer =
+        selected.packageName == DefaultFileApp.audioPlayerHandlerId;
     final isArchiveManager =
         selected.packageName == DefaultFileApp.archiveManagerHandlerId;
+    final isPdfViewer =
+        selected.packageName == DefaultFileApp.pdfViewerHandlerId;
+    final isSpreadsheetViewer =
+        selected.packageName == DefaultFileApp.spreadsheetViewerHandlerId;
+    final isDocumentViewer =
+        selected.packageName == DefaultFileApp.documentViewerHandlerId;
+    final isPresentationViewer =
+        selected.packageName == DefaultFileApp.presentationViewerHandlerId;
     final distinctCategories = extensions
         .map(
           (extension) =>
@@ -1410,8 +1944,18 @@ class _DefaultAppsSection extends ConsumerWidget {
                   ? DefaultFileApp.imageViewerHandlerId
                   : isVideoPlayer
                   ? DefaultFileApp.videoPlayerHandlerId
+                  : isAudioPlayer
+                  ? DefaultFileApp.audioPlayerHandlerId
                   : isArchiveManager
                   ? DefaultFileApp.archiveManagerHandlerId
+                  : isPdfViewer
+                  ? DefaultFileApp.pdfViewerHandlerId
+                  : isSpreadsheetViewer
+                  ? DefaultFileApp.spreadsheetViewerHandlerId
+                  : isDocumentViewer
+                  ? DefaultFileApp.documentViewerHandlerId
+                  : isPresentationViewer
+                  ? DefaultFileApp.presentationViewerHandlerId
                   : 'external',
               category: distinctCategories.length == 1
                   ? distinctCategories.single
@@ -1421,21 +1965,36 @@ class _DefaultAppsSection extends ConsumerWidget {
                   isTextEditor ||
                       isImageViewer ||
                       isVideoPlayer ||
-                      isArchiveManager
+                      isAudioPlayer ||
+                      isArchiveManager ||
+                      isPdfViewer ||
+                      isSpreadsheetViewer ||
+                      isDocumentViewer ||
+                      isPresentationViewer
                   ? null
                   : selected.packageName,
               displayName:
                   isTextEditor ||
                       isImageViewer ||
                       isVideoPlayer ||
-                      isArchiveManager
+                      isAudioPlayer ||
+                      isArchiveManager ||
+                      isPdfViewer ||
+                      isSpreadsheetViewer ||
+                      isDocumentViewer ||
+                      isPresentationViewer
                   ? null
                   : selected.name,
               activityName:
                   isTextEditor ||
                       isImageViewer ||
                       isVideoPlayer ||
-                      isArchiveManager
+                      isAudioPlayer ||
+                      isArchiveManager ||
+                      isPdfViewer ||
+                      isSpreadsheetViewer ||
+                      isDocumentViewer ||
+                      isPresentationViewer
                   ? null
                   : selected.activityName,
               extensionSpecific: true,
@@ -1514,6 +2073,48 @@ class _DefaultAppsSection extends ConsumerWidget {
     }
 
     final choices = <OpenWithApp>[
+      if (extensions.every(
+        (extension) =>
+            FileTypeCategory.categoryForExtension(
+              extension,
+              categories: categories,
+            ) ==
+            'Audio',
+      ))
+        OpenWithApp(
+          name: 'Audio Player (built-in)',
+          packageName: DefaultFileApp.audioPlayerHandlerId,
+          mimeType: 'audio/*',
+          iconBytes: builtInIcon,
+        ),
+      if (extensions.every(
+            (extension) => extension == '.csv' || extension == '.tsv',
+          ) ||
+          extensions.every((extension) => extension == '.xlsx'))
+        OpenWithApp(
+          name: 'Spreadsheet Viewer (built-in)',
+          packageName: DefaultFileApp.spreadsheetViewerHandlerId,
+          mimeType: extensions.every((extension) => extension == '.xlsx')
+              ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+              : 'text/csv',
+          iconBytes: builtInIcon,
+        ),
+      if (extensions.length == 1 && extensions.single == '.docx')
+        OpenWithApp(
+          name: 'Document Viewer (built-in)',
+          packageName: DefaultFileApp.documentViewerHandlerId,
+          mimeType:
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          iconBytes: builtInIcon,
+        ),
+      if (extensions.length == 1 && extensions.single == '.pptx')
+        OpenWithApp(
+          name: 'Presentation Viewer (built-in)',
+          packageName: DefaultFileApp.presentationViewerHandlerId,
+          mimeType:
+              'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          iconBytes: builtInIcon,
+        ),
       OpenWithApp(
         name: 'Text Editor (built-in)',
         packageName: DefaultFileApp.textEditorHandlerId,
@@ -1552,6 +2153,13 @@ class _DefaultAppsSection extends ConsumerWidget {
           name: 'Archive Manager (built-in)',
           packageName: DefaultFileApp.archiveManagerHandlerId,
           mimeType: 'application/x-archive',
+          iconBytes: builtInIcon,
+        ),
+      if (extensions.length == 1 && extensions.single == '.pdf')
+        OpenWithApp(
+          name: 'PDF Viewer (built-in)',
+          packageName: DefaultFileApp.pdfViewerHandlerId,
+          mimeType: 'application/pdf',
           iconBytes: builtInIcon,
         ),
       ...appsByActivity.values,
@@ -1901,9 +2509,17 @@ class _CustomExtensionsDialogState extends State<_CustomExtensionsDialog> {
 
 String _defaultAppName(DefaultFileApp defaultApp) {
   if (defaultApp.isTextEditor) return 'Text Editor (built-in)';
+  if (defaultApp.isSpreadsheetViewer) {
+    return 'Spreadsheet Viewer (built-in)';
+  }
   if (defaultApp.isImageViewer) return 'Image Viewer (built-in)';
   if (defaultApp.isVideoPlayer) return 'Video Player (built-in)';
   if (defaultApp.isArchiveManager) return 'Archive Manager (built-in)';
+  if (defaultApp.isPdfViewer) return 'PDF Viewer (built-in)';
+  if (defaultApp.isDocumentViewer) return 'Document Viewer (built-in)';
+  if (defaultApp.isPresentationViewer) {
+    return 'Presentation Viewer (built-in)';
+  }
   return defaultApp.displayName?.trim().isNotEmpty == true
       ? defaultApp.displayName!
       : defaultApp.packageName ?? 'Unknown app';
@@ -2012,8 +2628,16 @@ class _DefaultFileAppTile extends ConsumerWidget {
     };
     final appName = defaultApp.isTextEditor
         ? Future<String?>.value('Text Editor (built-in)')
+        : defaultApp.isSpreadsheetViewer
+        ? Future<String?>.value('Spreadsheet Viewer (built-in)')
+        : defaultApp.isDocumentViewer
+        ? Future<String?>.value('Document Viewer (built-in)')
+        : defaultApp.isPresentationViewer
+        ? Future<String?>.value('Presentation Viewer (built-in)')
         : defaultApp.isImageViewer
         ? Future<String?>.value('Image Viewer (built-in)')
+        : defaultApp.isAudioPlayer
+        ? Future<String?>.value('Audio Player (built-in)')
         : defaultApp.activityName != null
         ? Future<String?>.value(defaultApp.displayName)
         : ref
@@ -2091,6 +2715,22 @@ class _DefaultFileAppTile extends ConsumerWidget {
       );
       return;
     }
+    Uint8List? audioPlayerIcon;
+    if (defaultApp.category == 'Audio') {
+      try {
+        audioPlayerIcon = await ref
+            .read(openWithRepositoryProvider)
+            .getOwnApplicationIcon();
+      } catch (error) {
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not load the built-in app icon: $error'),
+          ),
+        );
+        return;
+      }
+    }
     final choices = [
       if (defaultApp.category == 'Text')
         OpenWithApp(
@@ -2110,11 +2750,41 @@ class _DefaultFileAppTile extends ConsumerWidget {
           packageName: DefaultFileApp.videoPlayerHandlerId,
           mimeType: 'video/*',
         ),
+      if (defaultApp.category == 'Audio')
+        OpenWithApp(
+          name: 'Audio Player (built-in)',
+          packageName: DefaultFileApp.audioPlayerHandlerId,
+          mimeType: 'audio/*',
+          iconBytes: audioPlayerIcon,
+        ),
       if (defaultApp.category == 'Archives')
         OpenWithApp(
           name: 'Archive Manager (built-in)',
           packageName: DefaultFileApp.archiveManagerHandlerId,
           mimeType: 'application/x-archive',
+        ),
+      if (defaultApp.category == 'Documents' &&
+          defaultApp.matchedExtensions.contains('.pdf'))
+        OpenWithApp(
+          name: 'PDF Viewer (built-in)',
+          packageName: DefaultFileApp.pdfViewerHandlerId,
+          mimeType: 'application/pdf',
+        ),
+      if (defaultApp.category == 'Documents' &&
+          defaultApp.matchedExtensions.contains('.docx'))
+        OpenWithApp(
+          name: 'Document Viewer (built-in)',
+          packageName: DefaultFileApp.documentViewerHandlerId,
+          mimeType:
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        ),
+      if (defaultApp.category == 'Documents' &&
+          defaultApp.matchedExtensions.contains('.pptx'))
+        OpenWithApp(
+          name: 'Presentation Viewer (built-in)',
+          packageName: DefaultFileApp.presentationViewerHandlerId,
+          mimeType:
+              'application/vnd.openxmlformats-officedocument.presentationml.presentation',
         ),
       ...apps,
     ];
@@ -2182,8 +2852,16 @@ class _DefaultFileAppTile extends ConsumerWidget {
             app.packageName == DefaultFileApp.imageViewerHandlerId;
         final isVideoPlayer =
             app.packageName == DefaultFileApp.videoPlayerHandlerId;
+        final isAudioPlayer =
+            app.packageName == DefaultFileApp.audioPlayerHandlerId;
         final isArchiveManager =
             app.packageName == DefaultFileApp.archiveManagerHandlerId;
+        final isPdfViewer =
+            app.packageName == DefaultFileApp.pdfViewerHandlerId;
+        final isDocumentViewer =
+            app.packageName == DefaultFileApp.documentViewerHandlerId;
+        final isPresentationViewer =
+            app.packageName == DefaultFileApp.presentationViewerHandlerId;
         await ref
             .read(defaultFileAppsProvider.notifier)
             .save(
@@ -2195,8 +2873,16 @@ class _DefaultFileAppTile extends ConsumerWidget {
                     ? DefaultFileApp.imageViewerHandlerId
                     : isVideoPlayer
                     ? DefaultFileApp.videoPlayerHandlerId
+                    : isAudioPlayer
+                    ? DefaultFileApp.audioPlayerHandlerId
                     : isArchiveManager
                     ? DefaultFileApp.archiveManagerHandlerId
+                    : isPdfViewer
+                    ? DefaultFileApp.pdfViewerHandlerId
+                    : isDocumentViewer
+                    ? DefaultFileApp.documentViewerHandlerId
+                    : isPresentationViewer
+                    ? DefaultFileApp.presentationViewerHandlerId
                     : 'external',
                 category: defaultApp.category,
                 mimeType: app.mimeType,
@@ -2204,21 +2890,33 @@ class _DefaultFileAppTile extends ConsumerWidget {
                     isTextEditor ||
                         isImageViewer ||
                         isVideoPlayer ||
-                        isArchiveManager
+                        isAudioPlayer ||
+                        isArchiveManager ||
+                        isPdfViewer ||
+                        isDocumentViewer ||
+                        isPresentationViewer
                     ? null
                     : app.packageName,
                 displayName:
                     isTextEditor ||
                         isImageViewer ||
                         isVideoPlayer ||
-                        isArchiveManager
+                        isAudioPlayer ||
+                        isArchiveManager ||
+                        isPdfViewer ||
+                        isDocumentViewer ||
+                        isPresentationViewer
                     ? null
                     : app.name,
                 activityName:
                     isTextEditor ||
                         isImageViewer ||
                         isVideoPlayer ||
-                        isArchiveManager
+                        isAudioPlayer ||
+                        isArchiveManager ||
+                        isPdfViewer ||
+                        isDocumentViewer ||
+                        isPresentationViewer
                     ? null
                     : app.activityName,
                 extensionSpecific: defaultApp.extensionSpecific,
@@ -2298,8 +2996,18 @@ class _DefaultFileAppTile extends ConsumerWidget {
         selected.packageName == DefaultFileApp.imageViewerHandlerId;
     final isVideoPlayer =
         selected.packageName == DefaultFileApp.videoPlayerHandlerId;
+    final isAudioPlayer =
+        selected.packageName == DefaultFileApp.audioPlayerHandlerId;
     final isArchiveManager =
         selected.packageName == DefaultFileApp.archiveManagerHandlerId;
+    final isPdfViewer =
+        selected.packageName == DefaultFileApp.pdfViewerHandlerId;
+    final isSpreadsheetViewer =
+        selected.packageName == DefaultFileApp.spreadsheetViewerHandlerId;
+    final isDocumentViewer =
+        selected.packageName == DefaultFileApp.documentViewerHandlerId;
+    final isPresentationViewer =
+        selected.packageName == DefaultFileApp.presentationViewerHandlerId;
     try {
       await ref
           .read(defaultFileAppsProvider.notifier)
@@ -2312,8 +3020,18 @@ class _DefaultFileAppTile extends ConsumerWidget {
                   ? DefaultFileApp.imageViewerHandlerId
                   : isVideoPlayer
                   ? DefaultFileApp.videoPlayerHandlerId
+                  : isAudioPlayer
+                  ? DefaultFileApp.audioPlayerHandlerId
                   : isArchiveManager
                   ? DefaultFileApp.archiveManagerHandlerId
+                  : isPdfViewer
+                  ? DefaultFileApp.pdfViewerHandlerId
+                  : isSpreadsheetViewer
+                  ? DefaultFileApp.spreadsheetViewerHandlerId
+                  : isDocumentViewer
+                  ? DefaultFileApp.documentViewerHandlerId
+                  : isPresentationViewer
+                  ? DefaultFileApp.presentationViewerHandlerId
                   : 'external',
               category: 'Others',
               mimeType: selected.mimeType,
@@ -2321,21 +3039,36 @@ class _DefaultFileAppTile extends ConsumerWidget {
                   isTextEditor ||
                       isImageViewer ||
                       isVideoPlayer ||
-                      isArchiveManager
+                      isAudioPlayer ||
+                      isArchiveManager ||
+                      isPdfViewer ||
+                      isSpreadsheetViewer ||
+                      isDocumentViewer ||
+                      isPresentationViewer
                   ? null
                   : selected.packageName,
               displayName:
                   isTextEditor ||
                       isImageViewer ||
                       isVideoPlayer ||
-                      isArchiveManager
+                      isAudioPlayer ||
+                      isArchiveManager ||
+                      isPdfViewer ||
+                      isSpreadsheetViewer ||
+                      isDocumentViewer ||
+                      isPresentationViewer
                   ? null
                   : selected.name,
               activityName:
                   isTextEditor ||
                       isImageViewer ||
                       isVideoPlayer ||
-                      isArchiveManager
+                      isAudioPlayer ||
+                      isArchiveManager ||
+                      isPdfViewer ||
+                      isSpreadsheetViewer ||
+                      isDocumentViewer ||
+                      isPresentationViewer
                   ? null
                   : selected.activityName,
               extensionSpecific: true,
@@ -2374,6 +3107,30 @@ Widget _openWithLeadingIcon(OpenWithApp app) {
   if (app.packageName == DefaultFileApp.textEditorHandlerId) {
     return const Icon(Icons.text_snippet_outlined);
   }
+  if (app.packageName == DefaultFileApp.spreadsheetViewerHandlerId) {
+    return Image.asset(
+      Branding.logoPng,
+      width: 32,
+      height: 32,
+      fit: BoxFit.contain,
+    );
+  }
+  if (app.packageName == DefaultFileApp.documentViewerHandlerId) {
+    return Image.asset(
+      Branding.logoPng,
+      width: 32,
+      height: 32,
+      fit: BoxFit.contain,
+    );
+  }
+  if (app.packageName == DefaultFileApp.presentationViewerHandlerId) {
+    return Image.asset(
+      Branding.logoPng,
+      width: 32,
+      height: 32,
+      fit: BoxFit.contain,
+    );
+  }
   if (app.packageName == DefaultFileApp.imageViewerHandlerId) {
     return const Icon(Icons.image_outlined);
   }
@@ -2381,6 +3138,14 @@ Widget _openWithLeadingIcon(OpenWithApp app) {
     return const Icon(Icons.play_circle_outline);
   }
   if (app.packageName == DefaultFileApp.archiveManagerHandlerId) {
+    return Image.asset(
+      Branding.logoPng,
+      width: 32,
+      height: 32,
+      fit: BoxFit.contain,
+    );
+  }
+  if (app.packageName == DefaultFileApp.pdfViewerHandlerId) {
     return Image.asset(
       Branding.logoPng,
       width: 32,

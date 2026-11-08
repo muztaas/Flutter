@@ -22,6 +22,8 @@ import '../common/file_type_icon.dart';
 import '../common/marquee_text.dart';
 import '../common/open_with_app_option.dart';
 import '../common/storage_entry_row.dart';
+import '../common/content_sized_menu.dart';
+import '../common/detected_content_recovery.dart';
 import '../storage/storage_tab.dart';
 
 class ArchiveManagerPage extends ConsumerStatefulWidget {
@@ -60,6 +62,7 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
   bool _loading = true;
   bool _selectionMode = false;
   bool _autoExtractionStarted = false;
+  final GlobalKey _menuKey = GlobalKey();
   late final StreamSubscription<dynamic> _progressSubscription;
 
   @override
@@ -93,8 +96,9 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
       '.bz2',
       '.xz',
     ]) {
-      if (lower.endsWith(suffix))
+      if (lower.endsWith(suffix)) {
         return _archiveName.substring(0, _archiveName.length - suffix.length);
+      }
     }
 
     return _archiveName;
@@ -169,7 +173,7 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
         widget.onFolderChanged?.call(restoredFolder);
         if (requestedFolder.isNotEmpty) {
           _showMessage(
-            'The saved folder inside ${_archiveName} is unavailable; showing the archive root.',
+            'The saved folder inside $_archiveName is unavailable; showing the archive root.',
           );
         }
       }
@@ -327,10 +331,10 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
   }
 
   Future<void> _showMenu() async {
-    final action = await showMenu<String>(
+    final action = await showContentMenuFromPopupEntries<String>(
       context: context,
-      position: const RelativeRect.fromLTRB(1000, 80, 0, 0),
-      items: [
+      anchorKey: _menuKey,
+      entries: [
         const PopupMenuItem(value: 'extract_all', child: Text('Extract all')),
         if (_selected.isNotEmpty)
           const PopupMenuItem(
@@ -603,8 +607,9 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
           .read(openWithRepositoryProvider)
           .listApps(path: widget.archivePath, category: 'Archives');
     } catch (error) {
-      if (mounted)
+      if (mounted) {
         _showMessage('Could not find an app for this archive: $error');
+      }
       return;
     }
     if (!mounted) return;
@@ -660,6 +665,9 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
   Widget build(BuildContext context) {
     super.build(context);
     final children = _children();
+    final visibleSelectionCount = children
+        .where((child) => _selected.contains(child.path))
+        .length;
     final currentTitle = _folder.isEmpty
         ? _archiveName
         : _folder.split('/').last;
@@ -672,69 +680,71 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
     );
     return Scaffold(
       appBar: AppBar(
-          leading: IconButton(
-            tooltip: _folder.isNotEmpty || _selectionMode ? 'Back' : 'Close',
-            onPressed: _navigateBack,
-            icon: const Icon(Icons.arrow_back),
-          ),
-          title: MarqueeText(
-            _selectionMode ? '${_selected.length} selected' : currentTitle,
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-          actions: [
-            IconButton(
-              tooltip: 'More options',
-              onPressed: _showMenu,
-              icon: const Icon(Icons.more_vert),
-            ),
-          ],
+        leading: IconButton(
+          tooltip: _folder.isNotEmpty || _selectionMode ? 'Back' : 'Close',
+          onPressed: _navigateBack,
+          icon: const Icon(Icons.arrow_back),
         ),
+        title: MarqueeText(
+          _selectionMode
+              ? '$visibleSelectionCount/${children.length} selected'
+              : currentTitle,
+          style: Theme.of(context).textTheme.titleLarge,
+        ),
+        actions: [
+          IconButton(
+            key: _menuKey,
+            tooltip: 'More options',
+            onPressed: _showMenu,
+            icon: const Icon(Icons.more_vert),
+          ),
+        ],
+      ),
       body: Column(
-          children: [
-            if (_activeOperationId != null)
-              Material(
-                color: Theme.of(context).colorScheme.surfaceContainer,
-                child: Padding(
-                  padding: EdgeInsets.all(fontScaledSpacing(context, 10)),
-                  child: Column(
-                    children: [
-                      LinearProgressIndicator(value: _progress?.fraction),
-                      const SizedBox(height: 6),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              _progress?.currentEntry ??
-                                  'Preparing extraction…',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
+        children: [
+          if (_activeOperationId != null)
+            Material(
+              color: Theme.of(context).colorScheme.surfaceContainer,
+              child: Padding(
+                padding: EdgeInsets.all(fontScaledSpacing(context, 10)),
+                child: Column(
+                  children: [
+                    LinearProgressIndicator(value: _progress?.fraction),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _progress?.currentEntry ?? 'Preparing extraction…',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                           ),
-                          TextButton(
-                            onPressed: _cancelOperation,
-                            child: const Text('Cancel'),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
+                        ),
+                        TextButton(
+                          onPressed: _cancelOperation,
+                          child: const Text('Cancel'),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
-            Expanded(
-              child: _loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _error != null
-                  ? _buildError(_error!)
-                  : children.isEmpty
-                  ? const Center(child: Text('This folder is empty'))
-                  : Scrollbar(
-                      thumbVisibility: true,
-                      interactive: true,
-                      child: ListView.separated(
-                        itemCount: children.length,
-                        separatorBuilder: (_, _) =>
-                            SizedBox(height: fontScaledSpacing(context, 2)),
-                        itemBuilder: (context, index) {
+            ),
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _error != null
+                ? _buildError(_error!)
+                : children.isEmpty
+                ? const Center(child: Text('This folder is empty'))
+                : Scrollbar(
+                    thumbVisibility: true,
+                    interactive: true,
+                    child: ListView.separated(
+                      itemCount: children.length,
+                      separatorBuilder: (_, _) =>
+                          SizedBox(height: fontScaledSpacing(context, 2)),
+                      itemBuilder: (context, index) {
                         final entry = children[index];
                         final selected = _selected.contains(entry.path);
                         final modified = entry.modifiedTime;
@@ -791,12 +801,12 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
                             detailsEnabled: details.isNotEmpty,
                           ),
                         );
-                        },
-                      ),
+                      },
                     ),
-            ),
-          ],
-        ),
+                  ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -813,6 +823,10 @@ class ArchiveManagerPageState extends ConsumerState<ArchiveManagerPage>
             const Icon(Icons.error_outline),
             const SizedBox(height: 12),
             Text(message, textAlign: TextAlign.center),
+            DetectedContentRecoveryAction(
+              path: widget.archivePath,
+              currentCategory: 'Archives',
+            ),
             if (unavailable) ...[
               const SizedBox(height: 12),
               FilledButton.icon(

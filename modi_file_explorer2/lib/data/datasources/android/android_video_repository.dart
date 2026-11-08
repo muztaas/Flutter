@@ -19,7 +19,8 @@ import '../../../domain/utils/shared_storage_scan_scope.dart';
 import '../../../domain/utils/storage_display_name.dart';
 import '../../../domain/repositories/video_repository.dart';
 
-class AndroidVideoRepository implements VideoRepository {
+class AndroidVideoRepository
+    implements VideoRepository, VideoLibrarySnapshotRepository {
   static const _channel = MethodChannel('modi_file_explorer2/video_media');
   static const _maximumConcurrentOperations = 3;
   static const _maximumMemoryCacheBytes = 20 * 1024 * 1024;
@@ -55,6 +56,34 @@ class AndroidVideoRepository implements VideoRepository {
         'extensions': extensions.toList(),
       }),
     );
+    return _libraryFromScanResult(drive, result);
+  }
+
+  @override
+  Future<VideoLibraryScan> scanVideoSubtree({
+    required StorageDevice drive,
+    required String relativeFolderPath,
+    required Set<String> extensions,
+  }) async {
+    _driveRoots[drive.id] = drive.path;
+    _videoExtensionsByDrive[drive.id] = extensions;
+    final folderPath = _absolutePathFor(drive.id, relativeFolderPath);
+    final result = await Isolate.run(
+      () => _scanVideoFiles({
+        'driveId': drive.id,
+        'rootPath': drive.path,
+        'scanPath': folderPath,
+        'relativePath': relativeFolderPath,
+        'extensions': extensions.toList(),
+      }),
+    );
+    return _libraryFromScanResult(drive, result);
+  }
+
+  VideoLibraryScan _libraryFromScanResult(
+    StorageDevice drive,
+    Map<String, Object?> result,
+  ) {
     final videos = (result['videos']! as List)
         .map((item) => Map<String, Object?>.from(item as Map))
         .map(
@@ -260,6 +289,26 @@ class AndroidVideoRepository implements VideoRepository {
     }
     _knownSnapshots[driveId] = current;
     await _persistIndex();
+  }
+
+  @override
+  Future<List<VideoFile>?> loadVideoLibrarySnapshot({
+    required String driveId,
+  }) async {
+    final support = await getApplicationSupportDirectory();
+    final path = '${support.path}${Platform.pathSeparator}video-library.json';
+    return compute(_readVideoLibrarySnapshot, (path: path, driveId: driveId));
+  }
+
+  @override
+  Future<void> saveVideoLibrarySnapshot(VideoLibraryScan library) async {
+    final support = await getApplicationSupportDirectory();
+    final path = '${support.path}${Platform.pathSeparator}video-library.json';
+    final temporaryPath = '$path.tmp';
+    await compute(
+      _writeVideoLibrarySnapshot,
+      (path: path, temporaryPath: temporaryPath, videos: library.videos),
+    );
   }
 
   @override
@@ -645,6 +694,12 @@ class AndroidVideoRepository implements VideoRepository {
     await _persistIndex();
   }
 
+  @override
+  Future<void> forgetPath({
+    required String driveId,
+    required String relativePath,
+  }) => _forgetIndexedSubtree(driveId, relativePath);
+
   Future<FileSystemEntity> _entityFor(
     String driveId,
     String relativePath,
@@ -1011,11 +1066,100 @@ class _QueuedVideoTask {
   final void Function() cancel;
 }
 
+List<VideoFile>? _readVideoLibrarySnapshot(
+  ({String path, String driveId}) input,
+) {
+  final file = File(input.path);
+  if (!file.existsSync()) return null;
+  final decoded = jsonDecode(file.readAsStringSync());
+  if (decoded is! List) {
+    throw const FormatException('Saved video library snapshot is invalid.');
+  }
+  return decoded
+      .map((item) {
+        if (item is! Map) {
+          throw const FormatException('A saved video library entry is invalid.');
+        }
+        return Map<String, Object?>.from(item);
+      })
+      .map((item) {
+        final driveId = item['driveId'];
+        final relativePath = item['relativePath'];
+        final size = item['size'];
+        final modified = item['modified'];
+        if (driveId is! String ||
+            relativePath is! String ||
+            size is! int ||
+            modified is! int) {
+          throw const FormatException(
+            'A saved video library entry has invalid fields.',
+          );
+        }
+        if (driveId != input.driveId) return null;
+        final name = relativePath.split('/').last;
+        final extensionStart = name.lastIndexOf('.');
+        return VideoFile(
+          driveId: driveId,
+          relativePath: relativePath,
+          name: name,
+          extension: extensionStart < 0
+              ? ''
+              : name.substring(extensionStart).toLowerCase(),
+          size: size,
+          modified: DateTime.fromMillisecondsSinceEpoch(modified),
+          isHidden: relativePath.split('/').any((part) => part.startsWith('.')),
+          isInsideNomedia: false,
+        );
+      })
+      .whereType<VideoFile>()
+      .toList(growable: false);
+}
+
+Future<void> _writeVideoLibrarySnapshot(
+  ({String path, String temporaryPath, List<VideoFile> videos}) input,
+) async {
+  final file = File(input.path);
+  final temporary = File(input.temporaryPath);
+  final encoded = jsonEncode([
+    for (final video in input.videos)
+      {
+        'driveId': video.driveId,
+        'relativePath': video.relativePath,
+        'size': video.size,
+        'modified': video.modified.millisecondsSinceEpoch,
+      },
+  ]);
+  await temporary.writeAsString(encoded, flush: true);
+  if (await file.exists()) await file.delete();
+  await temporary.rename(input.path);
+}
+
 Map<String, Object?> _scanVideoFiles(Map<String, Object?> arguments) {
   final driveId = arguments['driveId']! as String;
   final rootPath = arguments['rootPath']! as String;
   final extensions = (arguments['extensions']! as List).cast<String>().toSet();
   final root = Directory(rootPath);
+  final scanRoot = Directory(arguments['scanPath'] as String? ?? rootPath);
+  final initialRelativePath = arguments['relativePath'] as String? ?? '';
+  final initialSegments = initialRelativePath
+      .split('/')
+      .where((segment) => segment.isNotEmpty)
+      .toList();
+  var initialInsideNomedia = false;
+  var ancestorPath = _normalizeVideoPath(scanRoot.path);
+  if (initialRelativePath.isNotEmpty) {
+    while (ancestorPath == _normalizeVideoPath(root.path) ||
+        ancestorPath.startsWith('${_normalizeVideoPath(root.path)}/')) {
+      if (File('$ancestorPath${Platform.pathSeparator}.nomedia').existsSync()) {
+        initialInsideNomedia = true;
+        break;
+      }
+      if (ancestorPath == _normalizeVideoPath(root.path)) break;
+      final parent = _normalizeVideoPath(Directory(ancestorPath).parent.path);
+      if (parent == ancestorPath) break;
+      ancestorPath = parent;
+    }
+  }
   final pending =
       <
         ({
@@ -1026,10 +1170,10 @@ Map<String, Object?> _scanVideoFiles(Map<String, Object?> arguments) {
         })
       >[
         (
-          directory: root,
-          relativePath: '',
-          hidden: false,
-          insideNomedia: false,
+          directory: scanRoot,
+          relativePath: initialRelativePath,
+          hidden: initialSegments.any((segment) => segment.startsWith('.')),
+          insideNomedia: initialInsideNomedia,
         ),
       ];
   final directoryMetadata =
@@ -1038,6 +1182,26 @@ Map<String, Object?> _scanVideoFiles(Map<String, Object?> arguments) {
         ({bool hidden, bool insideNomedia, String name, int? modified})
       >{};
   final videos = <Map<String, Object?>>[];
+  var metadataPath = initialRelativePath;
+  var metadataDirectory = scanRoot;
+  while (metadataPath.isNotEmpty) {
+    try {
+      final stat = metadataDirectory.statSync();
+      directoryMetadata[metadataPath] = (
+        hidden: metadataPath.split('/').any((part) => part.startsWith('.')),
+        insideNomedia: initialInsideNomedia,
+        name: metadataPath.split('/').last,
+        modified: stat.modified.millisecondsSinceEpoch,
+      );
+    } on FileSystemException catch (error) {
+      debugPrint(
+        'Could not read video folder metadata for ${metadataDirectory.path}: $error',
+      );
+    }
+    final separator = metadataPath.lastIndexOf('/');
+    metadataPath = separator < 0 ? '' : metadataPath.substring(0, separator);
+    metadataDirectory = metadataDirectory.parent;
+  }
 
   while (pending.isNotEmpty) {
     final current = pending.removeLast();

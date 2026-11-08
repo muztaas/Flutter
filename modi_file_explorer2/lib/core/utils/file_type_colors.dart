@@ -40,7 +40,7 @@ const Map<FileTypeColor, ({Color light, Color dark})> fileTypeColors = {
   FileTypeColor.code: (light: Color(0xFF00695C), dark: Color(0xFF4DB6AC)),
   FileTypeColor.image: (light: Color(0xFF1565C0), dark: Color(0xFF64B5F6)),
   FileTypeColor.video: (light: Color(0xFFC62828), dark: Color(0xFFEF5350)),
-  FileTypeColor.audio: (light: Color(0xFF6A1B9A), dark: Color(0xFFCE93D8)),
+  FileTypeColor.audio: (light: Color(0xFF6A1B9A), dark: Color.fromARGB(255, 124, 49, 137)),
   FileTypeColor.downloads: (light: Color(0xFF2E7D32), dark: Color(0xFF81C784)),
   FileTypeColor.documents: (light: Color(0xFFFADA5E), dark: Color(0xFFFADA5E)),
   FileTypeColor.apps: (light: Color(0xFF5E35B1), dark: Color(0xFFB39DDB)),

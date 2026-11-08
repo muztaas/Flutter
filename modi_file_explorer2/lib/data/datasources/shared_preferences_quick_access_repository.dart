@@ -5,8 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../domain/entities/quick_access_item.dart';
 import '../../domain/repositories/quick_access_repository.dart';
 
-class SharedPreferencesQuickAccessRepository
-    implements QuickAccessRepository {
+class SharedPreferencesQuickAccessRepository implements QuickAccessRepository {
   static const _key = 'quickAccess.items';
 
   @override
@@ -42,6 +41,19 @@ class SharedPreferencesQuickAccessRepository
   Future<void> delete(String path) async {
     final items = await getAll();
     items.removeWhere((item) => item.path == path);
+    await _saveItems(items);
+  }
+
+  @override
+  Future<void> deleteAll(Iterable<String> paths) async {
+    final pathsToDelete = paths.toSet();
+    if (pathsToDelete.isEmpty) return;
+    final items = await getAll();
+    items.removeWhere((item) => pathsToDelete.contains(item.path));
+    await _saveItems(items);
+  }
+
+  Future<void> _saveItems(List<QuickAccessItem> items) async {
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString(
       _key,

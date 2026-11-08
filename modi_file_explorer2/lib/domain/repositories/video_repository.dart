@@ -11,6 +11,12 @@ abstract interface class VideoRepository {
     required Set<String> extensions,
   });
 
+  Future<VideoLibraryScan> scanVideoSubtree({
+    required StorageDevice drive,
+    required String relativeFolderPath,
+    required Set<String> extensions,
+  });
+
   Future<VideoFile?> getVideoAtPath({
     required StorageDevice drive,
     required String path,
@@ -47,6 +53,11 @@ abstract interface class VideoRepository {
   Future<List<VideoFile>> recentlyPlayed(List<VideoFile> availableVideos);
 
   Future<void> moveRecord(VideoFile oldVideo, VideoFile newVideo);
+
+  Future<void> forgetPath({
+    required String driveId,
+    required String relativePath,
+  });
 
   Future<VideoPathProperties> getPathProperties({
     required String driveId,
@@ -85,4 +96,12 @@ abstract interface class VideoRepository {
   });
 
   void cancelPending(VideoFile video);
+}
+
+abstract interface class VideoLibrarySnapshotRepository {
+  Future<List<VideoFile>?> loadVideoLibrarySnapshot({
+    required String driveId,
+  });
+
+  Future<void> saveVideoLibrarySnapshot(VideoLibraryScan library);
 }

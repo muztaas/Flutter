@@ -29,10 +29,12 @@ Future<bool> openVideoFile(
   Future<void> Function()? onExternalOpen,
   bool excludeBuiltIn = false,
   bool? useSavedDefaultApps,
+  String? mimeTypeOverride,
+  bool allowSaveDefault = true,
 }) async {
   final repository = ref.read(openWithRepositoryProvider);
   final extension = _extension(name);
-  if (extension.isEmpty) {
+  if (extension.isEmpty && mimeTypeOverride == null) {
     _showOpenError(context, 'Could not determine the video file type');
     return false;
   }
@@ -55,10 +57,15 @@ Future<bool> openVideoFile(
             playlist: playlist,
             currentIndex: currentIndex,
             onPlaybackBegan: onPlaybackBegan,
+            contentOnly: mimeTypeOverride != null,
           );
           return true;
         }
-        final apps = await repository.listApps(path: path, category: 'Video');
+        final apps = await repository.listApps(
+          path: path,
+          category: 'Video',
+          mimeType: mimeTypeOverride,
+        );
         final app = apps
             .where(
               (candidate) =>
@@ -73,7 +80,7 @@ Future<bool> openVideoFile(
             category: 'Video',
             packageName: app.packageName,
             activityName: app.activityName,
-            mimeType: app.mimeType,
+            mimeType: mimeTypeOverride ?? app.mimeType,
           );
           if (!context.mounted) return false;
           await _notifyExternalOpen(context, ref, path, name, onExternalOpen);
@@ -99,7 +106,11 @@ Future<bool> openVideoFile(
 
   final List<OpenWithApp> apps;
   try {
-    apps = await repository.listApps(path: path, category: 'Video');
+    apps = await repository.listApps(
+      path: path,
+      category: 'Video',
+      mimeType: mimeTypeOverride,
+    );
   } catch (error) {
     if (context.mounted) {
       _showOpenError(context, 'Could not load video apps: $error');
@@ -147,7 +158,19 @@ Future<bool> openVideoFile(
               SimpleDialogOption(
                 onPressed: () => Navigator.pop(
                   dialogContext,
-                  _VideoAppSelection(app: app, saveAsDefault: saveAsDefault),
+                  _VideoAppSelection(
+                    app: mimeTypeOverride == null
+                        ? app
+                        : OpenWithApp(
+                            name: app.name,
+                            packageName: app.packageName,
+                            mimeType: mimeTypeOverride,
+                            applicationName: app.applicationName,
+                            activityName: app.activityName,
+                            iconBytes: app.iconBytes,
+                          ),
+                    saveAsDefault: saveAsDefault,
+                  ),
                 ),
                 child: Row(
                   children: [
@@ -163,12 +186,13 @@ Future<bool> openVideoFile(
                   ],
                 ),
               ),
-            CheckboxListTile(
-              title: Text('Always use this app for .$extension files'),
-              value: saveAsDefault,
-              onChanged: (value) =>
-                  setDialogState(() => saveAsDefault = value ?? false),
-            ),
+            if (allowSaveDefault)
+              CheckboxListTile(
+                title: Text('Always use this app for .$extension files'),
+                value: saveAsDefault,
+                onChanged: (value) =>
+                    setDialogState(() => saveAsDefault = value ?? false),
+              ),
           ],
         ),
       );
@@ -176,7 +200,7 @@ Future<bool> openVideoFile(
   );
   if (selection == null || !context.mounted) return false;
 
-  if (selection.saveAsDefault) {
+  if (selection.saveAsDefault && allowSaveDefault) {
     try {
       await ref
           .read(defaultFileAppsProvider.notifier)
@@ -226,6 +250,7 @@ Future<bool> openVideoFile(
       playlist: playlist,
       currentIndex: currentIndex,
       onPlaybackBegan: onPlaybackBegan,
+      contentOnly: mimeTypeOverride != null,
     );
     return true;
   }
@@ -235,7 +260,7 @@ Future<bool> openVideoFile(
       category: 'Video',
       packageName: selection.app.packageName,
       activityName: selection.app.activityName,
-      mimeType: selection.app.mimeType,
+      mimeType: mimeTypeOverride ?? selection.app.mimeType,
     );
     if (!context.mounted) return false;
     await _notifyExternalOpen(context, ref, path, name, onExternalOpen);
@@ -307,6 +332,7 @@ Future<void> _openBuiltInPlayer(
   List<VideoPlayerItem>? playlist,
   int? currentIndex,
   Future<void> Function(VideoPlayerItem item)? onPlaybackBegan,
+  bool contentOnly = false,
 }) {
   return _openBuiltInPlayerAsync(
     ref,
@@ -316,6 +342,7 @@ Future<void> _openBuiltInPlayer(
     playlist: playlist,
     currentIndex: currentIndex,
     onPlaybackBegan: onPlaybackBegan,
+    contentOnly: contentOnly,
   );
 }
 
@@ -327,6 +354,7 @@ Future<void> _openBuiltInPlayerAsync(
   List<VideoPlayerItem>? playlist,
   int? currentIndex,
   Future<void> Function(VideoPlayerItem item)? onPlaybackBegan,
+  bool contentOnly = false,
 }) async {
   var items = playlist == null || playlist.isEmpty
       ? <VideoPlayerItem>[]
@@ -437,10 +465,16 @@ Future<void> _openBuiltInPlayerAsync(
         sessionId: DateTime.now().microsecondsSinceEpoch.toString(),
         items: items,
         initialIndex: startIndex!,
-        onPlaybackBegan: onPlaybackBegan ?? markPlayed,
-        onResumePosition: loadResumePosition,
-        onSaveResumePosition: saveResumePosition,
-        onResetResumePosition: resetResumePosition,
+        onPlaybackBegan: contentOnly
+            ? (_) async {}
+            : onPlaybackBegan ?? markPlayed,
+        onResumePosition: contentOnly
+            ? (_) async => Duration.zero
+            : loadResumePosition,
+        onSaveResumePosition: contentOnly
+            ? (_, _) async {}
+            : saveResumePosition,
+        onResetResumePosition: contentOnly ? (_) async {} : resetResumePosition,
       ),
     ),
   );

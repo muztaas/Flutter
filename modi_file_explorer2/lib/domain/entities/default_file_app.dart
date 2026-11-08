@@ -1,3 +1,5 @@
+import 'file_type_category.dart';
+
 class DefaultFileApp {
   const DefaultFileApp({
     required this.extension,
@@ -14,7 +16,12 @@ class DefaultFileApp {
   static const textEditorHandlerId = 'textEditor';
   static const imageViewerHandlerId = 'imageViewer';
   static const videoPlayerHandlerId = 'videoPlayer';
+  static const audioPlayerHandlerId = 'audioPlayer';
   static const archiveManagerHandlerId = 'archiveManager';
+  static const pdfViewerHandlerId = 'pdfViewer';
+  static const spreadsheetViewerHandlerId = 'spreadsheetViewer';
+  static const documentViewerHandlerId = 'documentViewer';
+  static const presentationViewerHandlerId = 'presentationViewer';
 
   final String extension;
   final String handlerId;
@@ -27,12 +34,20 @@ class DefaultFileApp {
   final List<String> extensions;
 
   List<String> get matchedExtensions =>
-      extensions.isNotEmpty ? extensions : [extension];
+      (extensions.isNotEmpty ? extensions : [extension])
+          .map(FileTypeCategory.normalizeExtension)
+          .where((value) => value.isNotEmpty)
+          .toList(growable: false);
 
   bool get isTextEditor => handlerId == textEditorHandlerId;
   bool get isImageViewer => handlerId == imageViewerHandlerId;
   bool get isVideoPlayer => handlerId == videoPlayerHandlerId;
+  bool get isAudioPlayer => handlerId == audioPlayerHandlerId;
   bool get isArchiveManager => handlerId == archiveManagerHandlerId;
+  bool get isPdfViewer => handlerId == pdfViewerHandlerId;
+  bool get isSpreadsheetViewer => handlerId == spreadsheetViewerHandlerId;
+  bool get isDocumentViewer => handlerId == documentViewerHandlerId;
+  bool get isPresentationViewer => handlerId == presentationViewerHandlerId;
 
   Map<String, Object?> toJson() => {
     'extension': extension,

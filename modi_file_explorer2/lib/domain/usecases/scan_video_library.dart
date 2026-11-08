@@ -17,4 +17,25 @@ class ScanVideoLibrary {
       extensions: extensions,
     );
   }
+
+  Future<VideoLibraryScan?> loadSnapshot(Set<String> extensions) async {
+    final drives = await _storageRepository.listStorageDevices();
+    final internalDrives = drives.where((drive) => drive.id == 'internal');
+    final snapshotRepository = _videoRepository;
+    if (internalDrives.isEmpty ||
+        snapshotRepository is! VideoLibrarySnapshotRepository) {
+      return null;
+    }
+    final drive = internalDrives.first;
+    final videos = await (snapshotRepository as VideoLibrarySnapshotRepository)
+        .loadVideoLibrarySnapshot(driveId: drive.id);
+    if (videos == null) return null;
+    return VideoLibraryScan(
+      drive: drive,
+      videos: videos
+          .where((video) => extensions.contains(video.extension))
+          .toList(growable: false),
+      folders: const [],
+    );
+  }
 }

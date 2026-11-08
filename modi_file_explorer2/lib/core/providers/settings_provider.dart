@@ -29,6 +29,8 @@ class AppSettings {
     this.includeOtherDrivesInCategoryPages = true,
     this.defaultStartupTab = 'default',
     this.alwaysOpenTabs = const ['internal'],
+    this.blacklistedPaths = const [],
+    this.whitelistedPaths = const [],
   });
 
   final bool darkTheme;
@@ -53,6 +55,8 @@ class AppSettings {
   final bool includeOtherDrivesInCategoryPages;
   final String defaultStartupTab;
   final List<String> alwaysOpenTabs;
+  final List<String> blacklistedPaths;
+  final List<String> whitelistedPaths;
 
   double get textSizeOffset => switch (fontSize) {
     'x-small' => -1,
@@ -86,6 +90,8 @@ class AppSettings {
     bool? includeOtherDrivesInCategoryPages,
     String? defaultStartupTab,
     List<String>? alwaysOpenTabs,
+    List<String>? blacklistedPaths,
+    List<String>? whitelistedPaths,
   }) => AppSettings(
     darkTheme: darkTheme ?? this.darkTheme,
     fontSize: fontSize ?? this.fontSize,
@@ -120,6 +126,8 @@ class AppSettings {
         this.includeOtherDrivesInCategoryPages,
     defaultStartupTab: defaultStartupTab ?? this.defaultStartupTab,
     alwaysOpenTabs: alwaysOpenTabs ?? this.alwaysOpenTabs,
+    blacklistedPaths: blacklistedPaths ?? this.blacklistedPaths,
+    whitelistedPaths: whitelistedPaths ?? this.whitelistedPaths,
   );
 
   static AppSettings fromPreferences(SharedPreferences preferences) {
@@ -131,6 +139,11 @@ class AppSettings {
     final savedStartupTab = preferences.getString('storage.startupTab');
     final savedAlwaysOpenTabs = preferences.getStringList(
       'storage.alwaysOpenTabs',
+    );
+    List<String> readPathList(String key) => List.unmodifiable(
+      (preferences.getStringList(key) ?? const <String>[])
+          .where((path) => path.trim().isNotEmpty)
+          .take(99),
     );
     return AppSettings(
       darkTheme: preferences.getString('theme.mode') == 'dark',
@@ -193,6 +206,8 @@ class AppSettings {
                 (page) => page != 'home' && page != 'default',
               ),
             ),
+      blacklistedPaths: readPathList('settings.files.blacklist'),
+      whitelistedPaths: readPathList('settings.files.whitelist'),
     );
   }
 }
@@ -374,6 +389,37 @@ class AppSettingsController extends StateNotifier<AppSettings> {
     state = state.copyWith(alwaysOpenTabs: List.unmodifiable(uniqueValues));
     final preferences = await SharedPreferences.getInstance();
     await preferences.setStringList('storage.alwaysOpenTabs', uniqueValues);
+  }
+
+  Future<void> setBlacklistedPaths(List<String> values) =>
+      _setPathList(values, 'blacklistedPaths', 'settings.files.blacklist');
+
+  Future<void> setWhitelistedPaths(List<String> values) =>
+      _setPathList(values, 'whitelistedPaths', 'settings.files.whitelist');
+
+  Future<void> _setPathList(
+    List<String> values,
+    String field,
+    String preferenceKey,
+  ) async {
+    final paths = <String>[];
+    final seen = <String>{};
+    for (final value in values) {
+      final path = value.trim();
+      if (path.isEmpty) continue;
+      final normalized = path
+          .replaceAll('\\', '/')
+          .replaceFirst(RegExp(r'/+$'), '');
+      if (!seen.add(normalized)) continue;
+      paths.add(path);
+      if (paths.length == 99) break;
+    }
+    final updated = List<String>.unmodifiable(paths);
+    state = field == 'blacklistedPaths'
+        ? state.copyWith(blacklistedPaths: updated)
+        : state.copyWith(whitelistedPaths: updated);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setStringList(preferenceKey, updated);
   }
 }
 

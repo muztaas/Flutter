@@ -156,10 +156,7 @@ class FileSearchController extends StateNotifier<SearchOverlayState> {
     unawaited(_loadFolderCandidates(scope, candidateGeneration));
   }
 
-  Future<void> _loadFolderCandidates(
-    SearchScope scope,
-    int generation,
-  ) async {
+  Future<void> _loadFolderCandidates(SearchScope scope, int generation) async {
     try {
       final candidates = await _searchFiles.listFilterFolders(scope);
       if (generation != _candidateGeneration || !state.isOpen) return;
@@ -206,7 +203,8 @@ class FileSearchController extends StateNotifier<SearchOverlayState> {
         next.modifiedFrom != null &&
         next.modifiedTo != null &&
         next.modifiedFrom!.isAfter(next.modifiedTo!);
-    final message = validationMessage ??
+    final message =
+        validationMessage ??
         (invalidDateRange ? 'From date must be on or before To date.' : null);
     if (message != null) {
       _cancel();
@@ -301,6 +299,25 @@ class FileSearchController extends StateNotifier<SearchOverlayState> {
       results: state.results
           .where((candidate) => candidate.path != result.path)
           .toList(),
+    );
+  }
+
+  void removePaths(Iterable<String> paths) {
+    final removedPaths = paths
+        .map(
+          (path) => path.replaceAll('\\', '/').replaceAll(RegExp(r'/+$'), ''),
+        )
+        .toSet();
+    if (removedPaths.isEmpty) return;
+    state = state.copyWith(
+      results: state.results.where((result) {
+        final normalized = result.path
+            .replaceAll('\\', '/')
+            .replaceAll(RegExp(r'/+$'), '');
+        return !removedPaths.any(
+          (path) => normalized == path || normalized.startsWith('$path/'),
+        );
+      }).toList(),
     );
   }
 
