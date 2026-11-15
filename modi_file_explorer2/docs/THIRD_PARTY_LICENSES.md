@@ -1,8 +1,8 @@
 # Third-party licenses
 
-This inventory covers the built-in media-player dependencies added to the
+This inventory covers built-in media and PDF viewer dependencies added to the
 Android application. Versions are those selected by the Android release
-runtime dependency graph.
+runtime dependency graph unless noted otherwise.
 
 | Component | Version | License | Purpose |
 | --- | --- | --- | --- |
@@ -14,6 +14,81 @@ runtime dependency graph.
 | AndroidX Media3 DataSource | 1.9.2 | Apache-2.0 | Local-file data access |
 | AndroidX Media3 Decoder | 1.9.2 | Apache-2.0 | Decoder interfaces and integration; does not bundle codecs |
 | AndroidX Media3 Extractor | 1.9.2 | Apache-2.0 | Media container extraction |
+
+## Built-in PDF viewer
+
+The PDF viewer uses PDFium through the following permissively licensed Dart
+packages. Their package licenses are exposed in **Settings > About > Open
+source licenses** by Flutter's package license registry.
+
+| Component | Version | License | Purpose / release payload |
+| --- | --- | --- | --- |
+| pdfrx | 2.4.8 | MIT | PDF viewer engine API; Dart code only |
+| pdfrx_engine | 0.4.7 | MIT | Progressive document, page, text, and tile rendering; Dart code only |
+| pdfium_flutter | 0.2.3 | MIT | Flutter native-asset integration |
+| pdfium_dart | 0.2.5 | MIT | PDFium FFI bindings |
+| PDFium | Chromium revision 7811 | BSD-3-Clause | Native PDF parsing and rendering |
+| bblanchon/pdfium-binaries | chromium/7811 | MIT | Distributor of prebuilt PDFium binaries |
+| flutter_launcher_icons | 0.14.4 | MIT | Build-time dev tool; no release payload |
+
+The app vendors the 276,088-byte Dart source of `pdfrx_engine` 0.4.7 under
+`third_party/pdfrx_engine/` and applies a local fix for an upstream progressive
+page-reload indexing defect. Its MIT license is included in the in-app open
+source licenses. This source override does not add another native library or
+increase the per-ABI PDFium payload.
+
+The PDFium Android archives contain one native library per ABI. The exact
+uncompressed `libpdfium.so` payload sizes from the approved release archives
+are:
+
+| Android ABI | `libpdfium.so` bytes | Approximate size |
+| --- | ---: | ---: |
+| arm64-v8a | 6,386,696 | 6.09 MiB |
+| armeabi-v7a | 4,209,140 | 4.01 MiB |
+| x86_64 | 6,604,440 | 6.30 MiB |
+| x86 | 6,052,448 | 5.77 MiB |
+
+The current Android APK build packages arm64-v8a, armeabi-v7a, and x86_64.
+Google Play App Bundles and `flutter build apk --split-per-abi` avoid shipping
+all packaged ABIs to each device. The native library is stored uncompressed in
+the APK; the figures above are therefore the per-ABI library payload increase,
+before other application code and alignment.
+
+The upstream binary archive's `LICENSE` and every file in its `licenses/`
+directory are bundled unchanged under `assets/pdfium/` and registered in the
+in-app open-source license screen. The native dependency notices cover PDFium,
+ICU, Catapult, zlib, libunwind, libjpeg-turbo, CPU Features, LLVM libc, Little
+CMS, libpng, Anti-Grain Geometry, OpenJPEG, FreeType, libtiff, fast_float,
+Abseil, and simdutf.
+
+| Native component | License in bundled notice |
+| --- | --- |
+| PDFium | BSD-3-Clause |
+| ICU | Unicode License v3 |
+| Catapult | BSD-3-Clause |
+| zlib | zlib License |
+| libunwind | Apache-2.0 with LLVM exception |
+| libjpeg-turbo | BSD-style licenses and IJG notice |
+| CPU Features | Apache-2.0 |
+| LLVM libc | Apache-2.0 with LLVM exception |
+| Little CMS | MIT |
+| libpng | PNG Reference Library License v2 |
+| Anti-Grain Geometry 2.3 | MIT-style permissive license |
+| OpenJPEG | BSD-2-Clause |
+| FreeType | FreeType License (FTL) |
+| libtiff | libtiff permissive license |
+| fast_float | MIT |
+| Abseil | Apache-2.0 |
+| simdutf | MIT |
+
+The ICU notice also contains license text for build/configuration scripts
+(including Autoconf-generated files); those scripts are not present in the
+binary archive. The LLVM libunwind and LLVM libc notices include conditional
+GPLv2 compatibility language, and the FreeType notice describes its
+permissive FreeType License. These notice texts do not change the licenses of
+the shipped components; the binary archive supplies the PDFium shared library
+and permissively licensed runtime dependency notices, not the referenced GPL
+build scripts.
 
 ## Built-in Archive Manager
 
@@ -123,11 +198,11 @@ in-app **Settings > About > Open source licenses** page.
 
 ## Whole-app dependency review
 
-The `pubspec.lock` review covered all 89 resolved hosted Dart packages,
-including development and transitive dependencies. Their cached package license
-files identified them as MIT, BSD, or Apache-2.0; no GPL, AGPL, or LGPL
-package was found. Flutter SDK-provided license entries are also exposed by the
-in-app license page.
+The `pubspec.lock` review covers all resolved hosted Dart packages, including
+development and transitive dependencies. Their cached package license files
+identified them as MIT, BSD, or Apache-2.0; no GPL, AGPL, or LGPL runtime
+package was found. Flutter SDK-provided license entries are also exposed by
+the in-app license page.
 
 The direct application dependencies include:
 
@@ -142,6 +217,7 @@ The direct application dependencies include:
 | hive | 2.2.3 | Apache-2.0 |
 | path_provider | 2.1.6 | BSD-3-Clause |
 | permission_handler | 13.0.1 | MIT |
+| pdfrx | 2.4.8 | MIT |
 | shared_preferences | 2.5.5 | BSD-3-Clause |
 
 This is a dependency-license review, not a legal opinion or a review of
@@ -157,3 +233,17 @@ There is no otherwise identical pre-audio build for a reliable binary
 comparison. The audio feature adds the 905,317-byte Media3 Session AAR before
 APK shrinking and compression; Media3 contributes no native libraries or
 codecs.
+
+## OOXML metric-compatible fonts
+
+| Font | Version/source | License | Purpose |
+| --- | --- | --- | --- |
+| Carlito | Google Fonts repository revision `5bb28733cec313b63fbd415b574b5ae35c8aa8b8` | SIL Open Font License 1.1 | Metric-compatible substitute for Calibri |
+| Caladea | Google Fonts repository revision `5bb28733cec313b63fbd415b574b5ae35c8aa8b8` | SIL Open Font License 1.1 | Metric-compatible substitute for Cambria |
+
+Both fonts are included as Latin subsets with regular, bold, italic, and
+bold-italic faces. The eight subset TTFs total 1,180,704 bytes uncompressed
+and 560,775 bytes when ZIP-deflated with level 9. This is a package-size
+estimate, not an APK measurement; Flutter's APK compression and alignment may
+change the final increment. The upstream OFL notices are bundled with each
+font and are available through **Settings > About > Open source licenses**.

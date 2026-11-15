@@ -27,8 +27,20 @@ class PdfRenderedPage {
   const PdfRenderedPage({
     required this.bytes,
     required this.pageInfo,
+    required this.imageWidth,
+    required this.imageHeight,
+    required this.x,
+    required this.y,
+    required this.fullWidth,
+    required this.fullHeight,
   });
 
   final Uint8List bytes;
   final PdfPageInfo pageInfo;
+  final int imageWidth;
+  final int imageHeight;
+  final int x;
+  final int y;
+  final int fullWidth;
+  final int fullHeight;
 }

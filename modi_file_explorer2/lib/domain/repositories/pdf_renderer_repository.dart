@@ -10,6 +10,10 @@ abstract class PdfRendererRepository {
   Future<PdfRenderedPage> renderPage({
     required String documentId,
     required int pageIndex,
+    required int fullWidth,
+    required int fullHeight,
+    required int x,
+    required int y,
     required int width,
     required int height,
     required String requestId,

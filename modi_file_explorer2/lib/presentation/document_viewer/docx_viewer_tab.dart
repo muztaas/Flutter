@@ -8,8 +8,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/providers/docx_file_provider.dart';
 import '../../domain/repositories/docx_file_repository.dart';
 import '../common/built_in_viewer_shell.dart';
+import '../common/office_chart.dart';
 import '../common/marquee_text.dart';
 import '../common/open_docx_file.dart';
+
+Color _officeColor(int value) =>
+    Color(value <= 0xFFFFFF ? 0xFF000000 | value : value & 0xFFFFFFFF);
 
 class DocxViewerTab extends ConsumerStatefulWidget {
   const DocxViewerTab({
@@ -45,6 +49,13 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
   bool _isComplete = false;
   bool _isTruncated = false;
   bool _usePageLayout = false;
+  double? _sectionPageWidth;
+  double? _sectionPageHeight;
+  double? _sectionMarginLeft;
+  double? _sectionMarginRight;
+  double? _sectionMarginTop;
+  double? _sectionMarginBottom;
+  final Set<String> _notShownFeatures = {};
 
   @override
   bool get wantKeepAlive => true;
@@ -91,6 +102,13 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
     _isLoading = false;
     _isComplete = false;
     _isTruncated = false;
+    _notShownFeatures.clear();
+    _sectionPageWidth = null;
+    _sectionPageHeight = null;
+    _sectionMarginLeft = null;
+    _sectionMarginRight = null;
+    _sectionMarginTop = null;
+    _sectionMarginBottom = null;
     _tableScrollOffsets.value = const {};
     if (session != null) unawaited(session.close());
     if (notify && mounted) setState(() {});
@@ -110,6 +128,8 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
     setState(() => _zoom = next);
     widget.onZoomChanged(next > 1.001);
   }
+
+  void _zoomBy(double factor) => _setZoom(_zoom * factor);
 
   void _onPointerDown(PointerDownEvent event) {
     _activePointers[event.pointer] = event.position;
@@ -209,6 +229,13 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
     _blocks.addAll(progress.blocks);
     _isComplete = progress.isComplete;
     _isTruncated = progress.isTruncated;
+    _notShownFeatures.addAll(progress.notShownFeatures);
+    _sectionPageWidth = progress.sectionPageWidth ?? _sectionPageWidth;
+    _sectionPageHeight = progress.sectionPageHeight ?? _sectionPageHeight;
+    _sectionMarginLeft = progress.sectionMarginLeft ?? _sectionMarginLeft;
+    _sectionMarginRight = progress.sectionMarginRight ?? _sectionMarginRight;
+    _sectionMarginTop = progress.sectionMarginTop ?? _sectionMarginTop;
+    _sectionMarginBottom = progress.sectionMarginBottom ?? _sectionMarginBottom;
   }
 
   Widget _buildBlock(
@@ -236,21 +263,35 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
           if (block.styleUnderline) TextDecoration.underline,
           if (block.styleStrikethrough) TextDecoration.lineThrough,
         ]),
+        fontFamily: block.styleFontFamily,
         fontSize: block.styleFontSize == null
             ? null
             : block.styleFontSize! * 4 / 3,
         color: block.styleColor == null
             ? null
-            : Color(0xff000000 | block.styleColor!),
+            : _officeColor(block.styleColor!),
         backgroundColor: block.styleHighlight == null
             ? null
-            : Color(0xff000000 | block.styleHighlight!),
+            : _officeColor(block.styleHighlight!),
       );
       final direction = block.isRightToLeft
           ? TextDirection.rtl
           : Directionality.of(context);
       final inheritedStyle = paragraphStyle ?? const TextStyle();
       final spans = <InlineSpan>[];
+      final firstLineIndent = (block.paragraphFirstLineIndent ?? 0)
+          .clamp(0, 360)
+          .toDouble();
+      if (firstLineIndent > 0) {
+        spans.add(
+          TextSpan(
+            text: List.filled(
+              (firstLineIndent / 8).round().clamp(1, 45),
+              ' ',
+            ).join(),
+          ),
+        );
+      }
       for (final run in block.runs) {
         final style = inheritedStyle.copyWith(
           fontWeight: run.bold ? FontWeight.bold : inheritedStyle.fontWeight,
@@ -266,10 +307,11 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
               : run.fontSize! * 4 / 3,
           color: run.color == null
               ? inheritedStyle.color
-              : Color(0xff000000 | run.color!),
+              : _officeColor(run.color!),
+          fontFamily: run.fontFamily ?? inheritedStyle.fontFamily,
           backgroundColor: run.highlight == null
               ? inheritedStyle.backgroundColor
-              : Color(0xff000000 | run.highlight!),
+              : _officeColor(run.highlight!),
         );
         if (run.imagePath != null && session != null) {
           spans.add(
@@ -280,6 +322,10 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
                 path: run.imagePath!,
                 width: run.imageWidth,
                 height: run.imageHeight,
+                cropLeft: run.imageCropLeft,
+                cropTop: run.imageCropTop,
+                cropRight: run.imageCropRight,
+                cropBottom: run.imageCropBottom,
                 inline: true,
               ),
             ),
@@ -317,7 +363,7 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
       var markerColor = paragraphStyle?.color;
       for (final run in block.runs) {
         if (run.color != null) {
-          markerColor = Color(0xff000000 | run.color!);
+          markerColor = _officeColor(run.color!);
           break;
         }
       }
@@ -349,16 +395,19 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
             );
       final borderColor = block.paragraphBottomBorderColor;
       final paragraph = Container(
-        decoration: borderColor == null
-            ? null
-            : BoxDecoration(
-                border: Border(
+        decoration: BoxDecoration(
+          color: block.paragraphBackground == null
+              ? null
+              : _officeColor(block.paragraphBackground!),
+          border: borderColor == null
+              ? null
+              : Border(
                   bottom: BorderSide(
-                    color: Color(0xff000000 | borderColor),
+                    color: _officeColor(borderColor),
                     width: (block.paragraphBottomBorderWidth ?? 0.5) * zoom,
                   ),
                 ),
-              ),
+        ),
         child: Padding(
           padding: EdgeInsetsDirectional.fromSTEB(
             ((pageLayout ? 3 : 12) + indentLeft) * zoom,
@@ -398,7 +447,7 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
             padding: EdgeInsets.only(left: left),
             child: Container(
               width: width,
-              color: Color(0xff000000 | background),
+              color: _officeColor(background),
               child: paragraph,
             ),
           );
@@ -463,7 +512,10 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
           _boundedFloatingValue(block.floatingHeight, 0, 4000);
       return math.max(maximum, bottom);
     });
-    final pageWidth = (rightEdge - leftEdge).clamp(1.0, 2400.0).toDouble();
+    final pageWidth = math.max(
+      _sectionPageWidth ?? 816.0,
+      (rightEdge - leftEdge).clamp(1.0, 2400.0),
+    );
     final pageHeight = (bottomEdge - topEdge).clamp(1.0, 4000.0).toDouble();
 
     return LayoutBuilder(
@@ -482,7 +534,7 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
           child: SizedBox(
             width: math.max(constraints.maxWidth, renderedWidth).toDouble(),
             child: ColoredBox(
-              color: Colors.white,
+              color: Colors.grey.shade300,
               child: ListView.builder(
                 key: ValueKey(_generation),
                 addAutomaticKeepAlives: false,
@@ -491,15 +543,31 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
                 itemBuilder: (context, index) {
                   if (index != 0 || !hasPositionedBlocks) {
                     final blockIndex = hasPositionedBlocks ? index - 1 : index;
-                    return MediaQuery(
-                      data: MediaQuery.of(
-                        context,
-                      ).copyWith(textScaler: TextScaler.linear(_zoom)),
-                      child: _buildBlock(
-                        context,
-                        remainingBlocks[blockIndex],
-                        session,
-                        pageLayout: true,
+                    return Center(
+                      child: SizedBox(
+                        width: renderedWidth,
+                        child: ColoredBox(
+                          color: Colors.white,
+                          child: Padding(
+                            padding: EdgeInsets.fromLTRB(
+                              (_sectionMarginLeft ?? 72) * fitScale,
+                              (_sectionMarginTop ?? 72) * fitScale,
+                              (_sectionMarginRight ?? 72) * fitScale,
+                              (_sectionMarginBottom ?? 72) * fitScale,
+                            ),
+                            child: MediaQuery(
+                              data: MediaQuery.of(
+                                context,
+                              ).copyWith(textScaler: TextScaler.linear(_zoom)),
+                              child: _buildBlock(
+                                context,
+                                remainingBlocks[blockIndex],
+                                session,
+                                pageLayout: true,
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
                     );
                   }
@@ -723,39 +791,35 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
         allowSaveDefault: false,
       ),
       actions: [
-        if (_usePageLayout) ...[
-          IconButton(
-            tooltip: 'Zoom out',
-            onPressed: () => _setZoom(_zoom - 0.1),
-            icon: const Icon(Icons.zoom_out),
-          ),
-          IconButton(
-            tooltip: 'Reset zoom to 100%',
-            onPressed: _zoom == 1 ? null : () => _setZoom(1),
-            icon: Text('${(_zoom * 100).round()}%'),
-          ),
-          IconButton(
-            tooltip: 'Zoom in',
-            onPressed: () => _setZoom(_zoom + 0.1),
-            icon: const Icon(Icons.zoom_in),
-          ),
-        ],
-        IconButton(
-          tooltip: _usePageLayout
-              ? 'Switch to mobile layout'
-              : 'Switch to page layout',
-          onPressed: () {
+        PopupMenuButton<String>(
+          tooltip: 'Document view options',
+          onSelected: (value) {
             setState(() {
-              _usePageLayout = !_usePageLayout;
+              _usePageLayout = value == 'page';
               _zoom = 1;
             });
             widget.onZoomChanged(false);
           },
+          itemBuilder: (context) => [
+            CheckedPopupMenuItem(
+              value: 'reading',
+              checked: !_usePageLayout,
+              child: const Text('Reading view'),
+            ),
+            CheckedPopupMenuItem(
+              value: 'page',
+              checked: _usePageLayout,
+              child: const Text('Page view'),
+            ),
+          ],
           icon: Icon(
-            _usePageLayout ? Icons.phone_android : Icons.description_outlined,
+            _usePageLayout
+                ? Icons.description_outlined
+                : Icons.view_agenda_outlined,
           ),
         ),
       ],
+      notShownFeatures: _notShownFeatures.toList(growable: false),
       child: _loadError != null
           ? Center(
               child: Padding(
@@ -775,273 +839,411 @@ class _DocxViewerTabState extends ConsumerState<DocxViewerTab>
               child: Column(
                 children: [
                   Expanded(
-                    child: AnimatedPadding(
-                      padding: EdgeInsets.only(
-                        top: widget.isChromeHidden ? 0 : 44,
-                      ),
-                      duration: const Duration(milliseconds: 180),
-                      child: Listener(
-                        onPointerDown: _onPointerDown,
-                        onPointerMove: _onPointerMove,
-                        onPointerUp: _onPointerEnd,
-                        onPointerCancel: _onPointerEnd,
-                        child: MediaQuery(
-                          data: scaledMedia,
-                          child: _usePageLayout
-                              ? _buildPageLayout(context, session)
-                              : ListView.builder(
-                                  key: ValueKey(_generation),
-                                  addAutomaticKeepAlives: false,
-                                  itemCount: _blocks.length,
-                                  itemBuilder: (context, index) {
-                                    final block = _blocks[index];
-                                    if (block.type == 'paragraph') {
-                                      final headingLevel =
-                                          block.headingLevel ??
-                                          _headingLevel(block.styleName);
-                                      final baseStyle = headingLevel == null
-                                          ? Theme.of(
-                                              context,
-                                            ).textTheme.bodyMedium
-                                          : switch (headingLevel) {
-                                              1 => Theme.of(
-                                                context,
-                                              ).textTheme.headlineSmall,
-                                              2 => Theme.of(
-                                                context,
-                                              ).textTheme.titleLarge,
-                                              3 => Theme.of(
-                                                context,
-                                              ).textTheme.titleMedium,
-                                              _ => Theme.of(
-                                                context,
-                                              ).textTheme.titleSmall,
-                                            };
-                                      final paragraphStyle = baseStyle
-                                          ?.copyWith(
-                                            fontWeight: block.styleBold
-                                                ? FontWeight.bold
-                                                : null,
-                                            fontStyle: block.styleItalic
-                                                ? FontStyle.italic
-                                                : null,
-                                            decoration: TextDecoration.combine([
-                                              if (block.styleUnderline)
-                                                TextDecoration.underline,
-                                              if (block.styleStrikethrough)
-                                                TextDecoration.lineThrough,
-                                            ]),
-                                            fontSize:
-                                                block.styleFontSize == null
-                                                ? null
-                                                : block.styleFontSize! * 4 / 3,
-                                            color: block.styleColor == null
-                                                ? null
-                                                : Color(
-                                                    0xff000000 |
-                                                        block.styleColor!,
-                                                  ),
-                                            backgroundColor:
-                                                block.styleHighlight == null
-                                                ? null
-                                                : Color(
-                                                    0xff000000 |
-                                                        block.styleHighlight!,
-                                                  ),
-                                          );
-                                      final direction = block.isRightToLeft
-                                          ? TextDirection.rtl
-                                          : Directionality.of(context);
-                                      final inheritedStyle =
-                                          paragraphStyle ?? const TextStyle();
-                                      final paragraph = Padding(
-                                        padding: EdgeInsetsDirectional.fromSTEB(
-                                          12 +
-                                              (block.listMarker == null
-                                                  ? 0
-                                                  : block.listLevel * 18),
-                                          headingLevel == null ? 3 : 12,
-                                          12,
-                                          headingLevel == null ? 5 : 7,
-                                        ),
-                                        child: Wrap(
-                                          textDirection: direction,
-                                          alignment: switch (block.alignment) {
-                                            'center' => WrapAlignment.center,
-                                            'right' => WrapAlignment.end,
-                                            'both' || 'distribute' =>
-                                              WrapAlignment.spaceBetween,
-                                            _ => WrapAlignment.start,
-                                          },
-                                          children: [
-                                            if (block.listMarker != null)
-                                              Text(
-                                                '${block.listMarker} ',
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        AnimatedPadding(
+                          padding: EdgeInsets.only(
+                            top: widget.isChromeHidden ? 0 : 44,
+                          ),
+                          duration: const Duration(milliseconds: 180),
+                          child: Listener(
+                            onPointerDown: _onPointerDown,
+                            onPointerMove: _onPointerMove,
+                            onPointerUp: _onPointerEnd,
+                            onPointerCancel: _onPointerEnd,
+                            child: MediaQuery(
+                              data: scaledMedia,
+                              child: _usePageLayout
+                                  ? _buildPageLayout(context, session)
+                                  : ListView.builder(
+                                      key: ValueKey(_generation),
+                                      addAutomaticKeepAlives: false,
+                                      itemCount: _blocks.length,
+                                      itemBuilder: (context, index) {
+                                        final block = _blocks[index];
+                                        if (block.type == 'paragraph') {
+                                          final headingLevel =
+                                              block.headingLevel ??
+                                              _headingLevel(block.styleName);
+                                          final baseStyle = headingLevel == null
+                                              ? Theme.of(
+                                                  context,
+                                                ).textTheme.bodyMedium
+                                              : switch (headingLevel) {
+                                                  1 => Theme.of(
+                                                    context,
+                                                  ).textTheme.headlineSmall,
+                                                  2 => Theme.of(
+                                                    context,
+                                                  ).textTheme.titleLarge,
+                                                  3 => Theme.of(
+                                                    context,
+                                                  ).textTheme.titleMedium,
+                                                  _ => Theme.of(
+                                                    context,
+                                                  ).textTheme.titleSmall,
+                                                };
+                                          final paragraphStyle = baseStyle
+                                              ?.copyWith(
+                                                fontWeight: block.styleBold
+                                                    ? FontWeight.bold
+                                                    : null,
+                                                fontStyle: block.styleItalic
+                                                    ? FontStyle.italic
+                                                    : null,
+                                                height:
+                                                    block.paragraphLineHeight,
+                                                decoration:
+                                                    TextDecoration.combine([
+                                                      if (block.styleUnderline)
+                                                        TextDecoration
+                                                            .underline,
+                                                      if (block
+                                                          .styleStrikethrough)
+                                                        TextDecoration
+                                                            .lineThrough,
+                                                    ]),
+                                                fontFamily:
+                                                    block.styleFontFamily,
+                                                fontSize:
+                                                    block.styleFontSize == null
+                                                    ? null
+                                                    : block.styleFontSize! *
+                                                          4 /
+                                                          3,
+                                                color: block.styleColor == null
+                                                    ? null
+                                                    : Color(
+                                                        0xff000000 |
+                                                            block.styleColor!,
+                                                      ),
+                                                backgroundColor:
+                                                    block.styleHighlight == null
+                                                    ? null
+                                                    : Color(
+                                                        0xff000000 |
+                                                            block
+                                                                .styleHighlight!,
+                                                      ),
+                                              );
+                                          final direction = block.isRightToLeft
+                                              ? TextDirection.rtl
+                                              : Directionality.of(context);
+                                          final inheritedStyle =
+                                              paragraphStyle ??
+                                              const TextStyle();
+                                          final paragraph = DecoratedBox(
+                                            decoration: BoxDecoration(
+                                              color:
+                                                  block.paragraphBackground ==
+                                                      null
+                                                  ? null
+                                                  : Color(
+                                                      0xff000000 |
+                                                          block
+                                                              .paragraphBackground!,
+                                                    ),
+                                              border:
+                                                  block.paragraphBottomBorderColor ==
+                                                      null
+                                                  ? null
+                                                  : Border(
+                                                      bottom: BorderSide(
+                                                        color: Color(
+                                                          0xff000000 |
+                                                              block
+                                                                  .paragraphBottomBorderColor!,
+                                                        ),
+                                                        width:
+                                                            block
+                                                                .paragraphBottomBorderWidth ??
+                                                            0.5,
+                                                      ),
+                                                    ),
+                                            ),
+                                            child: Padding(
+                                              padding: EdgeInsetsDirectional.fromSTEB(
+                                                12 +
+                                                    (block.paragraphIndentLeft ??
+                                                        0) +
+                                                    (block.listMarker == null
+                                                        ? 0
+                                                        : block.listLevel * 18),
+                                                (block.paragraphSpaceBefore ??
+                                                        (headingLevel == null
+                                                            ? 3
+                                                            : 12))
+                                                    .toDouble(),
+                                                12 +
+                                                    (block.paragraphIndentRight ??
+                                                        0),
+                                                (block.paragraphSpaceAfter ??
+                                                        (headingLevel == null
+                                                            ? 5
+                                                            : 7))
+                                                    .toDouble(),
+                                              ),
+                                              child: Wrap(
                                                 textDirection: direction,
-                                                style: paragraphStyle,
-                                              ),
-                                            for (final run in block.runs)
-                                              if (run.imagePath != null &&
-                                                  session != null)
-                                                _DocxImage(
-                                                  session: session,
-                                                  path: run.imagePath!,
-                                                  width: run.imageWidth,
-                                                  height: run.imageHeight,
-                                                  inline: true,
-                                                )
-                                              else
-                                                Builder(
-                                                  builder: (context) {
-                                                    final style = inheritedStyle.copyWith(
-                                                      fontWeight: run.bold
-                                                          ? FontWeight.bold
-                                                          : inheritedStyle
-                                                                .fontWeight,
-                                                      fontStyle: run.italic
-                                                          ? FontStyle.italic
-                                                          : inheritedStyle
-                                                                .fontStyle,
-                                                      decoration:
-                                                          run.underline ||
-                                                              run.strikethrough
-                                                          ? TextDecoration.combine([
-                                                              if (run.underline)
-                                                                TextDecoration
-                                                                    .underline,
-                                                              if (run
-                                                                  .strikethrough)
-                                                                TextDecoration
-                                                                    .lineThrough,
-                                                            ])
-                                                          : inheritedStyle
-                                                                .decoration,
-                                                      fontSize:
-                                                          run.fontSize == null
-                                                          ? inheritedStyle
-                                                                .fontSize
-                                                          : run.fontSize! *
-                                                                4 /
-                                                                3,
-                                                      color: run.color == null
-                                                          ? inheritedStyle.color
-                                                          : Color(
-                                                              0xff000000 |
-                                                                  run.color!,
-                                                            ),
-                                                      backgroundColor:
-                                                          run.highlight == null
-                                                          ? inheritedStyle
-                                                                .backgroundColor
-                                                          : Color(
-                                                              0xff000000 |
-                                                                  run.highlight!,
-                                                            ),
-                                                    );
-                                                    final text = Text(
-                                                      run.text,
+                                                alignment: switch (block
+                                                    .alignment) {
+                                                  'center' =>
+                                                    WrapAlignment.center,
+                                                  'right' => WrapAlignment.end,
+                                                  'both' || 'distribute' =>
+                                                    WrapAlignment.spaceBetween,
+                                                  _ => WrapAlignment.start,
+                                                },
+                                                children: [
+                                                  if (block.listMarker != null)
+                                                    Text(
+                                                      '${block.listMarker} ',
                                                       textDirection: direction,
-                                                      style: style,
-                                                    );
-                                                    final hyperlink =
-                                                        run.hyperlink;
-                                                    return hyperlink == null
-                                                        ? text
-                                                        : GestureDetector(
-                                                            behavior:
-                                                                HitTestBehavior
-                                                                    .opaque,
-                                                            onTap: () => unawaited(
-                                                              _confirmAndOpenDocxLink(
-                                                                context,
-                                                                session,
-                                                                hyperlink,
-                                                              ),
-                                                            ),
-                                                            child: text,
+                                                      style: paragraphStyle,
+                                                    ),
+                                                  if ((block.paragraphFirstLineIndent ??
+                                                          0) >
+                                                      0)
+                                                    Text(
+                                                      List.filled(
+                                                        ((block.paragraphFirstLineIndent ??
+                                                                    0) /
+                                                                8)
+                                                            .round()
+                                                            .clamp(1, 45),
+                                                        ' ',
+                                                      ).join(),
+                                                    ),
+                                                  for (final run in block.runs)
+                                                    if (run.imagePath != null &&
+                                                        session != null)
+                                                      _DocxImage(
+                                                        session: session,
+                                                        path: run.imagePath!,
+                                                        width: run.imageWidth,
+                                                        height: run.imageHeight,
+                                                        cropLeft:
+                                                            run.imageCropLeft,
+                                                        cropTop:
+                                                            run.imageCropTop,
+                                                        cropRight:
+                                                            run.imageCropRight,
+                                                        cropBottom:
+                                                            run.imageCropBottom,
+                                                        inline: true,
+                                                      )
+                                                    else
+                                                      Builder(
+                                                        builder: (context) {
+                                                          final style = inheritedStyle.copyWith(
+                                                            fontWeight: run.bold
+                                                                ? FontWeight
+                                                                      .bold
+                                                                : inheritedStyle
+                                                                      .fontWeight,
+                                                            fontStyle:
+                                                                run.italic
+                                                                ? FontStyle
+                                                                      .italic
+                                                                : inheritedStyle
+                                                                      .fontStyle,
+                                                            decoration:
+                                                                run.underline ||
+                                                                    run.strikethrough
+                                                                ? TextDecoration.combine([
+                                                                    if (run
+                                                                        .underline)
+                                                                      TextDecoration
+                                                                          .underline,
+                                                                    if (run
+                                                                        .strikethrough)
+                                                                      TextDecoration
+                                                                          .lineThrough,
+                                                                  ])
+                                                                : inheritedStyle
+                                                                      .decoration,
+                                                            fontSize:
+                                                                run.fontSize ==
+                                                                    null
+                                                                ? inheritedStyle
+                                                                      .fontSize
+                                                                : run.fontSize! *
+                                                                      4 /
+                                                                      3,
+                                                            color:
+                                                                run.color ==
+                                                                    null
+                                                                ? inheritedStyle
+                                                                      .color
+                                                                : Color(
+                                                                    0xff000000 |
+                                                                        run.color!,
+                                                                  ),
+                                                            fontFamily:
+                                                                run.fontFamily ??
+                                                                inheritedStyle
+                                                                    .fontFamily,
+                                                            backgroundColor:
+                                                                run.highlight ==
+                                                                    null
+                                                                ? inheritedStyle
+                                                                      .backgroundColor
+                                                                : Color(
+                                                                    0xff000000 |
+                                                                        run.highlight!,
+                                                                  ),
                                                           );
-                                                  },
-                                                ),
-                                          ],
-                                        ),
-                                      );
-                                      final background =
-                                          block.floatingBackground;
-                                      if (background == null) return paragraph;
-                                      final maxRight = _blocks.fold<double>(0, (
-                                        maximum,
-                                        item,
-                                      ) {
-                                        final right =
-                                            (item.floatingLeft ?? 0) +
-                                            (item.floatingWidth ?? 0);
-                                        return right > maximum
-                                            ? right
-                                            : maximum;
-                                      });
-                                      return LayoutBuilder(
-                                        builder: (context, constraints) {
-                                          final pageWidth = maxRight > 0
-                                              ? maxRight
-                                              : constraints.maxWidth;
-                                          final availableWidth =
-                                              constraints.maxWidth;
-                                          final left =
-                                              ((block.floatingLeft ?? 0) /
-                                                      pageWidth *
-                                                      availableWidth)
-                                                  .clamp(
-                                                    0,
-                                                    availableWidth * 0.6,
-                                                  )
-                                                  .toDouble();
-                                          final width =
-                                              ((block.floatingWidth ??
-                                                          pageWidth) /
-                                                      pageWidth *
-                                                      availableWidth)
-                                                  .clamp(
-                                                    0,
-                                                    availableWidth - left,
-                                                  )
-                                                  .toDouble();
-                                          return Padding(
-                                            padding: EdgeInsets.only(
-                                              left: left,
-                                            ),
-                                            child: Container(
-                                              width: width,
-                                              color: Color(
-                                                0xff000000 | background,
+                                                          final text = Text(
+                                                            run.text,
+                                                            textDirection:
+                                                                direction,
+                                                            style: style,
+                                                          );
+                                                          final hyperlink =
+                                                              run.hyperlink;
+                                                          return hyperlink ==
+                                                                  null
+                                                              ? text
+                                                              : GestureDetector(
+                                                                  behavior:
+                                                                      HitTestBehavior
+                                                                          .opaque,
+                                                                  onTap: () => unawaited(
+                                                                    _confirmAndOpenDocxLink(
+                                                                      context,
+                                                                      session,
+                                                                      hyperlink,
+                                                                    ),
+                                                                  ),
+                                                                  child: text,
+                                                                );
+                                                        },
+                                                      ),
+                                                ],
                                               ),
-                                              child: paragraph,
                                             ),
                                           );
-                                        },
-                                      );
-                                    }
-                                    if (block.type == 'tableRow') {
-                                      return _DocxTableRow(
-                                        block: block,
-                                        session: session,
-                                        scrollOffsets: _tableScrollOffsets,
-                                        onScroll: _scrollTable,
-                                        onOpenLink: (context, hyperlink) =>
-                                            _confirmAndOpenDocxLink(
-                                              context,
-                                              session,
-                                              hyperlink,
-                                            ),
-                                      );
-                                    }
-                                    return _DocxBlockView(
-                                      block: block,
-                                      session: session,
-                                    );
-                                  },
-                                ),
+                                          final background =
+                                              block.floatingBackground;
+                                          if (background == null)
+                                            return paragraph;
+                                          final maxRight = _blocks.fold<double>(
+                                            0,
+                                            (maximum, item) {
+                                              final right =
+                                                  (item.floatingLeft ?? 0) +
+                                                  (item.floatingWidth ?? 0);
+                                              return right > maximum
+                                                  ? right
+                                                  : maximum;
+                                            },
+                                          );
+                                          return LayoutBuilder(
+                                            builder: (context, constraints) {
+                                              final pageWidth = maxRight > 0
+                                                  ? maxRight
+                                                  : constraints.maxWidth;
+                                              final availableWidth =
+                                                  constraints.maxWidth;
+                                              final left =
+                                                  ((block.floatingLeft ?? 0) /
+                                                          pageWidth *
+                                                          availableWidth)
+                                                      .clamp(
+                                                        0,
+                                                        availableWidth * 0.6,
+                                                      )
+                                                      .toDouble();
+                                              final width =
+                                                  ((block.floatingWidth ??
+                                                              pageWidth) /
+                                                          pageWidth *
+                                                          availableWidth)
+                                                      .clamp(
+                                                        0,
+                                                        availableWidth - left,
+                                                      )
+                                                      .toDouble();
+                                              return Padding(
+                                                padding: EdgeInsets.only(
+                                                  left: left,
+                                                ),
+                                                child: Container(
+                                                  width: width,
+                                                  color: Color(
+                                                    0xff000000 | background,
+                                                  ),
+                                                  child: paragraph,
+                                                ),
+                                              );
+                                            },
+                                          );
+                                        }
+                                        if (block.type == 'tableRow') {
+                                          return _DocxTableRow(
+                                            block: block,
+                                            session: session,
+                                            scrollOffsets: _tableScrollOffsets,
+                                            onScroll: _scrollTable,
+                                            onOpenLink: (context, hyperlink) =>
+                                                _confirmAndOpenDocxLink(
+                                                  context,
+                                                  session,
+                                                  hyperlink,
+                                                ),
+                                          );
+                                        }
+                                        return _DocxBlockView(
+                                          block: block,
+                                          session: session,
+                                        );
+                                      },
+                                    ),
+                            ),
+                          ),
                         ),
-                      ),
+                        if (!widget.isChromeHidden)
+                          Positioned(
+                            right: 12,
+                            bottom: 80,
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .surfaceContainer
+                                    .withValues(alpha: 0.9),
+                                borderRadius: BorderRadius.circular(28),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.18),
+                                    blurRadius: 8,
+                                  ),
+                                ],
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    tooltip: 'Zoom in',
+                                    onPressed: () => _zoomBy(1.25),
+                                    icon: const Icon(Icons.add),
+                                  ),
+                                  IconButton(
+                                    tooltip: 'Zoom out',
+                                    onPressed: () => _zoomBy(0.8),
+                                    icon: const Icon(Icons.remove),
+                                  ),
+                                  IconButton(
+                                    tooltip: 'Reset zoom',
+                                    onPressed: () => _setZoom(1),
+                                    icon: const Icon(Icons.fit_screen),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
                   ),
                 ],
@@ -1116,6 +1318,10 @@ class _DocxBlockView extends StatelessWidget {
         path: block.imagePath!,
         width: block.imageWidth,
         height: block.imageHeight,
+        cropLeft: block.imageCropLeft,
+        cropTop: block.imageCropTop,
+        cropRight: block.imageCropRight,
+        cropBottom: block.imageCropBottom,
       );
       if (block.floatingShape == 'ellipse') {
         image = ClipOval(child: image);
@@ -1126,6 +1332,14 @@ class _DocxBlockView extends StatelessWidget {
         );
       }
       return image;
+    }
+    if (block.type == 'chart' && block.chartData != null) {
+      return SizedBox(
+        height: 260,
+        child: OfficeChartView(
+          chart: OfficeChartData.fromMap(block.chartData!),
+        ),
+      );
     }
     if (block.type == 'placeholder') {
       return Padding(
@@ -1174,9 +1388,14 @@ List<List<DocxTextRun>> _splitDocxTableCellParagraphs(List<DocxTextRun> runs) {
             underline: run.underline,
             strikethrough: run.strikethrough,
             fontSize: run.fontSize,
+            fontFamily: run.fontFamily,
             color: run.color,
             highlight: run.highlight,
             hyperlink: run.hyperlink,
+            imageCropLeft: run.imageCropLeft,
+            imageCropTop: run.imageCropTop,
+            imageCropRight: run.imageCropRight,
+            imageCropBottom: run.imageCropBottom,
           ),
         );
       }
@@ -1250,78 +1469,130 @@ class _DocxTableRow extends StatelessWidget {
           .skip(gridColumn)
           .take(span)
           .fold<double>(0, (total, width) => total + width);
+      final verticalMerge = index < block.tableCellVerticalMerges.length
+          ? block.tableCellVerticalMerges[index]
+          : null;
+      final cellBackground = index < block.tableCellBackgrounds.length
+          ? block.tableCellBackgrounds[index]
+          : null;
+      final cellBorderColor = index < block.tableCellBorders.length
+          ? block.tableCellBorders[index]
+          : null;
       rowChildren.add(
         SizedBox(
           width: cellWidth,
           child: Container(
             padding: EdgeInsets.all(8 * zoom),
             decoration: BoxDecoration(
-              border: Border.all(color: borderColor, width: 0.5 * zoom),
+              color: cellBackground != null
+                  ? _officeColor(cellBackground)
+                  : block.tableRowBackground == null
+                  ? null
+                  : _officeColor(block.tableRowBackground!),
+              border: Border(
+                left: BorderSide(
+                  color: cellBorderColor == null
+                      ? borderColor
+                      : _officeColor(cellBorderColor),
+                  width: 0.5 * zoom,
+                ),
+                right: BorderSide(
+                  color: cellBorderColor == null
+                      ? borderColor
+                      : _officeColor(cellBorderColor),
+                  width: 0.5 * zoom,
+                ),
+                top: verticalMerge == 'continue'
+                    ? BorderSide.none
+                    : BorderSide(
+                        color: cellBorderColor == null
+                            ? borderColor
+                            : _officeColor(cellBorderColor),
+                        width: 0.5 * zoom,
+                      ),
+                bottom: verticalMerge == 'restart'
+                    ? BorderSide.none
+                    : BorderSide(
+                        color: cellBorderColor == null
+                            ? borderColor
+                            : _officeColor(cellBorderColor),
+                        width: 0.5 * zoom,
+                      ),
+              ),
             ),
             constraints: BoxConstraints(minHeight: 40 * zoom),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                for (final paragraph in _splitDocxTableCellParagraphs(
-                  cells[index],
-                ))
-                  Wrap(
-                    textDirection: Directionality.of(context),
-                    children: [
-                      for (final run in paragraph)
-                        if (run.imagePath != null && session != null)
-                          _DocxImage(
-                            session: session!,
-                            path: run.imagePath!,
-                            width: run.imageWidth,
-                            height: run.imageHeight,
-                            inline: true,
-                          )
-                        else
-                          Builder(
-                            builder: (context) {
-                              final baseStyle = Theme.of(
-                                context,
-                              ).textTheme.bodyMedium;
-                              final text = Text(
-                                run.text,
-                                style: baseStyle?.copyWith(
-                                  fontWeight: run.bold ? FontWeight.bold : null,
-                                  fontStyle: run.italic
-                                      ? FontStyle.italic
-                                      : null,
-                                  decoration: run.underline || run.strikethrough
-                                      ? TextDecoration.combine([
-                                          if (run.underline)
-                                            TextDecoration.underline,
-                                          if (run.strikethrough)
-                                            TextDecoration.lineThrough,
-                                        ])
-                                      : null,
-                                  fontSize: run.fontSize == null
-                                      ? baseStyle.fontSize
-                                      : run.fontSize! * 4 / 3,
-                                  color: run.color == null
-                                      ? baseStyle.color
-                                      : Color(0xff000000 | run.color!),
-                                  backgroundColor: run.highlight == null
-                                      ? baseStyle.backgroundColor
-                                      : Color(0xff000000 | run.highlight!),
-                                ),
-                              );
-                              return run.hyperlink == null
-                                  ? text
-                                  : GestureDetector(
-                                      behavior: HitTestBehavior.opaque,
-                                      onTap: () => unawaited(
-                                        onOpenLink(context, run.hyperlink),
-                                      ),
-                                      child: text,
-                                    );
-                            },
-                          ),
-                    ],
-                  ),
+                if (verticalMerge != 'continue')
+                  for (final paragraph in _splitDocxTableCellParagraphs(
+                    cells[index],
+                  ))
+                    Wrap(
+                      textDirection: Directionality.of(context),
+                      children: [
+                        for (final run in paragraph)
+                          if (run.imagePath != null && session != null)
+                            _DocxImage(
+                              session: session!,
+                              path: run.imagePath!,
+                              width: run.imageWidth,
+                              height: run.imageHeight,
+                              cropLeft: run.imageCropLeft,
+                              cropTop: run.imageCropTop,
+                              cropRight: run.imageCropRight,
+                              cropBottom: run.imageCropBottom,
+                              inline: true,
+                            )
+                          else
+                            Builder(
+                              builder: (context) {
+                                final baseStyle = Theme.of(
+                                  context,
+                                ).textTheme.bodyMedium;
+                                final text = Text(
+                                  run.text,
+                                  style: baseStyle?.copyWith(
+                                    fontWeight: run.bold
+                                        ? FontWeight.bold
+                                        : null,
+                                    fontStyle: run.italic
+                                        ? FontStyle.italic
+                                        : null,
+                                    decoration:
+                                        run.underline || run.strikethrough
+                                        ? TextDecoration.combine([
+                                            if (run.underline)
+                                              TextDecoration.underline,
+                                            if (run.strikethrough)
+                                              TextDecoration.lineThrough,
+                                          ])
+                                        : null,
+                                    fontFamily: run.fontFamily,
+                                    fontSize: run.fontSize == null
+                                        ? baseStyle.fontSize
+                                        : run.fontSize! * 4 / 3,
+                                    color: run.color == null
+                                        ? baseStyle.color
+                                        : _officeColor(run.color!),
+                                    backgroundColor: run.highlight == null
+                                        ? baseStyle.backgroundColor
+                                        : _officeColor(run.highlight!),
+                                  ),
+                                );
+                                return run.hyperlink == null
+                                    ? text
+                                    : GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onTap: () => unawaited(
+                                          onOpenLink(context, run.hyperlink),
+                                        ),
+                                        child: text,
+                                      );
+                              },
+                            ),
+                      ],
+                    ),
               ],
             ),
           ),
@@ -1458,6 +1729,10 @@ class _DocxImage extends StatefulWidget {
     required this.path,
     required this.width,
     required this.height,
+    this.cropLeft = 0,
+    this.cropTop = 0,
+    this.cropRight = 0,
+    this.cropBottom = 0,
     this.inline = false,
   });
 
@@ -1465,6 +1740,10 @@ class _DocxImage extends StatefulWidget {
   final String path;
   final double? width;
   final double? height;
+  final double cropLeft;
+  final double cropTop;
+  final double cropRight;
+  final double cropBottom;
   final bool inline;
 
   @override
@@ -1528,30 +1807,64 @@ class _DocxImageState extends State<_DocxImage> {
       final viewportWidth = MediaQuery.sizeOf(context).width - 48;
       final zoom = MediaQuery.textScalerOf(context).scale(1);
       final width =
-          (widget.width ?? viewportWidth).clamp(24, 800).toDouble() * zoom;
+          (widget.width ?? viewportWidth)
+              .clamp(24, widget.inline ? 480 : 800)
+              .toDouble() *
+          zoom;
       final height = widget.height == null
           ? null
           : widget.height!.clamp(24, 900).toDouble() * zoom;
+      final cropLeft = widget.cropLeft.clamp(0.0, 0.9);
+      final cropTop = widget.cropTop.clamp(0.0, 0.9);
+      final cropRight = widget.cropRight.clamp(0.0, 0.9 - cropLeft);
+      final cropBottom = widget.cropBottom.clamp(0.0, 0.9 - cropTop);
+      final visibleWidth = 1 - cropLeft - cropRight;
+      final visibleHeight = 1 - cropTop - cropBottom;
+      final sourceWidth = width / visibleWidth;
+      final sourceHeight = height == null ? null : height / visibleHeight;
+      final image = Image.memory(
+        bytes,
+        width: sourceWidth,
+        height: sourceHeight,
+        fit: cropLeft == 0 && cropTop == 0 && cropRight == 0 && cropBottom == 0
+            ? BoxFit.contain
+            : BoxFit.fill,
+        cacheWidth: (sourceWidth * pixelRatio).round().clamp(1, 2048).toInt(),
+        cacheHeight: sourceHeight == null
+            ? null
+            : (sourceHeight * pixelRatio).round().clamp(1, 2048).toInt(),
+        errorBuilder: (context, error, stackTrace) =>
+            const _DocxObjectPlaceholder('Unsupported image'),
+      );
+      final displayedImage =
+          height == null ||
+              (cropLeft == 0 &&
+                  cropTop == 0 &&
+                  cropRight == 0 &&
+                  cropBottom == 0)
+          ? image
+          : SizedBox(
+              width: width,
+              height: height,
+              child: ClipRect(
+                child: Stack(
+                  children: [
+                    Positioned(
+                      left: -cropLeft * sourceWidth,
+                      top: -cropTop * sourceHeight!,
+                      width: sourceWidth,
+                      height: sourceHeight,
+                      child: image,
+                    ),
+                  ],
+                ),
+              ),
+            );
       return Padding(
         padding: widget.inline
             ? EdgeInsets.zero
             : const EdgeInsets.symmetric(vertical: 8),
-        child: Center(
-          child: Image.memory(
-            bytes,
-            width: widget.inline
-                ? width.clamp(24, 480 * zoom).toDouble()
-                : width,
-            height: height,
-            fit: BoxFit.contain,
-            cacheWidth: (width * pixelRatio).round().clamp(1, 2048).toInt(),
-            cacheHeight: height == null
-                ? null
-                : (height * pixelRatio).round().clamp(1, 2048).toInt(),
-            errorBuilder: (context, error, stackTrace) =>
-                const _DocxObjectPlaceholder('Unsupported image'),
-          ),
-        ),
+        child: Center(child: displayedImage),
       );
     },
   );

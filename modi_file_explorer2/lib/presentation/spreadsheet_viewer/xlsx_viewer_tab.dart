@@ -32,12 +32,15 @@ class _XlsxViewerTabState extends ConsumerState<XlsxViewerTab>
     with AutomaticKeepAliveClientMixin {
   XlsxReadSession? _session;
   XlsxSpreadsheetGridSource? _source;
+  final GlobalKey<SpreadsheetGridState> _gridKey =
+      GlobalKey<SpreadsheetGridState>();
   List<XlsxSheetInfo> _sheets = const [];
   int _selectedSheet = 0;
   int _loadGeneration = 0;
   Object? _loadError;
   bool _isVisible = false;
   bool _isOpening = false;
+  bool _freezePanes = false;
 
   @override
   bool get wantKeepAlive => true;
@@ -54,6 +57,7 @@ class _XlsxViewerTabState extends ConsumerState<XlsxViewerTab>
     if (oldWidget.path != widget.path) {
       _closeWorkbook();
       _loadError = null;
+      _freezePanes = false;
       if (_isVisible) unawaited(_openFile());
     }
   }
@@ -116,6 +120,20 @@ class _XlsxViewerTabState extends ConsumerState<XlsxViewerTab>
       setState(() {
         _session = session;
         _sheets = session!.sheets;
+        if (source.sheetTabColor != null) {
+          _sheets = _sheets
+              .map(
+                (sheet) => sheet.id == session!.sheets.first.id
+                    ? XlsxSheetInfo(
+                        id: sheet.id,
+                        name: sheet.name,
+                        defaultRowHeight: sheet.defaultRowHeight,
+                        tabColor: source.sheetTabColor,
+                      )
+                    : sheet,
+              )
+              .toList(growable: false);
+        }
         _source = source;
         _selectedSheet = 0;
         _isOpening = false;
@@ -152,6 +170,21 @@ class _XlsxViewerTabState extends ConsumerState<XlsxViewerTab>
         return;
       }
       setState(() => _source = source);
+      if (source.sheetTabColor != null) {
+        setState(() {
+          _sheets = [
+            for (var sheetIndex = 0; sheetIndex < _sheets.length; sheetIndex++)
+              sheetIndex == index
+                  ? XlsxSheetInfo(
+                      id: _sheets[sheetIndex].id,
+                      name: _sheets[sheetIndex].name,
+                      defaultRowHeight: _sheets[sheetIndex].defaultRowHeight,
+                      tabColor: source.sheetTabColor,
+                    )
+                  : _sheets[sheetIndex],
+          ];
+        });
+      }
       source.continueParsing();
     } catch (error) {
       if (!mounted || generation != _loadGeneration) return;
@@ -176,6 +209,48 @@ class _XlsxViewerTabState extends ConsumerState<XlsxViewerTab>
         useSavedDefaultApps: false,
         allowSaveDefault: false,
       ),
+      actions: [
+        IconButton(
+          tooltip: 'Go to cell',
+          onPressed: source == null
+              ? null
+              : () => showSpreadsheetGoToCell(context, _gridKey),
+          icon: const Icon(Icons.my_location),
+        ),
+        IconButton(
+          tooltip: 'Find in sheet',
+          onPressed: source == null
+              ? null
+              : () => showSpreadsheetFind(context, _gridKey),
+          icon: const Icon(Icons.search),
+        ),
+        PopupMenuButton<bool>(
+          tooltip: 'Spreadsheet options',
+          onSelected: (freeze) => setState(() => _freezePanes = freeze),
+          itemBuilder: (context) => [
+            PopupMenuItem<bool>(
+              value: !_freezePanes,
+              enabled:
+                  source != null &&
+                  (source.freezeRowCount > 0 || source.freezeColumnCount > 0),
+              child: Row(
+                children: [
+                  const Icon(Icons.push_pin_outlined),
+                  const SizedBox(width: 12),
+                  const Expanded(child: Text('Freeze panes')),
+                  Checkbox(value: _freezePanes, onChanged: null),
+                ],
+              ),
+            ),
+          ],
+          child: const Padding(
+            padding: EdgeInsets.all(12),
+            child: Icon(Icons.more_vert),
+          ),
+        ),
+      ],
+      notShownFeaturesProvider: () => source?.omittedFeatureLabels ?? const [],
+      notShownListenable: source,
       child: _loadError != null
           ? Center(
               child: Padding(
@@ -201,9 +276,12 @@ class _XlsxViewerTabState extends ConsumerState<XlsxViewerTab>
               children: [
                 Expanded(
                   child: SpreadsheetGrid(
-                    key: ValueKey(_selectedSheet),
+                    key: _gridKey,
                     source: source,
                     onZoomChanged: widget.onZoomChanged,
+                    freezePanes: _freezePanes,
+                    freezeRowCount: source.freezeRowCount,
+                    freezeColumnCount: source.freezeColumnCount,
                   ),
                 ),
                 _SheetTabs(
@@ -257,7 +335,11 @@ class _SheetTabs extends StatelessWidget {
               child: MarqueeText(
                 sheets[index].name,
                 isActive: selected,
-                style: Theme.of(context).textTheme.labelLarge,
+                style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                  color: sheets[index].tabColor == null
+                      ? null
+                      : Color(sheets[index].tabColor!),
+                ),
                 styleMode: MarqueeStyle.pauseAndLoop,
               ),
             ),
@@ -279,6 +361,7 @@ class XlsxSpreadsheetGridSource extends SpreadsheetGridDataSource {
       _visibleColumnIndexes = const [0],
       _columnWidths = const {},
       _omittedFeatureLabels = const [],
+      _charts = const [],
       _defaultRowHeight = sheet.defaultRowHeight;
 
   static Future<XlsxSpreadsheetGridSource> open(
@@ -297,9 +380,13 @@ class XlsxSpreadsheetGridSource extends SpreadsheetGridDataSource {
   bool _isComplete;
   bool _isTruncated;
   int _columnCount;
+  int _freezeRowCount = 0;
+  int _freezeColumnCount = 0;
+  int? _sheetTabColor;
   List<int> _visibleColumnIndexes;
   Map<int, double> _columnWidths;
   List<String> _omittedFeatureLabels;
+  List<Map<Object?, Object?>> _charts;
   double _defaultRowHeight;
   final List<int> _rowNumbers = [];
   final Map<int, double> _rowHeights = {};
@@ -312,6 +399,12 @@ class XlsxSpreadsheetGridSource extends SpreadsheetGridDataSource {
 
   @override
   int get columnCount => _columnCount;
+
+  int get freezeRowCount => _freezeRowCount;
+
+  int get freezeColumnCount => _freezeColumnCount;
+
+  int? get sheetTabColor => _sheetTabColor;
 
   @override
   List<int> get visibleColumnIndexes => _visibleColumnIndexes;
@@ -336,7 +429,11 @@ class XlsxSpreadsheetGridSource extends SpreadsheetGridDataSource {
   List<String> get omittedFeatureLabels => _omittedFeatureLabels;
 
   @override
-  bool get isIndexing => !_isComplete && _warningMessage == null;
+  @override
+  List<Map<Object?, Object?>> get charts => _charts;
+
+  @override
+  bool get isIndexing => !_stopped && !_isComplete && _warningMessage == null;
 
   @override
   bool get isTruncated => _isTruncated;
@@ -360,8 +457,15 @@ class XlsxSpreadsheetGridSource extends SpreadsheetGridDataSource {
     _columnCount = progress.columnCount;
     _visibleColumnIndexes = progress.visibleColumnIndexes;
     _columnWidths = progress.columnWidths;
-    _omittedFeatureLabels = progress.omittedFeatureLabels;
+    _omittedFeatureLabels = {
+      ...progress.omittedFeatureLabels,
+      ...progress.notShownFeatures,
+    }.toList(growable: false);
+    _charts = progress.charts;
     _defaultRowHeight = progress.defaultRowHeight;
+    _freezeRowCount = progress.freezeRowCount;
+    _freezeColumnCount = progress.freezeColumnCount;
+    _sheetTabColor = progress.tabColor ?? _sheetTabColor;
     if (progress.rows.any((row) => row.isTruncated)) {
       _warningMessage = 'Some cell text exceeded the XLSX viewer limit.';
     }
@@ -434,6 +538,7 @@ class XlsxSpreadsheetGridSource extends SpreadsheetGridDataSource {
 
   @override
   void dispose() {
+    if (!_stopped) notifyListeners();
     _stopped = true;
     _rowCache.clear();
     super.dispose();

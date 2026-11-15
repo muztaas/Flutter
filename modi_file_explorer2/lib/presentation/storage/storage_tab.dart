@@ -98,6 +98,8 @@ enum _BatchRenameScope { nameOnly, nameAndExtension }
 
 enum _BatchCollisionChoice { overwrite, rename, skip, cancel, resolveOneByOne }
 
+enum _DocumentMismatchChoice { cancel, openDetected, continueAsDocument }
+
 class _OpenWithSelection {
   const _OpenWithSelection({
     required this.saveAsDefault,
@@ -134,9 +136,20 @@ String _categoryDescription(String category) => switch (category) {
   'Audio' => 'audio',
   'Video' => 'video',
   'Text' => 'text',
-  'Documents' => 'a PDF',
+  'Documents' => 'a document',
   'Archives' => 'an archive',
   _ => category,
+};
+
+const _officeMimeTypes = <String, String>{
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+      'Word',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'Excel',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+      'PowerPoint',
+  'application/msword': 'Word (legacy)',
+  'application/vnd.ms-excel': 'Excel (legacy)',
+  'application/vnd.ms-powerpoint': 'PowerPoint (legacy)',
 };
 
 class _BatchRenameEntry {
@@ -516,7 +529,11 @@ class StorageTab extends ConsumerStatefulWidget {
 }
 
 class StorageTabState extends ConsumerState<StorageTab>
-    with AutomaticKeepAliveClientMixin {
+    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
+  static const _folderCacheFallbackDelay = Duration(seconds: 5);
+  static const _currentFolderQuickCheckInterval = Duration(seconds: 5);
+  static const _currentFolderFingerprintEntryLimit = 200;
+  static const _largeFolderSafetyRefreshInterval = Duration(minutes: 1);
   static const _imageSortPreferenceKey = 'images.sort';
   static const _categoryDirectoryCacheVersion = 4;
   static const _maximumCachedCategoryFoldersPerType = 2048;
@@ -634,11 +651,18 @@ class StorageTabState extends ConsumerState<StorageTab>
   bool _isListScrolling = false;
   int _activePointerCount = 0;
   bool _isRefreshing = false;
+  bool _driveDescendantRefreshInProgress = false;
+  bool _currentFolderQuickCheckInProgress = false;
+  String? _quickCheckPath;
+  int? _quickCheckDirectoryModified;
+  DateTime? _lastLargeFolderSafetyRefresh;
   final ValueNotifier<bool> _refreshingNotifier = ValueNotifier(false);
   final ValueNotifier<int> _itemsRevision = ValueNotifier(0);
   ({Directory directory, List<FileSystemEntity> items})? _pendingScanResult;
   _PendingFolderRefresh? _pendingFolderRefresh;
+  final List<_PendingFolderRefresh> _queuedFolderRefreshes = [];
   Timer? _folderRefreshApplyTimer;
+  Timer? _currentFolderQuickCheckTimer;
   _PendingCategoryRefresh? _pendingCategoryRefresh;
   Timer? _categoryRefreshApplyTimer;
   final Object _refreshOwner = Object();
@@ -674,12 +698,22 @@ class StorageTabState extends ConsumerState<StorageTab>
     );
   }
 
+  static Future<void> refreshMountedTabSession(String sessionId) async {
+    final tab = _mountedStorageTabs
+        .where((candidate) => candidate.widget.searchSessionId == sessionId)
+        .firstOrNull;
+    if (tab == null) return;
+    await tab._refreshCurrentFolderInBackground();
+  }
+
   Timer? _pressTimer;
   bool _longPressTriggered = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    TabsManager.instance.addListener(_onTabsChanged);
     _mountedStorageTabs.add(this);
     _listScrollController.addListener(_rememberScrollOffset);
     _copySession = widget.copySession ?? StorageCopySession();
@@ -690,6 +724,114 @@ class StorageTabState extends ConsumerState<StorageTab>
       if (mounted) _copySession.notifyChanged();
     });
     _prepareAndLoadRoot(widget.initialPath);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _scheduleCurrentFolderQuickCheck();
+    } else {
+      _currentFolderQuickCheckTimer?.cancel();
+      _currentFolderQuickCheckTimer = null;
+    }
+  }
+
+  void _onTabsChanged() {
+    _scheduleCurrentFolderQuickCheck();
+  }
+
+  bool get _isSelectedStorageTab {
+    final tabs = TabsManager.instance.tabs;
+    final selectedIndex = TabsManager.instance.selectedIndex;
+    return selectedIndex >= 0 &&
+        selectedIndex < tabs.length &&
+        tabs[selectedIndex].sessionId == widget.searchSessionId;
+  }
+
+  void _scheduleCurrentFolderQuickCheck() {
+    _currentFolderQuickCheckTimer?.cancel();
+    _currentFolderQuickCheckTimer = null;
+    if (!mounted ||
+        _isCategoryTab ||
+        _dir == null ||
+        !_isSelectedStorageTab ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    _quickCheckPath = _normalizedPath(_dir!.path);
+    _quickCheckDirectoryModified = null;
+    _lastLargeFolderSafetyRefresh = DateTime.now();
+    _currentFolderQuickCheckTimer = Timer.periodic(
+      _currentFolderQuickCheckInterval,
+      (_) => unawaited(_checkCurrentFolderForChanges()),
+    );
+  }
+
+  Future<void> _checkCurrentFolderForChanges() async {
+    final directory = _dir;
+    if (!mounted ||
+        directory == null ||
+        !_isSelectedStorageTab ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed ||
+        _currentFolderQuickCheckInProgress ||
+        _isRefreshing ||
+        _driveDescendantRefreshInProgress ||
+        _pendingFolderRefresh != null ||
+        _queuedFolderRefreshes.isNotEmpty) {
+      return;
+    }
+
+    final path = directory.path;
+    final normalizedPath = _normalizedPath(path);
+    if (_quickCheckPath != normalizedPath) {
+      _quickCheckPath = normalizedPath;
+      _quickCheckDirectoryModified = null;
+      _lastLargeFolderSafetyRefresh = DateTime.now();
+    }
+
+    _currentFolderQuickCheckInProgress = true;
+    try {
+      final oldSnapshot =
+          _folderSnapshots[_directoryCacheKey(path)] ??
+          const <String, Map<String, Object?>>{};
+      final result = await compute<Map<String, Object?>, Map<String, Object?>>(
+        _quickCheckFolderListing,
+        {
+          'path': path,
+          'oldEntries': oldSnapshot,
+          'previousDirectoryModified': _quickCheckDirectoryModified,
+          'fingerprintEntryLimit': _currentFolderFingerprintEntryLimit,
+        },
+      );
+      if (!mounted ||
+          _normalizedPath(_dir?.path ?? '') != normalizedPath ||
+          !_isSelectedStorageTab) {
+        return;
+      }
+
+      final directoryModified = result['directoryModified'] as int?;
+      if (directoryModified != null) {
+        _quickCheckDirectoryModified = directoryModified;
+      }
+      final changed = result['changed'] == true;
+      final isLargeFolder = result['isLargeFolder'] == true;
+      final now = DateTime.now();
+      final needsSafetyRefresh =
+          isLargeFolder &&
+          _lastLargeFolderSafetyRefresh != null &&
+          now.difference(_lastLargeFolderSafetyRefresh!) >=
+              _largeFolderSafetyRefreshInterval;
+      if (!changed && !needsSafetyRefresh) return;
+
+      _lastLargeFolderSafetyRefresh = now;
+      await _runFolderRefresh(path, RefreshPriority.visiblePage);
+    } on RefreshCancelled {
+      // The next foreground check can retry work cancelled with its tab.
+    } catch (error) {
+      debugPrint('Could not check current folder "$path" for changes: $error');
+    } finally {
+      _currentFolderQuickCheckInProgress = false;
+    }
   }
 
   Future<void> _prepareAndLoadRoot(String? path) async {
@@ -860,16 +1002,23 @@ class StorageTabState extends ConsumerState<StorageTab>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    TabsManager.instance.removeListener(_onTabsChanged);
     _mountedStorageTabs.remove(this);
     unawaited(_fileChangeSubscription.cancel());
     _categoryRefreshApplyTimer?.cancel();
     _folderRefreshApplyTimer?.cancel();
+    _currentFolderQuickCheckTimer?.cancel();
     RefreshCoordinator.instance.cancelOwner(_refreshOwner);
     final pendingFolderRefresh = _pendingFolderRefresh;
     if (pendingFolderRefresh != null &&
         !pendingFolderRefresh.completer.isCompleted) {
       pendingFolderRefresh.completer.complete();
     }
+    for (final pending in _queuedFolderRefreshes) {
+      if (!pending.completer.isCompleted) pending.completer.complete();
+    }
+    _queuedFolderRefreshes.clear();
     final pendingRefresh = _pendingCategoryRefresh;
     if (pendingRefresh != null && !pendingRefresh.completer.isCompleted) {
       pendingRefresh.completer.complete();
@@ -1138,7 +1287,36 @@ class StorageTabState extends ConsumerState<StorageTab>
       );
     }
 
-    if (!forceRefresh && cachedItems != null) {
+    final useDelayedFolderFallback =
+        !_isCategoryTab &&
+        !forceRefresh &&
+        !targetedChange &&
+        !backgroundRefresh;
+    var cachedFallbackShown = false;
+    var exactListingFinished = false;
+    if (useDelayedFolderFallback) {
+      unawaited(() async {
+        await Future<void>.delayed(_folderCacheFallbackDelay);
+        if (exactListingFinished) return;
+        try {
+          cachedFallbackShown = await _showCachedFolderFallback(
+            directory: dir,
+            cacheKey: cacheKey,
+            cachedItems: cachedItems,
+            navigationRequestId: navigationRequestId,
+            navigationTimer: navigationTimer,
+            isExactListingFinished: () => exactListingFinished,
+          );
+        } catch (error, stackTrace) {
+          debugPrint(
+            'Could not show folder fallback cache "${dir.path}": '
+            '$error\n$stackTrace',
+          );
+        }
+      }());
+    }
+
+    if (!forceRefresh && cachedItems != null && !useDelayedFolderFallback) {
       final items = List<FileSystemEntity>.of(cachedItems);
       _sortList(items, _sortBy, _sortAscending);
       _markFolderSnapshotVisibility(cacheKey, items);
@@ -1160,6 +1338,7 @@ class StorageTabState extends ConsumerState<StorageTab>
             _normalizedPath(dir.path) ==
                 _normalizedPath(_categoryInitialPath ?? '');
       });
+      _scheduleCurrentFolderQuickCheck();
       _reportNavigationFrame(navigationTimer, dir.path);
       if (!backgroundRefresh) {
         _reportCurrentLocation(dir.path);
@@ -1176,7 +1355,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
 
     var persistentCacheNeedsRefresh = false;
-    if (!_isCategoryTab && !forceRefresh) {
+    if (!_isCategoryTab && !forceRefresh && !useDelayedFolderFallback) {
       final cachedFolder = await FilesystemCache.instance.loadFolder(
         _volumeIdForPath(dir.path),
         dir.path,
@@ -1290,13 +1469,14 @@ class StorageTabState extends ConsumerState<StorageTab>
             _normalizedPath(dir.path) ==
                 _normalizedPath(_categoryInitialPath ?? '');
       });
+      _scheduleCurrentFolderQuickCheck();
       _reportNavigationFrame(navigationTimer, dir.path);
       _reportCurrentLocation(dir.path);
       _scheduleScrollRestoreAfterLayout();
       _copySession.notifyChanged();
       return;
     }
-    if (!forceRefresh && cachedItems != null) {
+    if (!forceRefresh && cachedItems != null && !useDelayedFolderFallback) {
       final items = List<FileSystemEntity>.of(cachedItems);
       _sortList(items, _sortBy, _sortAscending);
       _markFolderSnapshotVisibility(cacheKey, items);
@@ -1318,6 +1498,7 @@ class StorageTabState extends ConsumerState<StorageTab>
             _normalizedPath(dir.path) ==
                 _normalizedPath(_categoryInitialPath ?? '');
       });
+      _scheduleCurrentFolderQuickCheck();
       _reportNavigationFrame(navigationTimer, dir.path);
       if (!backgroundRefresh) {
         _reportCurrentLocation(dir.path);
@@ -1447,12 +1628,17 @@ class StorageTabState extends ConsumerState<StorageTab>
       }
       _sortList(items, _sortBy, _sortAscending);
     } catch (error) {
+      exactListingFinished = true;
       if (preserveCurrentResults) {
         await FilesystemCache.instance.markFolderStale(
           _volumeIdForPath(dir.path),
           dir.path,
         );
         debugPrint('Could not refresh folder "${dir.path}": $error');
+        return;
+      }
+      if (cachedFallbackShown) {
+        debugPrint('Could not load exact folder listing "${dir.path}": $error');
         return;
       }
       items = [];
@@ -1504,7 +1690,10 @@ class StorageTabState extends ConsumerState<StorageTab>
       _pendingScanResult = (directory: dir, items: items);
       return;
     }
-    if (!backgroundRefresh) _applyTopScrollReset(dir.path);
+    exactListingFinished = true;
+    if (!backgroundRefresh && !cachedFallbackShown) {
+      _applyTopScrollReset(dir.path);
+    }
     setState(() {
       _dir = dir;
       _items = items;
@@ -1516,8 +1705,11 @@ class StorageTabState extends ConsumerState<StorageTab>
           _normalizedPath(dir.path) ==
               _normalizedPath(_categoryInitialPath ?? '');
     });
-    _reportNavigationFrame(navigationTimer, dir.path);
-    if (!backgroundRefresh) {
+    _scheduleCurrentFolderQuickCheck();
+    if (!cachedFallbackShown) {
+      _reportNavigationFrame(navigationTimer, dir.path);
+    }
+    if (!backgroundRefresh && !cachedFallbackShown) {
       _reportCurrentLocation(dir.path);
       _scheduleScrollRestoreAfterLayout();
     }
@@ -1533,6 +1725,110 @@ class StorageTabState extends ConsumerState<StorageTab>
         'firstFrameMs=${timer.elapsedMilliseconds}',
       );
     });
+  }
+
+  Future<bool> _showCachedFolderFallback({
+    required Directory directory,
+    required String cacheKey,
+    required List<FileSystemEntity>? cachedItems,
+    required int navigationRequestId,
+    required Stopwatch? navigationTimer,
+    required bool Function() isExactListingFinished,
+  }) async {
+    if (!mounted ||
+        isExactListingFinished() ||
+        navigationRequestId != _navigationRequestId ||
+        _isCategoryTab) {
+      return false;
+    }
+
+    var fallbackItems = cachedItems;
+    CachedFolderListing? cachedFolder;
+    if (fallbackItems == null) {
+      try {
+        cachedFolder = await FilesystemCache.instance.loadFolder(
+          _volumeIdForPath(directory.path),
+          directory.path,
+          markUsed: true,
+        );
+      } catch (error) {
+        debugPrint(
+          'Could not load folder fallback cache "${directory.path}": $error',
+        );
+      }
+      if (cachedFolder != null) {
+        fallbackItems = cachedFolder.entries
+            .map(
+              (entry) =>
+                  entry.isDirectory ? Directory(entry.path) : File(entry.path),
+            )
+            .toList(growable: false);
+      }
+    }
+
+    if (fallbackItems == null ||
+        !mounted ||
+        isExactListingFinished() ||
+        navigationRequestId != _navigationRequestId) {
+      return false;
+    }
+
+    final settings = ref.read(appSettingsProvider);
+    if (!settings.showNomediaFiles &&
+        await _isInsideNoMediaDirectory(directory)) {
+      fallbackItems = const [];
+    } else {
+      fallbackItems = fallbackItems
+          .where((item) {
+            final name = _displayName(item.path);
+            return (name != '.nomedia' || settings.showNomediaFiles) &&
+                _isPathVisible(
+                  item.path,
+                  isDirectory: item is Directory,
+                  showHiddenFiles: name == '.nomedia'
+                      ? true
+                      : settings.showHiddenFiles,
+                );
+          })
+          .toList(growable: false);
+    }
+    if (!mounted ||
+        isExactListingFinished() ||
+        navigationRequestId != _navigationRequestId) {
+      return false;
+    }
+    _sortList(fallbackItems, _sortBy, _sortAscending);
+
+    if (cachedFolder != null) {
+      _putBounded(_folderSnapshots, cacheKey, {
+        for (final entry in cachedFolder.entries)
+          entry.path: <String, Object?>{
+            'path': entry.path,
+            'isDirectory': entry.isDirectory,
+            'size': entry.size,
+            'modified': entry.modifiedMilliseconds,
+            'visible': fallbackItems.any((item) => item.path == entry.path),
+          },
+      }, 128);
+    }
+    _putBounded(_directoryCache, cacheKey, fallbackItems, 128);
+    _putBounded(
+      _subfolderCache,
+      directory.path,
+      fallbackItems.any((item) => item is Directory),
+      512,
+    );
+    _applyTopScrollReset(directory.path);
+    setState(() {
+      _dir = directory;
+      _items = fallbackItems!;
+      _showCategoryDrivePicker = false;
+    });
+    _reportNavigationFrame(navigationTimer, directory.path);
+    _reportCurrentLocation(directory.path);
+    _scheduleScrollRestoreAfterLayout();
+    _copySession.notifyChanged();
+    return true;
   }
 
   Future<bool> _directoryEntriesChanged(
@@ -1573,7 +1869,14 @@ class StorageTabState extends ConsumerState<StorageTab>
         final root = Directory(_anchorPath ?? _dir!.path);
         await _refreshCategorySnapshot(root, RefreshPriority.visiblePage);
       } else if (_dir != null) {
-        await _runFolderRefresh(_dir!.path, RefreshPriority.visiblePage);
+        final currentPath = _dir!.path;
+        final driveRoot = _drivePathFor(currentPath);
+        final isDriveRoot =
+            _normalizedPath(currentPath) == _normalizedPath(driveRoot);
+        await _runFolderRefresh(currentPath, RefreshPriority.visiblePage);
+        if (isDriveRoot) {
+          await _refreshDescendants(currentPath);
+        }
       }
     } on RefreshCancelled {
       // A closed tab no longer owns this refresh.
@@ -1583,7 +1886,66 @@ class StorageTabState extends ConsumerState<StorageTab>
       debugPrint('Could not refresh page: $error');
     } finally {
       _isRefreshing = false;
-      _refreshingNotifier.value = false;
+      if (mounted) _refreshingNotifier.value = false;
+    }
+  }
+
+  Future<void> _refreshCurrentFolderInBackground() async {
+    if (!mounted) return;
+    final directory = _dir;
+    if (_showCategoryDrivePicker) {
+      await ref.read(availableStorageDevicesProvider.notifier).refresh();
+      return;
+    }
+    if (directory == null) return;
+    try {
+      if (_isCategoryTab) {
+        await _refreshCategorySnapshot(
+          Directory(_anchorPath ?? directory.path),
+          RefreshPriority.visiblePage,
+        );
+      } else {
+        await _runFolderRefresh(directory.path, RefreshPriority.visiblePage);
+      }
+    } on RefreshCancelled {
+      // The selected page may have closed while its resume refresh was running.
+    } catch (error) {
+      debugPrint(
+        'Could not refresh current folder "${directory.path}" on resume: $error',
+      );
+    }
+  }
+
+  Future<void> _refreshDescendants(String path) async {
+    if (_driveDescendantRefreshInProgress) return;
+    _driveDescendantRefreshInProgress = true;
+    try {
+      final pending = <String>[path];
+      final visited = <String>{_normalizedPath(path)};
+      while (pending.isNotEmpty && mounted) {
+        final parentPath = pending.removeAt(0);
+        final snapshot =
+            _folderSnapshots[_directoryCacheKey(parentPath)] ??
+            const <String, Map<String, Object?>>{};
+        final childPaths = snapshot.values
+            .where((entry) => entry['isDirectory'] == true)
+            .map((entry) => entry['path']! as String)
+            .toList(growable: false);
+        for (final childPath in childPaths) {
+          if (!mounted) return;
+          if (!visited.add(_normalizedPath(childPath))) continue;
+          try {
+            await _runFolderRefresh(childPath, RefreshPriority.openPages);
+            pending.add(childPath);
+          } on RefreshCancelled {
+            return;
+          } catch (error) {
+            debugPrint('Could not refresh child folder "$childPath": $error');
+          }
+        }
+      }
+    } finally {
+      _driveDescendantRefreshInProgress = false;
     }
   }
 
@@ -1703,7 +2065,11 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
   }
 
-  Future<void> _runFolderRefresh(String path, RefreshPriority priority) async {
+  Future<void> _runFolderRefresh(
+    String path,
+    RefreshPriority priority, {
+    bool waitForApply = true,
+  }) async {
     final volumeId = _volumeIdForPath(path);
     final cacheKey = _directoryCacheKey(path);
     var oldSnapshot = _folderSnapshots[cacheKey];
@@ -1760,20 +2126,37 @@ class StorageTabState extends ConsumerState<StorageTab>
       },
     );
     if (!mounted) return;
-    while (_pendingFolderRefresh != null) {
-      final active = _pendingFolderRefresh!;
-      await active.completer.future;
-      if (normalizeSortPath(active.path) == normalizeSortPath(path)) return;
-      if (!mounted) return;
-    }
     final pending = _PendingFolderRefresh(
       path: path,
       diff: diff,
       completer: Completer<void>(),
     );
-    _pendingFolderRefresh = pending;
+    final normalizedPath = normalizeSortPath(path);
+    final active = _pendingFolderRefresh;
+    if (active != null && normalizeSortPath(active.path) == normalizedPath) {
+      if (waitForApply) await active.completer.future;
+      return;
+    }
+    final queued = _queuedFolderRefreshes
+        .where((item) => normalizeSortPath(item.path) == normalizedPath)
+        .firstOrNull;
+    if (queued != null) {
+      if (waitForApply) await queued.completer.future;
+      return;
+    }
+    if (active == null) {
+      _pendingFolderRefresh = pending;
+      _scheduleFolderRefreshApply();
+    } else {
+      _queuedFolderRefreshes.add(pending);
+    }
+    if (waitForApply) await pending.completer.future;
+  }
+
+  void _activateNextFolderRefresh() {
+    if (_pendingFolderRefresh != null || _queuedFolderRefreshes.isEmpty) return;
+    _pendingFolderRefresh = _queuedFolderRefreshes.removeAt(0);
     _scheduleFolderRefreshApply();
-    await pending.completer.future;
   }
 
   bool get _isFolderRefreshIdle {
@@ -1781,7 +2164,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         _isListScrolling ||
         _activePointerCount > 0 ||
         _selectionMode ||
-        _pressTimer != null ||
+        _pressTimer?.isActive == true ||
         _longPressTriggered ||
         _copySession.isPasting ||
         hasOpenContentSizedMenu) {
@@ -1816,6 +2199,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         _pendingFolderRefresh = null;
       }
       if (!pending.completer.isCompleted) pending.completer.complete();
+      _activateNextFolderRefresh();
     } catch (error, stackTrace) {
       debugPrint('Could not apply folder refresh: $error\n$stackTrace');
       if (!pending.completer.isCompleted) {
@@ -1824,6 +2208,7 @@ class StorageTabState extends ConsumerState<StorageTab>
       if (identical(_pendingFolderRefresh, pending)) {
         _pendingFolderRefresh = null;
       }
+      _activateNextFolderRefresh();
     }
   }
 
@@ -2205,7 +2590,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         _isListScrolling ||
         _activePointerCount > 0 ||
         _selectionMode ||
-        _pressTimer != null ||
+        _pressTimer?.isActive == true ||
         _longPressTriggered ||
         _copySession.isPasting ||
         hasOpenContentSizedMenu) {
@@ -5411,9 +5796,11 @@ class StorageTabState extends ConsumerState<StorageTab>
     bool forceCategory = false,
   }) async {
     final extension = _fileExtension(_displayName(file.path));
+    final shouldCheckSavedDefault = checkSavedDefault && !forceCategory;
     final detected = forceCategory ? await _sniffContent(file.path) : null;
     if (!mounted) return;
     if (forceCategory && detected == null) return;
+    var includeOfficeApps = false;
     if (forceCategory && detected != null) {
       final isTextMismatch =
           (category == 'Text' && !detected.isText) ||
@@ -5442,25 +5829,54 @@ class StorageTabState extends ConsumerState<StorageTab>
           category != 'Text' &&
           detected.category != category) {
         final detectedCategory = detected.category!;
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(
-            SnackBar(
-              content: Text(
-                'This file is ${detected.description}, not ${_categoryDescription(category)}.',
-              ),
-              action: SnackBarAction(
-                label: 'Open as ${detected.name}',
-                onPressed: () => _showOpenWithApplications(
-                  file,
-                  detectedCategory,
-                  checkSavedDefault: false,
-                  forceCategory: true,
-                ),
-              ),
+        final mismatchChoice = await showDialog<_DocumentMismatchChoice>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            content: Text(
+              'This file is ${detected.description}, not ${_categoryDescription(category)}.',
             ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(
+                  dialogContext,
+                  _DocumentMismatchChoice.cancel,
+                ),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(
+                  dialogContext,
+                  _DocumentMismatchChoice.openDetected,
+                ),
+                child: Text('Open as ${detected.name}'),
+              ),
+              if (category == 'Documents')
+                FilledButton(
+                  onPressed: () => Navigator.pop(
+                    dialogContext,
+                    _DocumentMismatchChoice.continueAsDocument,
+                  ),
+                  child: const Text('Continue as Document'),
+                ),
+            ],
+          ),
+        );
+        if (!mounted ||
+            mismatchChoice == null ||
+            mismatchChoice == _DocumentMismatchChoice.cancel) {
+          return;
+        }
+        if (mismatchChoice == _DocumentMismatchChoice.openDetected) {
+          await _showOpenWithApplications(
+            file,
+            detectedCategory,
+            checkSavedDefault: false,
+            forceCategory: true,
           );
-        return;
+          return;
+        }
+        includeOfficeApps =
+            mismatchChoice == _DocumentMismatchChoice.continueAsDocument;
       }
     }
 
@@ -5477,7 +5893,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         path: file.path,
         name: _displayName(file.path),
         excludeBuiltIn: !allowBuiltInHandlers,
-        useSavedDefaultApps: checkSavedDefault
+        useSavedDefaultApps: shouldCheckSavedDefault
             ? ref.read(appSettingsProvider).useSavedDefaultApps
             : false,
         mimeTypeOverride: contentMimeType,
@@ -5492,7 +5908,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         path: file.path,
         name: _displayName(file.path),
         excludeBuiltIn: !allowBuiltInHandlers,
-        useSavedDefaultApps: checkSavedDefault
+        useSavedDefaultApps: shouldCheckSavedDefault
             ? ref.read(appSettingsProvider).useSavedDefaultApps
             : false,
         mimeTypeOverride: contentMimeType,
@@ -5511,7 +5927,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         path: file.path,
         name: _displayName(file.path),
         excludeBuiltIn: !allowBuiltInHandlers,
-        useSavedDefaultApps: checkSavedDefault
+        useSavedDefaultApps: shouldCheckSavedDefault
             ? ref.read(appSettingsProvider).useSavedDefaultApps
             : false,
         mimeTypeOverride: contentMimeType,
@@ -5546,16 +5962,31 @@ class StorageTabState extends ConsumerState<StorageTab>
         );
         return;
       }
-      await openPdfFile(
-        context,
-        ref,
-        path: file.path,
-        name: _displayName(file.path),
-        useSavedDefaultApps: false,
-        mimeTypeOverride: contentMimeType,
-        allowSaveDefault: false,
-      );
-      return;
+      if (contentMimeType ==
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') {
+        await openSpreadsheetFile(
+          context,
+          ref,
+          path: file.path,
+          name: _displayName(file.path),
+          useSavedDefaultApps: false,
+          mimeTypeOverride: contentMimeType,
+          allowSaveDefault: false,
+        );
+        return;
+      }
+      if (contentMimeType == 'application/pdf') {
+        await openPdfFile(
+          context,
+          ref,
+          path: file.path,
+          name: _displayName(file.path),
+          useSavedDefaultApps: false,
+          mimeTypeOverride: contentMimeType,
+          allowSaveDefault: false,
+        );
+        return;
+      }
     }
     if (forceCategory && category == 'Video') {
       await openVideoFile(
@@ -5581,7 +6012,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         name: _displayName(file.path),
         excludeBuiltIn: !allowBuiltInHandlers,
         useSavedDefaultApps:
-            checkSavedDefault &&
+            shouldCheckSavedDefault &&
             ref.read(appSettingsProvider).useSavedDefaultApps,
       );
       return;
@@ -5625,7 +6056,7 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
     var effectiveCategory = category;
     if (!forceCategory &&
-        checkSavedDefault &&
+        shouldCheckSavedDefault &&
         extension.isNotEmpty &&
         ref.read(appSettingsProvider).useSavedDefaultApps) {
       final DefaultFileApp? savedDefault;
@@ -5736,13 +6167,37 @@ class StorageTabState extends ConsumerState<StorageTab>
 
     final List<OpenWithApp> listedApps;
     try {
-      listedApps = await ref
-          .read(openWithRepositoryProvider)
-          .listApps(
-            path: file.path,
-            category: effectiveCategory,
-            mimeType: contentMimeType,
-          );
+      final repository = ref.read(openWithRepositoryProvider);
+      if (includeOfficeApps) {
+        final appGroups = await Future.wait(
+          _officeMimeTypes.entries.map(
+            (entry) => repository.listApps(
+              path: file.path,
+              category: 'Documents',
+              mimeType: entry.key,
+            ),
+          ),
+        );
+        listedApps = [
+          for (var index = 0; index < appGroups.length; index++)
+            for (final app in appGroups[index])
+              OpenWithApp(
+                name:
+                    '${app.name} (${_officeMimeTypes.values.elementAt(index)})',
+                packageName: app.packageName,
+                mimeType: app.mimeType,
+                applicationName: app.applicationName,
+                activityName: app.activityName,
+                iconBytes: app.iconBytes,
+              ),
+        ];
+      } else {
+        listedApps = await repository.listApps(
+          path: file.path,
+          category: effectiveCategory,
+          mimeType: contentMimeType,
+        );
+      }
     } on PlatformException catch (error) {
       if (mounted) {
         _message(error.message ?? 'Could not find applications for this file');
@@ -5755,7 +6210,7 @@ class StorageTabState extends ConsumerState<StorageTab>
       return;
     }
     if (!mounted) return;
-    final apps = forceCategory && contentMimeType != null
+    final apps = forceCategory && contentMimeType != null && !includeOfficeApps
         ? listedApps
               .map(
                 (app) => OpenWithApp(
@@ -7833,6 +8288,7 @@ class StorageTabState extends ConsumerState<StorageTab>
         _longPressTriggered = false;
         _pressTimer?.cancel();
         _pressTimer = Timer(selectionLongPressDelay, () {
+          _pressTimer = null;
           if (!mounted) return;
           setState(() {
             _selectionMode = true;
@@ -7843,10 +8299,12 @@ class StorageTabState extends ConsumerState<StorageTab>
       },
       onTapUp: (_) {
         _pressTimer?.cancel();
+        _pressTimer = null;
         if (!_longPressTriggered) unawaited(_openEntity(entity));
       },
       onTapCancel: () {
         _pressTimer?.cancel();
+        _pressTimer = null;
         _longPressTriggered = false;
       },
       child: content,
@@ -8554,6 +9012,71 @@ Future<Map<String, Object?>> scanCategoryDirectoryTree(
       'hasCategoryFiles': false,
       'rootError': error.message,
     };
+  }
+}
+
+Map<String, Object?> _quickCheckFolderListing(Map<String, Object?> arguments) {
+  final path = arguments['path']! as String;
+  final previousDirectoryModified =
+      arguments['previousDirectoryModified'] as int?;
+  final fingerprintEntryLimit = arguments['fingerprintEntryLimit']! as int;
+  final oldEntries = (arguments['oldEntries']! as Map).map(
+    (key, value) =>
+        MapEntry(key as String, Map<String, Object?>.from(value as Map)),
+  );
+  try {
+    final directory = Directory(path);
+    final directoryStat = directory.statSync();
+    final entries = directory.listSync(followLinks: false);
+    final directoryModified = directoryStat.modified.millisecondsSinceEpoch;
+    if (entries.length > fingerprintEntryLimit) {
+      return {
+        'directoryModified': directoryModified,
+        'isLargeFolder': true,
+        'changed':
+            previousDirectoryModified != null &&
+            directoryModified != previousDirectoryModified,
+      };
+    }
+
+    final currentEntries = <String, Map<String, Object?>>{};
+    for (final entry in entries) {
+      final stat = entry.statSync();
+      currentEntries[entry.path] = {
+        'path': entry.path,
+        'isDirectory': entry is Directory,
+        'size': stat.size,
+        'modified': stat.modified.millisecondsSinceEpoch,
+      };
+    }
+    if (currentEntries.length != oldEntries.length) {
+      return {
+        'directoryModified': directoryModified,
+        'isLargeFolder': false,
+        'changed': true,
+      };
+    }
+    for (final entry in currentEntries.entries) {
+      final oldEntry = oldEntries[entry.key];
+      final current = entry.value;
+      if (oldEntry == null ||
+          oldEntry['isDirectory'] != current['isDirectory'] ||
+          oldEntry['size'] != current['size'] ||
+          oldEntry['modified'] != current['modified']) {
+        return {
+          'directoryModified': directoryModified,
+          'isLargeFolder': false,
+          'changed': true,
+        };
+      }
+    }
+    return {
+      'directoryModified': directoryModified,
+      'isLargeFolder': false,
+      'changed': false,
+    };
+  } on FileSystemException {
+    return {'directoryModified': null, 'isLargeFolder': false, 'changed': true};
   }
 }
 

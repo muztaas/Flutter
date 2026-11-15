@@ -40,9 +40,10 @@ dependencies:
   path_provider: ^2.1.6
   disk_space_2: ^1.0.13
   hive: ^2.2.3
+  pdfrx: 2.4.8
 
 dev_dependencies:
-  flutter_launcher_icons: ^0.10.0
+  flutter_launcher_icons: 0.14.4
   flutter_test:
     sdk: flutter
 
@@ -52,6 +53,10 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+
+dependency_overrides:
+  pdfrx_engine:
+    path: third_party/pdfrx_engine
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -94,11 +99,37 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+  fonts:
+    - family: Carlito
+      fonts:
+        - asset: assets/fonts/Carlito/Carlito-Regular.ttf
+        - asset: assets/fonts/Carlito/Carlito-Italic.ttf
+          style: italic
+        - asset: assets/fonts/Carlito/Carlito-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Carlito/Carlito-BoldItalic.ttf
+          style: italic
+          weight: 700
+    - family: Caladea
+      fonts:
+        - asset: assets/fonts/Caladea/Caladea-Regular.ttf
+        - asset: assets/fonts/Caladea/Caladea-Italic.ttf
+          style: italic
+        - asset: assets/fonts/Caladea/Caladea-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Caladea/Caladea-BoldItalic.ttf
+          style: italic
+          weight: 700
   assets:
     - lib/assets/icons/app_icon.svg
     - assets/branding/logo2.png
     - assets/branding/logo_foreground.png
     - assets/apache-2.0.txt
+    - assets/pdfium/LICENSE
+    - assets/pdfium/licenses/
+    - third_party/pdfrx_engine/LICENSE
+    - assets/fonts/Carlito/OFL.txt
+    - assets/fonts/Caladea/OFL.txt
 
 flutter_icons:
   android: true

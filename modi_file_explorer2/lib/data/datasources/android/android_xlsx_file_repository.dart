@@ -25,6 +25,7 @@ class AndroidXlsxFileRepository implements XlsxFileRepository {
               id: sheet['id']! as String,
               name: sheet['name']! as String,
               defaultRowHeight: (sheet['defaultRowHeight'] as num).toDouble(),
+              tabColor: sheet['tabColor'] as int?,
             ),
           )
           .toList(growable: false),
@@ -70,10 +71,10 @@ class _AndroidXlsxReadSession implements XlsxReadSession {
     String method, [
     Map<String, Object?> arguments = const {},
   ]) async {
-    final result = await _channel.invokeMapMethod<String, Object?>(
-      method,
-      {'id': _id, ...arguments},
-    );
+    final result = await _channel.invokeMapMethod<String, Object?>(method, {
+      'id': _id,
+      ...arguments,
+    });
     if (result == null) {
       throw const FormatException('The workbook reader returned no data.');
     }
@@ -103,6 +104,16 @@ class _AndroidXlsxReadSession implements XlsxReadSession {
       omittedFeatureLabels: (result['omittedFeatures']! as List)
           .cast<String>()
           .toList(growable: false),
+      freezeRowCount: result['freezeRowCount'] as int? ?? 0,
+      freezeColumnCount: result['freezeColumnCount'] as int? ?? 0,
+      tabColor: result['tabColor'] as int?,
+      notShownFeatures: (result['notShown'] as List? ?? const [])
+          .cast<String>()
+          .toList(growable: false),
+      charts: (result['charts'] as List? ?? const [])
+          .whereType<Map>()
+          .map((chart) => Map<Object?, Object?>.from(chart))
+          .toList(growable: false),
     );
   }
 
@@ -113,6 +124,17 @@ class _AndroidXlsxReadSession implements XlsxReadSession {
         rowNumber: row['rowNumber']! as int,
         rowHeight: (row['height'] as num?)?.toDouble(),
         isTruncated: row['truncated']! as bool,
+        cellStyles: (row['styles'] as List? ?? const [])
+            .map((style) => Map<String, Object?>.from(style as Map))
+            .toList(growable: false),
+        cellRichText: (row['richText'] as List? ?? const [])
+            .map((runs) {
+              if (runs == null) return null;
+              return (runs as List)
+                  .map((run) => Map<String, Object?>.from(run as Map))
+                  .toList(growable: false);
+            })
+            .toList(growable: false),
       );
 
   void _ensureOpen() {

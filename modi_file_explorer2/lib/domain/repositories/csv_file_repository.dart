@@ -24,6 +24,8 @@ class SpreadsheetRowData {
     this.columnIndexes,
     this.rowNumber,
     this.rowHeight,
+    this.cellStyles = const [],
+    this.cellRichText = const [],
   });
 
   final List<String> cells;
@@ -31,6 +33,24 @@ class SpreadsheetRowData {
   final List<int>? columnIndexes;
   final int? rowNumber;
   final double? rowHeight;
+  final List<Map<String, Object?>> cellStyles;
+  final List<List<Map<String, Object?>>?> cellRichText;
+
+  Map<String, Object?>? styleAt(int column) {
+    final indexes = columnIndexes;
+    if (indexes == null) return null;
+    final index = _findColumn(indexes, column);
+    return index < 0 || index >= cellStyles.length ? null : cellStyles[index];
+  }
+
+  List<Map<String, Object?>>? richTextAt(int column) {
+    final indexes = columnIndexes;
+    if (indexes == null) return null;
+    final index = _findColumn(indexes, column);
+    return index < 0 || index >= cellRichText.length
+        ? null
+        : cellRichText[index];
+  }
 
   String valueAt(int column) {
     final indexes = columnIndexes;

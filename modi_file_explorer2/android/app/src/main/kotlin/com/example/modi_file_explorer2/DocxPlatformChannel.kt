@@ -27,12 +27,17 @@ private const val DOCX_MAX_FLOATING_BACKGROUNDS = 256
 private const val DOCX_MAX_CELL_TEXT = 65_536
 private const val DOCX_MAX_IMAGE_BYTES = 16L * 1024 * 1024
 private const val DOCX_BATCH_BLOCKS = 128
+private const val DOCX_MAX_SUPPLEMENTAL_BLOCKS = 512
+private const val DOCX_MAX_CHARTS = 16
 
 private class DocxReaderException(val code: String, message: String) : Exception(message)
 
 private data class DocxTableCell(
 	val runs: List<Map<String, Any?>>,
 	val gridSpan: Int,
+	val background: Int?,
+	val verticalMerge: String?,
+	val borderColor: Int?,
 )
 
 private data class DocxNumberingDefinition(
@@ -40,6 +45,7 @@ private data class DocxNumberingDefinition(
 	val marker: String,
 	val leftIndent: Double?,
 	val hangingIndent: Double?,
+	val startAt: Int = 1,
 )
 
 internal class DocxPlatformChannel(
@@ -147,6 +153,7 @@ private data class DocxTextStyle(
 	val underline: Boolean = false,
 	val strike: Boolean = false,
 	val fontSize: Double? = null,
+	val fontFamily: String? = null,
 	val color: Int? = null,
 	val highlight: Int? = null,
 ) {
@@ -157,6 +164,7 @@ private data class DocxTextStyle(
 		"underline" to underline,
 		"strike" to strike,
 		"fontSize" to fontSize,
+		"fontFamily" to fontFamily,
 		"color" to color,
 		"highlight" to highlight,
 		"hyperlink" to hyperlink,
@@ -172,9 +180,34 @@ private class DocxDocument private constructor(
 	private var parser: XmlPullParser
 	private var documentInput: InputStream
 	private val inflatedEntryBytes = mutableMapOf<String, Long>()
+	private val ooxml = OoxmlPackage(
+		archive,
+		DOCX_MAX_ENTRY_BYTES,
+		DOCX_MAX_TOTAL_INFLATED_BYTES,
+	)
+	private val notShown = OoxmlNotShownReport()
 	private val relationships = mutableMapOf<String, String>()
 	private val styles = mutableMapOf<String, Map<String, Any?>>()
-	private val themeColors = mutableMapOf<String, Int>()
+	private val resolvedStyleCache = mutableMapOf<String, Map<String, Any?>>()
+	private val paragraphTextStyles = mutableMapOf<String, DocxTextStyle>()
+	private val styleTypes = mutableMapOf<String, String>()
+	private val documentDefaults = mutableMapOf<String, Any?>()
+	private var theme = OoxmlTheme(
+		emptyMap(),
+		emptyMap(),
+		emptyMap(),
+		emptyList(),
+		emptyList(),
+		emptyMap(),
+	)
+	private var defaultParagraphStyleId: String? = null
+	private var firstSection: Map<String, Double>? = null
+	private var headerBlocks: List<Map<String, Any?>> = emptyList()
+	private var trailingBlocks: List<Map<String, Any?>> = emptyList()
+	private var headerIndex = 0
+	private var trailingIndex = 0
+	private var trailingBlocksLoaded = false
+	private var documentEnded = false
 	private val numbering = mutableMapOf<Pair<Int, Int>, DocxNumberingDefinition>()
 	private val listCounters = mutableMapOf<Pair<Int, Int>, Int>()
 	private var blockCount = 0
@@ -188,37 +221,25 @@ private class DocxDocument private constructor(
 	private var insideTable = false
 	private var nextTableId = 0
 	private var nextFloatingId = 0
+	private var chartCount = 0
 	private var activeTableId = 0
+	private var activeTableStyleId: String? = null
+	private var activeTableRowIndex = 0
 	private val tableColumnWidths = mutableListOf<Double>()
 
 	init {
 		validateContentType()
 		readRelationships()
-		readThemeColors()
+		readTheme()
 		readStyles()
 		readNumbering()
 		documentInput = openEntry("word/document.xml")
 		parser = createParser(documentInput)
+		readSupplementalBlocks()
 	}
 
 	private fun validateContentType() {
-		val input = openEntry("[Content_Types].xml")
-		val xml = createParser(input)
-		var valid = false
-		try {
-			while (xml.next() != XmlPullParser.END_DOCUMENT) {
-				if (xml.eventType == XmlPullParser.START_TAG &&
-					xml.name == "Override" &&
-					xml.getAttributeValue(null, "PartName") == "/word/document.xml"
-				) {
-					valid = xml.getAttributeValue(null, "ContentType") == CONTENT_TYPE
-					break
-				}
-			}
-		} finally {
-			input.close()
-		}
-		if (!valid) {
+		if (ooxml.contentType("word/document.xml") != CONTENT_TYPE) {
 			throw DocxReaderException(
 				"UNSUPPORTED_DOCUMENT",
 				"Only standard .docx documents are supported; macro-enabled files are not handled",
@@ -231,18 +252,35 @@ private class DocxDocument private constructor(
 		val start = blockCount
 		val blocks = ArrayList<Map<String, Any?>>(DOCX_BATCH_BLOCKS)
 		while (!complete && !truncated && blocks.size < DOCX_BATCH_BLOCKS) {
+			if (headerIndex < headerBlocks.size) {
+				blocks.add(headerBlocks[headerIndex++])
+				blockCount++
+				continue
+			}
 			if (deferredBlocks.isNotEmpty()) {
 				blocks.add(deferredBlocks.removeFirst())
 				blockCount++
 				continue
 			}
-			val event = parser.next()
-			if (event == XmlPullParser.END_DOCUMENT) {
+			if (documentEnded) {
+				if (!trailingBlocksLoaded) loadTrailingBlocks()
+				if (trailingIndex < trailingBlocks.size) {
+					blocks.add(trailingBlocks[trailingIndex++])
+					blockCount++
+					continue
+				}
 				complete = true
 				break
 			}
+			val event = parser.next()
+			if (event == XmlPullParser.END_DOCUMENT) {
+				documentEnded = true
+				continue
+			}
 			if (event == XmlPullParser.END_TAG && parser.name == "tbl") {
 				insideTable = false
+				activeTableStyleId = null
+				activeTableRowIndex = 0
 				tableColumnWidths.clear()
 				continue
 			}
@@ -278,13 +316,20 @@ private class DocxDocument private constructor(
 				"tbl" -> if (!insideTable) {
 					insideTable = true
 					activeTableId = nextTableId++
+					activeTableStyleId = null
+					activeTableRowIndex = 0
 					tableColumnWidths.clear()
+				}
+				"tblStyle" -> if (insideTable) {
+					activeTableStyleId = parser.getAttributeValue(WORD_NS, "val")
 				}
 				"gridCol" -> if (insideTable && tableColumnWidths.size < DOCX_MAX_TABLE_COLUMNS) {
 					tableColumnWidths.add(
 						parser.getAttributeValue(WORD_NS, "w")
-							?.toDoubleOrNull()
-							?.div(15.0)
+							?.toLongOrNull()
+							?.let {
+								OoxmlUnits.pointsToPixels(OoxmlUnits.twipsToPoints(it))
+							}
 							?: 0.0,
 					)
 				}
@@ -315,6 +360,7 @@ private class DocxDocument private constructor(
 					addParsedBlocks(blocks, parseAlternateContentBlocks())
 				}
 				"object", "oleObject" -> {
+					notShown.add("Embedded objects")
 					if (blockCount >= DOCX_MAX_BLOCKS) {
 						truncated = true
 					} else {
@@ -323,7 +369,10 @@ private class DocxDocument private constructor(
 					}
 					skipElement()
 				}
-				"sectPr" -> Unit
+				"chart" -> notShown.add("Charts")
+				"smartArt" -> notShown.add("SmartArt diagrams")
+				"oMath", "oMathPara" -> notShown.add("Equations")
+				"sectPr" -> parseSectionProperties()
 			}
 		}
 		return mapOf(
@@ -332,6 +381,13 @@ private class DocxDocument private constructor(
 			"blockCount" to blockCount,
 			"complete" to complete,
 			"truncated" to truncated,
+			"notShown" to (notShown.values() + ooxml.failures()).distinct(),
+			"pageWidth" to firstSection?.get("pageWidth"),
+			"pageHeight" to firstSection?.get("pageHeight"),
+			"marginLeft" to firstSection?.get("marginLeft"),
+			"marginRight" to firstSection?.get("marginRight"),
+			"marginTop" to firstSection?.get("marginTop"),
+			"marginBottom" to firstSection?.get("marginBottom"),
 		)
 	}
 
@@ -351,6 +407,8 @@ private class DocxDocument private constructor(
 		var indentLeft: Double? = null
 		var indentRight: Double? = null
 		var hangingIndent: Double? = null
+		var firstLineIndent: Double? = null
+		var paragraphBackground: Int? = null
 		var bottomBorderColor: Int? = null
 		var bottomBorderWidth: Double? = null
 		while (parser.next() != XmlPullParser.END_DOCUMENT) {
@@ -376,29 +434,30 @@ private class DocxDocument private constructor(
 								"ilvl" -> listLevel = parser.getAttributeValue(WORD_NS, "val")?.toIntOrNull() ?: 0
 								"spacing" -> {
 									spaceBefore = parser.getAttributeValue(WORD_NS, "before")
-										?.toDoubleOrNull()?.div(15.0)
+										?.toLongOrNull()?.let(::twipsToPixels)
 									spaceAfter = parser.getAttributeValue(WORD_NS, "after")
-										?.toDoubleOrNull()?.div(15.0)
+										?.toLongOrNull()?.let(::twipsToPixels)
 									lineHeight = parser.getAttributeValue(WORD_NS, "line")
 										?.toDoubleOrNull()?.div(240.0)?.coerceIn(0.8, 3.0)
 								}
 								"bottom" -> {
 									val borderStyle = parser.getAttributeValue(WORD_NS, "val")
 									if (borderStyle != "nil" && borderStyle != "none") {
-										bottomBorderColor = parseColor(
-											parser.getAttributeValue(WORD_NS, "color"),
-										) ?: 0
+										bottomBorderColor = wordColor(parser) ?: 0
 										bottomBorderWidth = parser.getAttributeValue(WORD_NS, "sz")
 											?.toDoubleOrNull()?.div(6.0)?.coerceIn(0.3, 4.0)
 									}
 								}
+								"shd" -> paragraphBackground = wordShadingColor(parser)
 								"ind" -> {
 									indentLeft = parser.getAttributeValue(WORD_NS, "left")
-										?.toDoubleOrNull()?.div(15.0)
+										?.toLongOrNull()?.let(::twipsToPixels)
 									indentRight = parser.getAttributeValue(WORD_NS, "right")
-										?.toDoubleOrNull()?.div(15.0)
+										?.toLongOrNull()?.let(::twipsToPixels)
 									hangingIndent = parser.getAttributeValue(WORD_NS, "hanging")
-										?.toDoubleOrNull()?.div(15.0)
+										?.toLongOrNull()?.let(::twipsToPixels)
+									firstLineIndent = parser.getAttributeValue(WORD_NS, "firstLine")
+										?.toLongOrNull()?.let(::twipsToPixels)
 								}
 							}
 							if (!parser.name.endsWith("Pr") && parser.name !in setOf("numPr")) skipElement()
@@ -420,19 +479,23 @@ private class DocxDocument private constructor(
 						}
 					}
 				}
-				"r" -> runs.addAll(parseRun(null, embedded))
+				"r" -> runs.addAll(parseRun(null, embedded, paragraphTextStyle(styleName)))
 				"hyperlink" -> {
 					val relationId = parser.getAttributeValue(REL_NS, "id")
 					val anchor = parser.getAttributeValue(WORD_NS, "anchor")
 					val target = relationId?.let(relationships::get)
 						?: anchor?.let { "#$it" }
-					runs.addAll(parseHyperlink(target, embedded))
+					runs.addAll(parseHyperlink(target, embedded, paragraphTextStyle(styleName)))
 				}
 				"drawing" -> embedded.addAll(parseDrawingBlocks())
 				"pict" -> runs.addAll(parseLegacyPicture())
 				"AlternateContent" -> embedded.addAll(parseAlternateContentBlocks())
 				"del", "moveFrom" -> skipElement()
-				"oMath", "oMathPara" -> skipElement()
+				"oMath", "oMathPara" -> {
+					val equationText = readEquationText()
+					notShown.add("Equations (plain-text fallback)")
+					runs.add(DocxTextStyle(italic = true).channelValue(equationText))
+				}
 				"lastRenderedPageBreak" -> pendingPageBreak = true
 				"br" -> if (parser.getAttributeValue(WORD_NS, "type") == "page") {
 					pendingPageBreak = true
@@ -441,7 +504,7 @@ private class DocxDocument private constructor(
 		}
 		val result = mutableListOf<Map<String, Any?>>()
 		if (runs.isNotEmpty() || embedded.isEmpty()) {
-			val style = resolvedStyle(styleName)
+			val style = resolvedStyle(styleName ?: defaultParagraphStyleId)
 			val list = numId?.let { listMarker(it, listLevel) }
 			result.add(
 				mapOf(
@@ -455,6 +518,7 @@ private class DocxDocument private constructor(
 					"styleUnderline" to style?.get("underline"),
 					"styleStrike" to style?.get("strike"),
 					"styleFontSize" to style?.get("fontSize"),
+					"styleFontFamily" to style?.get("fontFamily"),
 					"styleColor" to style?.get("color"),
 					"styleHighlight" to style?.get("highlight"),
 					"headingLevel" to (
@@ -469,14 +533,24 @@ private class DocxDocument private constructor(
 					"spaceBefore" to (spaceBefore ?: style?.get("spaceBefore")),
 					"spaceAfter" to (spaceAfter ?: style?.get("spaceAfter")),
 					"lineHeight" to (lineHeight ?: style?.get("lineHeight")),
-					"bottomBorderColor" to bottomBorderColor,
-					"bottomBorderWidth" to bottomBorderWidth,
+					"paragraphBackground" to (
+						paragraphBackground ?: style?.get("paragraphBackground")
+					),
+					"bottomBorderColor" to (
+						bottomBorderColor ?: style?.get("bottomBorderColor")
+					),
+					"bottomBorderWidth" to (
+						bottomBorderWidth ?: style?.get("bottomBorderWidth")
+					),
 					"indentLeft" to (
 						indentLeft ?: list?.leftIndent ?: style?.get("indentLeft")
 					),
 					"indentRight" to (indentRight ?: style?.get("indentRight")),
 					"hangingIndent" to (
 						hangingIndent ?: list?.hangingIndent ?: style?.get("hangingIndent")
+					),
+					"firstLineIndent" to (
+						firstLineIndent ?: style?.get("firstLineIndent")
 					),
 					"pageBreakBefore" to pageBreakBefore,
 				),
@@ -500,14 +574,15 @@ private class DocxDocument private constructor(
 	private fun parseRun(
 		hyperlink: String?,
 		embedded: MutableList<Map<String, Any?>>,
+		defaultStyle: DocxTextStyle = DocxTextStyle(),
 	): List<Map<String, Any?>> {
-		var style = DocxTextStyle()
+		var style = defaultStyle
 		val result = mutableListOf<Map<String, Any?>>()
 		while (parser.next() != XmlPullParser.END_DOCUMENT) {
 			if (parser.eventType == XmlPullParser.END_TAG && parser.name == "r") break
 			if (parser.eventType != XmlPullParser.START_TAG) continue
 			when (parser.name) {
-				"rPr" -> style = parseRunProperties()
+				"rPr" -> style = parseRunProperties(defaultStyle)
 				"t", "delText" -> {
 					val text = keepText(readTextElement(parser.name))
 					if (parser.name == "t") result.add(style.channelValue(text, hyperlink))
@@ -545,18 +620,19 @@ private class DocxDocument private constructor(
 	private fun parseHyperlink(
 		target: String?,
 		embedded: MutableList<Map<String, Any?>>,
+		defaultStyle: DocxTextStyle,
 	): List<Map<String, Any?>> {
 		val result = mutableListOf<Map<String, Any?>>()
 		while (parser.next() != XmlPullParser.END_DOCUMENT) {
 			if (parser.eventType == XmlPullParser.END_TAG && parser.name == "hyperlink") break
 			if (parser.eventType == XmlPullParser.START_TAG && parser.name == "r") {
-				result.addAll(parseRun(target, embedded))
+				result.addAll(parseRun(target, embedded, defaultStyle))
 			}
 		}
 		return result
 	}
 
-	private fun parseRunProperties(): DocxTextStyle {
+	private fun parseRunProperties(defaultStyle: DocxTextStyle): DocxTextStyle {
 		var styleId: String? = null
 		var bold: Boolean? = null
 		var italic: Boolean? = null
@@ -564,6 +640,7 @@ private class DocxDocument private constructor(
 		var strike: Boolean? = null
 		var boldFont = false
 		var fontSize: Double? = null
+		var fontFamily: String? = null
 		var color: Int? = null
 		var highlight: Int? = null
 		while (parser.next() != XmlPullParser.END_DOCUMENT) {
@@ -576,25 +653,31 @@ private class DocxDocument private constructor(
 				"i" -> italic = value != "0" && value != "false"
 				"u" -> underline = value != "none"
 				"strike", "dstrike" -> strike = value != "0" && value != "false"
-				"sz" -> fontSize = value?.toDoubleOrNull()?.div(2.0)?.coerceIn(6.0, 96.0)
-				"color" -> color = parseColor(value)
+				"sz" -> fontSize = value?.toIntOrNull()
+					?.let(OoxmlUnits::halfPointsToPoints)
+					?.coerceIn(6.0, 96.0)
+				"color" -> color = wordColor(parser)
 				"highlight" -> highlight = parseHighlight(value)
-				"rFonts" -> boldFont = listOf("ascii", "hAnsi", "eastAsia", "cs")
-					.any { attribute ->
-						isBoldFontName(parser.getAttributeValue(WORD_NS, attribute))
-					}
+				"rFonts" -> {
+					fontFamily = fontFamilyFromAttributes(parser)
+					boldFont = listOf("ascii", "hAnsi", "eastAsia", "cs")
+						.any { attribute ->
+							isBoldFontName(parser.getAttributeValue(WORD_NS, attribute))
+						}
+				}
 				else -> if (parser.depth > 0 && parser.name !in setOf("vertAlign")) skipElement()
 			}
 		}
 		val style = resolvedStyle(styleId)
 		return DocxTextStyle(
-			bold ?: (boldFont || (style?.get("bold") as? Boolean ?: false)),
-			italic ?: (style?.get("italic") as? Boolean ?: false),
-			underline ?: (style?.get("underline") as? Boolean ?: false),
-			strike ?: (style?.get("strike") as? Boolean ?: false),
-			fontSize ?: (style?.get("fontSize") as? Double),
-			color ?: (style?.get("color") as? Int),
-			highlight ?: (style?.get("highlight") as? Int),
+			bold ?: (boldFont || (style?.get("bold") as? Boolean ?: defaultStyle.bold)),
+			italic ?: (style?.get("italic") as? Boolean ?: defaultStyle.italic),
+			underline ?: (style?.get("underline") as? Boolean ?: defaultStyle.underline),
+			strike ?: (style?.get("strike") as? Boolean ?: defaultStyle.strike),
+			fontSize ?: (style?.get("fontSize") as? Double) ?: defaultStyle.fontSize,
+			fontFamily ?: (style?.get("fontFamily") as? String) ?: defaultStyle.fontFamily,
+			color ?: (style?.get("color") as? Int) ?: defaultStyle.color,
+			highlight ?: (style?.get("highlight") as? Int) ?: defaultStyle.highlight,
 		)
 	}
 
@@ -617,24 +700,40 @@ private class DocxDocument private constructor(
 			"tableId" to activeTableId,
 			"columnWidths" to tableColumnWidths.toList(),
 			"cellSpans" to cells.map(DocxTableCell::gridSpan),
+			"cellBackgrounds" to cells.map(DocxTableCell::background),
+			"cellVerticalMerges" to cells.map(DocxTableCell::verticalMerge),
+			"cellBorders" to cells.map(DocxTableCell::borderColor),
+			"rowBackground" to tableRowBackground(),
 			"rows" to listOf(cells.map(DocxTableCell::runs)),
-		)
+		).also { activeTableRowIndex++ }
 	}
 
 	private fun parseTableCell(): DocxTableCell {
 		val result = mutableListOf<Map<String, Any?>>()
 		var gridSpan = 1
+		var background: Int? = null
+		var verticalMerge: String? = null
+		var borderColor: Int? = null
 		while (parser.next() != XmlPullParser.END_DOCUMENT) {
 			if (parser.eventType == XmlPullParser.END_TAG && parser.name == "tc") break
 			if (parser.eventType != XmlPullParser.START_TAG) continue
 			when (parser.name) {
 				"tcPr" -> while (parser.next() != XmlPullParser.END_DOCUMENT) {
 					if (parser.eventType == XmlPullParser.END_TAG && parser.name == "tcPr") break
-					if (parser.eventType == XmlPullParser.START_TAG && parser.name == "gridSpan") {
-						gridSpan = parser.getAttributeValue(WORD_NS, "val")
-							?.toIntOrNull()
-							?.coerceIn(1, DOCX_MAX_TABLE_COLUMNS)
-							?: 1
+					if (parser.eventType == XmlPullParser.START_TAG) {
+						when (parser.name) {
+							"gridSpan" -> gridSpan = parser.getAttributeValue(WORD_NS, "val")
+								?.toIntOrNull()
+								?.coerceIn(1, DOCX_MAX_TABLE_COLUMNS)
+								?: 1
+							"vMerge" -> verticalMerge =
+								parser.getAttributeValue(WORD_NS, "val") ?: "continue"
+							"shd" -> background = wordShadingColor(parser)
+							"top", "bottom", "left", "right" ->
+								if (parser.getAttributeValue(WORD_NS, "val") !in setOf("nil", "none")) {
+									borderColor = wordColor(parser) ?: borderColor
+								}
+						}
 					}
 				}
 				"p" -> {
@@ -653,15 +752,72 @@ private class DocxDocument private constructor(
 						)
 					}
 				}
+				"tbl" -> {
+					val nestedRows = parseNestedTableBlocks()
+					val nestedText = nestedRows
+						.flatMap { (it["rows"] as? List<*>).orEmpty() }
+						.filterIsInstance<List<*>>()
+						.joinToString("\n") { row ->
+							row.filterIsInstance<List<*>>().joinToString(" | ") { cell ->
+								cell.filterIsInstance<Map<String, Any?>>()
+									.joinToString("") { it["text"] as? String ?: "" }
+							}
+						}
+					if (nestedText.isNotBlank()) {
+						if (result.isNotEmpty()) result.add(DocxTextStyle().channelValue("\n"))
+						result.add(DocxTextStyle().channelValue(nestedText))
+					}
+				}
 			}
 		}
-		return DocxTableCell(result, gridSpan)
+		return DocxTableCell(result, gridSpan, background, verticalMerge, borderColor)
+	}
+
+	private fun tableRowBackground(): Int? {
+		val style = activeTableStyleId?.let(styles::get) ?: return null
+		val firstRow = style["firstRowFill"] as? Int
+		if (activeTableRowIndex == 0 && firstRow != null) return firstRow
+		return if (activeTableRowIndex % 2 == 1) style["bandFill"] as? Int else null
+	}
+
+	private fun wordShadingColor(xml: XmlPullParser): Int? {
+		val fill = xml.getAttributeValue(WORD_NS, "fill")
+		if (!fill.isNullOrBlank() && fill != "auto") return parseColor(fill)
+		val reference = xml.getAttributeValue(WORD_NS, "themeFill") ?: return null
+		return theme.color(reference, colorTransforms(xml, "themeFillTint", "themeFillShade"))
+	}
+
+	private fun wordColor(xml: XmlPullParser): Int? {
+		val reference = xml.getAttributeValue(WORD_NS, "themeColor")
+		if (!reference.isNullOrBlank()) {
+			theme.color(reference, colorTransforms(xml, "themeTint", "themeShade"))?.let {
+				return it
+			}
+		}
+		return parseColor(xml.getAttributeValue(WORD_NS, "val"))
+	}
+
+	private fun colorTransforms(
+		xml: XmlPullParser,
+		tintName: String,
+		shadeName: String,
+	): List<Pair<String, Int>> = buildList {
+		xml.getAttributeValue(WORD_NS, tintName)?.toIntOrNull(16)?.let {
+			add("tint" to (it * 100_000 / 255).coerceIn(0, 100_000))
+		}
+		xml.getAttributeValue(WORD_NS, shadeName)?.toIntOrNull(16)?.let {
+			add("shade" to (it * 100_000 / 255).coerceIn(0, 100_000))
+		}
 	}
 
 	private fun parseDrawing(): List<Map<String, Any?>>? {
 		var relationId: String? = null
 		var width: Double? = null
 		var height: Double? = null
+		var cropLeft = 0.0
+		var cropTop = 0.0
+		var cropRight = 0.0
+		var cropBottom = 0.0
 		val runs = mutableListOf<Map<String, Any?>>()
 		var depth = 1
 		while (depth > 0 && parser.next() != XmlPullParser.END_DOCUMENT) {
@@ -670,8 +826,16 @@ private class DocxDocument private constructor(
 				when (parser.name) {
 					"blip" -> relationId = parser.getAttributeValue(REL_NS, "embed")
 					"extent" -> {
-						width = parser.getAttributeValue(null, "cx")?.toDoubleOrNull()?.div(9525.0)
-						height = parser.getAttributeValue(null, "cy")?.toDoubleOrNull()?.div(9525.0)
+						width = parser.getAttributeValue(null, "cx")?.toLongOrNull()
+							?.let { OoxmlUnits.emuToPixels(it) }
+						height = parser.getAttributeValue(null, "cy")?.toLongOrNull()
+							?.let { OoxmlUnits.emuToPixels(it) }
+					}
+					"srcRect" -> {
+						cropLeft = parser.getAttributeValue(null, "l")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
+						cropTop = parser.getAttributeValue(null, "t")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
+						cropRight = parser.getAttributeValue(null, "r")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
+						cropBottom = parser.getAttributeValue(null, "b")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
 					}
 					"t" -> if (parser.namespace == DRAWING_NS) {
 						val text = keepText(readTextElement(parser.name))
@@ -702,12 +866,17 @@ private class DocxDocument private constructor(
 		}
 		val path = relationId?.let(relationships::get)
 		if (path != null && path.startsWith("word/media/")) {
+			OoxmlImageSupport.unsupportedFormat(path)?.let(notShown::add)
 			runs.add(
 				0,
 				mapOf(
 					"imagePath" to path,
 					"width" to width?.coerceIn(24.0, 1200.0),
 					"height" to height?.coerceIn(24.0, 900.0),
+					"cropLeft" to cropLeft.coerceIn(0.0, 0.9),
+					"cropTop" to cropTop.coerceIn(0.0, 0.9),
+					"cropRight" to cropRight.coerceIn(0.0, 0.9),
+					"cropBottom" to cropBottom.coerceIn(0.0, 0.9),
 				),
 			)
 		}
@@ -726,18 +895,40 @@ private class DocxDocument private constructor(
 		var outlineWidth: Double? = null
 		var rotationDegrees: Double? = null
 		var shape: String? = null
+		var cropLeft = 0.0
+		var cropTop = 0.0
+		var cropRight = 0.0
+		var cropBottom = 0.0
 		var parserPositionIsFloating = false
 		var insideSolidFill = false
 		var insideLine = false
 		var solidFillColor: Int? = null
 		var solidFillLuminanceModulation = 100_000
 		var solidFillLuminanceOffset = 0
+		var smartArtPresent = false
+		var chartRelationshipId: String? = null
 		val contentBlocks = mutableListOf<Map<String, Any?>>()
 		val directRuns = mutableListOf<Map<String, Any?>>()
 		var depth = 1
 		while (depth > 0 && parser.next() != XmlPullParser.END_DOCUMENT) {
 			if (parser.eventType == XmlPullParser.START_TAG) {
 				depth++
+				when (parser.name) {
+					"chart" -> chartRelationshipId =
+						parser.getAttributeValue(REL_NS, "id")
+					"oleObj", "object" -> notShown.add("Embedded objects")
+					"oMath", "oMathPara" -> notShown.add("Equations")
+					"relIds" -> {
+						smartArtPresent = true
+						notShown.add("SmartArt diagrams")
+					}
+					"graphicData" -> if (
+						parser.getAttributeValue(null, "uri")?.contains("diagram") == true
+					) {
+						smartArtPresent = true
+						notShown.add("SmartArt diagrams")
+					}
+				}
 				when {
 					parser.name == "anchor" ->
 						parserPositionIsFloating = true
@@ -746,8 +937,8 @@ private class DocxDocument private constructor(
 					parser.namespace == DRAWING_NS && parser.name == "ln" -> {
 						insideLine = true
 						outlineWidth = parser.getAttributeValue(null, "w")
-							?.toDoubleOrNull()
-							?.div(9525.0)
+							?.toLongOrNull()
+							?.let { OoxmlUnits.emuToPixels(it) }
 							?.coerceIn(0.1, 12.0)
 					}
 					parser.namespace == DRAWING_NS && parser.name == "solidFill" -> {
@@ -769,23 +960,28 @@ private class DocxDocument private constructor(
 								?.coerceIn(0, 100_000) ?: 0
 					}
 					parser.name == "posOffset" -> {
-						val offset = parser.nextText().toDoubleOrNull()?.div(9525.0)
+						val offset = parser.nextText().toLongOrNull()
+							?.let { OoxmlUnits.emuToPixels(it) }
 						if (positionAxis == "x" && offset != null) left = offset
 						if (positionAxis == "y" && offset != null) top = offset
 						depth--
 					}
 					parser.name == "extent" -> {
-						width = parser.getAttributeValue(null, "cx")
-							?.toDoubleOrNull()
-							?.div(9525.0)
-						height = parser.getAttributeValue(null, "cy")
-							?.toDoubleOrNull()
-							?.div(9525.0)
+						width = parser.getAttributeValue(null, "cx")?.toLongOrNull()
+							?.let { OoxmlUnits.emuToPixels(it) }
+						height = parser.getAttributeValue(null, "cy")?.toLongOrNull()
+							?.let { OoxmlUnits.emuToPixels(it) }
+					}
+					parser.name == "srcRect" -> {
+						cropLeft = parser.getAttributeValue(null, "l")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
+						cropTop = parser.getAttributeValue(null, "t")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
+						cropRight = parser.getAttributeValue(null, "r")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
+						cropBottom = parser.getAttributeValue(null, "b")?.toDoubleOrNull()?.div(100_000.0) ?: 0.0
 					}
 					parser.namespace == DRAWING_NS && parser.name == "xfrm" -> {
 						rotationDegrees = parser.getAttributeValue(null, "rot")
-							?.toDoubleOrNull()
-							?.div(60_000.0)
+							?.toLongOrNull()
+							?.let(OoxmlUnits::angle60000ToDegrees)
 					}
 					parser.name == "prstGeom" -> {
 						shape = parser.getAttributeValue(null, "prst")
@@ -881,13 +1077,74 @@ private class DocxDocument private constructor(
 				)
 			}
 		}
+		if (smartArtPresent) return listOf(placeholderBlock("SmartArt diagram not shown"))
+		if (chartRelationshipId != null) {
+			chartCount++
+			val chartPath = relationships[chartRelationshipId]
+			val chartData = chartPath?.let { target ->
+				runCatching {
+					openEntry(target).use { OoxmlChartParser.parse(it, theme) }
+				}.getOrNull()
+			}
+			if (chartData == null) {
+				notShown.add("Chart data could not be read")
+				return listOf(placeholderBlock("Chart not shown"))
+			}
+			if (chartData["supported"] != true) {
+				val chartTitle = chartData["title"] as? String
+				notShown.add(
+					if (chartTitle.isNullOrBlank()) "Unsupported chart type"
+					else "Unsupported chart: $chartTitle",
+				)
+			}
+			if (chartData["truncated"] == true) {
+				notShown.add("Chart data is truncated to viewer limits")
+			}
+			if (chartCount > DOCX_MAX_CHARTS) {
+				notShown.add("Additional charts are omitted by the 16-chart limit")
+				return listOf(
+					mapOf(
+						"type" to "chart",
+						"chartData" to mapOf(
+							"type" to "unsupported",
+							"title" to (chartData["title"] as? String).orEmpty(),
+							"series" to emptyList<Map<String, Any?>>(),
+							"supported" to false,
+						),
+						"floatingId" to nextFloatingId++,
+						"floatingLeft" to left,
+						"floatingTop" to top,
+						"floatingWidth" to boxWidth,
+						"floatingHeight" to boxHeight,
+						"floatingRotation" to rotationDegrees,
+					),
+				)
+			}
+			return listOf(
+				mapOf(
+					"type" to "chart",
+					"chartData" to chartData,
+					"floatingId" to nextFloatingId++,
+					"floatingLeft" to left,
+					"floatingTop" to top,
+					"floatingWidth" to boxWidth,
+					"floatingHeight" to boxHeight,
+					"floatingRotation" to rotationDegrees,
+				),
+			)
+		}
 		val path = relationId?.let(relationships::get)
 		if (path != null && path.startsWith("word/media/")) {
+			OoxmlImageSupport.unsupportedFormat(path)?.let(notShown::add)
 			val imageBlock = mutableMapOf<String, Any?>(
 				"type" to "image",
 				"imagePath" to path,
 				"width" to width?.coerceIn(24.0, 1200.0),
 				"height" to height?.coerceIn(24.0, 900.0),
+				"cropLeft" to cropLeft.coerceIn(0.0, 0.9),
+				"cropTop" to cropTop.coerceIn(0.0, 0.9),
+				"cropRight" to cropRight.coerceIn(0.0, 0.9),
+				"cropBottom" to cropBottom.coerceIn(0.0, 0.9),
 			)
 			if (parserPositionIsFloating) {
 				imageBlock.putAll(
@@ -921,9 +1178,13 @@ private class DocxDocument private constructor(
 	private fun parseNestedTableBlocks(): List<Map<String, Any?>> {
 		val previousInsideTable = insideTable
 		val previousTableId = activeTableId
+		val previousTableStyleId = activeTableStyleId
+		val previousTableRowIndex = activeTableRowIndex
 		val previousColumnWidths = tableColumnWidths.toList()
 		insideTable = true
 		activeTableId = nextTableId++
+		activeTableStyleId = null
+		activeTableRowIndex = 0
 		tableColumnWidths.clear()
 		val rows = mutableListOf<Map<String, Any?>>()
 		try {
@@ -933,21 +1194,33 @@ private class DocxDocument private constructor(
 				}
 				if (parser.eventType != XmlPullParser.START_TAG) continue
 				when {
+					parser.name == "tblStyle" -> {
+						activeTableStyleId = parser.getAttributeValue(WORD_NS, "val")
+					}
 					parser.name == "gridCol" &&
 						tableColumnWidths.size < DOCX_MAX_TABLE_COLUMNS -> {
 						tableColumnWidths.add(
 							parser.getAttributeValue(WORD_NS, "w")
-								?.toDoubleOrNull()
-								?.div(15.0)
+								?.toLongOrNull()
+								?.let(::twipsToPixels)
 								?: 0.0,
 						)
 					}
-					parser.name == "tr" -> parseTableRow()?.let(rows::add)
+					parser.name == "tr" -> {
+						if (rows.size < DOCX_MAX_SUPPLEMENTAL_BLOCKS) {
+							parseTableRow()?.let(rows::add)
+						} else {
+							truncated = true
+							skipElement()
+						}
+					}
 				}
 			}
 		} finally {
 			insideTable = previousInsideTable
 			activeTableId = previousTableId
+			activeTableStyleId = previousTableStyleId
+			activeTableRowIndex = previousTableRowIndex
 			tableColumnWidths.clear()
 			tableColumnWidths.addAll(previousColumnWidths)
 		}
@@ -1088,14 +1361,23 @@ private class DocxDocument private constructor(
 
 	private fun readStyles() {
 		if (archive.getEntry("word/styles.xml") == null) return
-		val input = openEntry("word/styles.xml")
+		readDocumentDefaults()
+		val input = ooxml.optionalPart("word/styles.xml") ?: return
 		val xml = createParser(input)
 		try {
 			while (xml.next() != XmlPullParser.END_DOCUMENT) {
 				if (xml.eventType != XmlPullParser.START_TAG || xml.name != "style") continue
 				val id = xml.getAttributeValue(WORD_NS, "styleId") ?: continue
+				val type = xml.getAttributeValue(WORD_NS, "type") ?: "paragraph"
+				styleTypes[id] = type
+				if (xml.getAttributeValue(WORD_NS, "type") == "paragraph" &&
+					xml.getAttributeValue(WORD_NS, "default") in setOf("1", "true")
+				) {
+					defaultParagraphStyleId = id
+				}
 				var name: String? = null
 				var basedOn: String? = null
+				var linkedStyle: String? = null
 				var alignment: String? = null
 				var rtl: Boolean? = null
 				var bold: Boolean? = null
@@ -1104,6 +1386,7 @@ private class DocxDocument private constructor(
 				var underline: Boolean? = null
 				var strike: Boolean? = null
 				var fontSize: Double? = null
+				var fontFamily: String? = null
 				var color: Int? = null
 				var highlight: Int? = null
 				var outlineLevel: Int? = null
@@ -1113,55 +1396,95 @@ private class DocxDocument private constructor(
 				var indentLeft: Double? = null
 				var indentRight: Double? = null
 				var hangingIndent: Double? = null
+				var firstLineIndent: Double? = null
+				var paragraphBackground: Int? = null
+				var bottomBorderColor: Int? = null
+				var bottomBorderWidth: Double? = null
+				var tableCondition: String? = null
+				var firstRowFill: Int? = null
+				var bandFill: Int? = null
 				while (xml.next() != XmlPullParser.END_DOCUMENT) {
 					if (xml.eventType == XmlPullParser.END_TAG && xml.name == "style") break
+					if (xml.eventType == XmlPullParser.END_TAG && xml.name == "tblStylePr") {
+						tableCondition = null
+						continue
+					}
 					if (xml.eventType != XmlPullParser.START_TAG) continue
 					val value = xml.getAttributeValue(WORD_NS, "val")
 					when (xml.name) {
+						"tblStylePr" -> tableCondition =
+							xml.getAttributeValue(WORD_NS, "type")
+						"shd" -> {
+							val fill = wordShadingColor(xml)
+							when (tableCondition) {
+								"firstRow" -> firstRowFill = fill
+								"band1Horz" -> bandFill = fill
+								null -> paragraphBackground = fill
+							}
+						}
+						"bottom" -> if (
+							tableCondition == null &&
+							xml.getAttributeValue(WORD_NS, "val") !in setOf("nil", "none")
+						) {
+							bottomBorderColor = wordColor(xml) ?: 0
+							bottomBorderWidth = xml.getAttributeValue(WORD_NS, "sz")
+								?.toDoubleOrNull()?.div(6.0)?.coerceIn(0.3, 4.0)
+						}
 						"name" -> name = value
 						"basedOn" -> basedOn = value
+						"link" -> linkedStyle = value
 						"jc" -> alignment = value
 						"bidi" -> rtl = value != "0" && value != "false"
 						"b", "bCs" -> bold = value != "0" && value != "false"
 						"i" -> italic = value != "0" && value != "false"
 						"u" -> underline = value != "none"
 						"strike", "dstrike" -> strike = value != "0" && value != "false"
-						"sz" -> fontSize = value?.toDoubleOrNull()?.div(2.0)?.coerceIn(6.0, 96.0)
-						"color" -> color = parseColor(value)
+						"sz" -> fontSize = value?.toIntOrNull()
+							?.let(OoxmlUnits::halfPointsToPoints)
+							?.coerceIn(6.0, 96.0)
+						"color" -> color = wordColor(xml)
 						"highlight" -> highlight = parseHighlight(value)
-						"rFonts" -> boldFont = listOf("ascii", "hAnsi", "eastAsia", "cs")
-							.any { attribute ->
-								isBoldFontName(xml.getAttributeValue(WORD_NS, attribute))
-							}
+						"rFonts" -> {
+							fontFamily = fontFamilyFromAttributes(xml)
+							boldFont = listOf("ascii", "hAnsi", "eastAsia", "cs")
+								.any { attribute ->
+									isBoldFontName(xml.getAttributeValue(WORD_NS, attribute))
+								}
+						}
 						"outlineLvl" -> outlineLevel = value?.toIntOrNull()?.coerceIn(0, 8)
 						"spacing" -> {
 							spaceBefore = xml.getAttributeValue(WORD_NS, "before")
-								?.toDoubleOrNull()?.div(15.0)
+								?.toLongOrNull()?.let(::twipsToPixels)
 							spaceAfter = xml.getAttributeValue(WORD_NS, "after")
-								?.toDoubleOrNull()?.div(15.0)
+								?.toLongOrNull()?.let(::twipsToPixels)
 							lineHeight = xml.getAttributeValue(WORD_NS, "line")
 								?.toDoubleOrNull()?.div(240.0)?.coerceIn(0.8, 3.0)
 						}
 						"ind" -> {
 							indentLeft = xml.getAttributeValue(WORD_NS, "left")
-								?.toDoubleOrNull()?.div(15.0)
+								?.toLongOrNull()?.let(::twipsToPixels)
 							indentRight = xml.getAttributeValue(WORD_NS, "right")
-								?.toDoubleOrNull()?.div(15.0)
+								?.toLongOrNull()?.let(::twipsToPixels)
 							hangingIndent = xml.getAttributeValue(WORD_NS, "hanging")
-								?.toDoubleOrNull()?.div(15.0)
+								?.toLongOrNull()?.let(::twipsToPixels)
+							firstLineIndent = xml.getAttributeValue(WORD_NS, "firstLine")
+								?.toLongOrNull()?.let(::twipsToPixels)
 						}
 					}
 				}
 				styles[id] = mapOf(
 					"name" to (name ?: id),
+					"type" to type,
 					"basedOn" to basedOn,
+					"link" to linkedStyle,
 					"alignment" to alignment,
 					"rtl" to rtl,
-					"bold" to (bold ?: boldFont),
+					"bold" to (bold ?: if (boldFont) true else null),
 					"italic" to italic,
 					"underline" to underline,
 					"strike" to strike,
 					"fontSize" to fontSize,
+					"fontFamily" to fontFamily,
 					"color" to color,
 					"highlight" to highlight,
 					"outlineLevel" to outlineLevel,
@@ -1171,96 +1494,348 @@ private class DocxDocument private constructor(
 					"indentLeft" to indentLeft,
 					"indentRight" to indentRight,
 					"hangingIndent" to hangingIndent,
+					"firstLineIndent" to firstLineIndent,
+					"paragraphBackground" to paragraphBackground,
+					"bottomBorderColor" to bottomBorderColor,
+					"bottomBorderWidth" to bottomBorderWidth,
+					"firstRowFill" to firstRowFill,
+					"bandFill" to bandFill,
 				)
 			}
+		} catch (error: Exception) {
+			ooxml.recordFailure("Could not parse styles.xml: ${error.message ?: "invalid part"}")
 		} finally {
 			input.close()
 		}
 	}
 
-	private fun readThemeColors() {
-		val entryName = "word/theme/theme1.xml"
-		if (archive.getEntry(entryName) == null) return
-		val input = openEntry(entryName)
+	private fun readDocumentDefaults() {
+		val input = ooxml.optionalPart("word/styles.xml") ?: return
 		val xml = createParser(input)
-		var currentColorName: String? = null
+		var insideDefaults = false
+		var runDefaults = false
+		var paragraphDefaults = false
 		try {
 			while (xml.next() != XmlPullParser.END_DOCUMENT) {
 				if (xml.eventType == XmlPullParser.START_TAG) {
-					if (xml.namespace == DRAWING_NS &&
-						xml.name in THEME_COLOR_NAMES
-					) {
-						currentColorName = xml.name
-					} else if (currentColorName != null &&
-						xml.namespace == DRAWING_NS &&
-						xml.name in setOf("srgbClr", "sysClr")
-					) {
-						val value = xml.getAttributeValue(
-							null,
-							if (xml.name == "sysClr") "lastClr" else "val",
-						)
-						parseColor(value)?.let { themeColors[currentColorName!!] = it }
+					when (xml.name) {
+						"docDefaults" -> insideDefaults = true
+						"rPrDefault" -> runDefaults = true
+						"pPrDefault" -> paragraphDefaults = true
+						else -> if (insideDefaults && (runDefaults || paragraphDefaults)) {
+							val target = if (paragraphDefaults) "p." else "r."
+							val value = xml.getAttributeValue(WORD_NS, "val")
+							when (xml.name) {
+								"b", "bCs" -> documentDefaults[target + "bold"] =
+									value != "0" && value != "false"
+								"i" -> documentDefaults[target + "italic"] =
+									value != "0" && value != "false"
+								"u" -> documentDefaults[target + "underline"] = value != "none"
+								"strike", "dstrike" -> documentDefaults[target + "strike"] =
+									value != "0" && value != "false"
+								"sz" -> documentDefaults[target + "fontSize"] =
+									value?.toIntOrNull()?.let(OoxmlUnits::halfPointsToPoints)
+								"color" -> documentDefaults[target + "color"] = wordColor(xml)
+								"highlight" -> documentDefaults[target + "highlight"] =
+									parseHighlight(value)
+								"shd" -> if (paragraphDefaults) {
+									documentDefaults["p.paragraphBackground"] =
+										wordShadingColor(xml)
+								}
+								"rFonts" -> documentDefaults[target + "fontFamily"] =
+									fontFamilyFromAttributes(xml)
+								"jc" -> documentDefaults["p.alignment"] = value
+								"spacing" -> {
+									documentDefaults["p.spaceBefore"] =
+										xml.getAttributeValue(WORD_NS, "before")
+											?.toLongOrNull()?.let(::twipsToPixels)
+									documentDefaults["p.spaceAfter"] =
+										xml.getAttributeValue(WORD_NS, "after")
+											?.toLongOrNull()?.let(::twipsToPixels)
+									documentDefaults["p.lineHeight"] =
+										xml.getAttributeValue(WORD_NS, "line")
+											?.toDoubleOrNull()?.div(240.0)?.coerceIn(0.8, 3.0)
+								}
+								"ind" -> {
+									documentDefaults["p.indentLeft"] =
+										xml.getAttributeValue(WORD_NS, "left")
+											?.toLongOrNull()?.let(::twipsToPixels)
+									documentDefaults["p.indentRight"] =
+										xml.getAttributeValue(WORD_NS, "right")
+											?.toLongOrNull()?.let(::twipsToPixels)
+									documentDefaults["p.hangingIndent"] =
+										xml.getAttributeValue(WORD_NS, "hanging")
+											?.toLongOrNull()?.let(::twipsToPixels)
+									documentDefaults["p.firstLineIndent"] =
+										xml.getAttributeValue(WORD_NS, "firstLine")
+											?.toLongOrNull()?.let(::twipsToPixels)
+								}
+							}
+						}
 					}
-				} else if (xml.eventType == XmlPullParser.END_TAG &&
-					xml.namespace == DRAWING_NS &&
-					xml.name == currentColorName
-				) {
-					currentColorName = null
+				} else if (xml.eventType == XmlPullParser.END_TAG) {
+					when (xml.name) {
+						"rPrDefault" -> runDefaults = false
+						"pPrDefault" -> paragraphDefaults = false
+						"docDefaults" -> insideDefaults = false
+					}
 				}
 			}
+		} catch (error: Exception) {
+			ooxml.recordFailure("Could not parse document defaults: ${error.message ?: "invalid part"}")
 		} finally {
 			input.close()
 		}
 	}
 
-	private fun resolveThemeColor(name: String): Int? = when (name) {
-		"tx1" -> themeColors["dk1"]
-		"tx2" -> themeColors["dk2"]
-		"bg1" -> themeColors["lt1"]
-		"bg2" -> themeColors["lt2"]
-		else -> themeColors[name]
+	private fun readTheme() {
+		val themeRelationship = ooxml.relationships("word/document.xml")
+			.values.firstOrNull { it.type.endsWith("/theme") && !it.external }?.target
+		val entryName = themeRelationship ?: "word/theme/theme1.xml"
+		val input = ooxml.optionalPart(entryName) ?: return
+		try {
+			theme = OoxmlThemeParser.parse(input)
+		} catch (error: Exception) {
+			ooxml.recordFailure("Could not parse $entryName: ${error.message ?: "invalid theme"}")
+		} finally {
+			input.close()
+		}
 	}
+
+	private fun fontFamilyFromAttributes(xml: XmlPullParser): String? {
+		val direct = listOf("hAnsi", "ascii", "eastAsia", "cs")
+			.firstNotNullOfOrNull { name ->
+				xml.getAttributeValue(WORD_NS, name)?.takeIf { it.isNotBlank() }
+			}
+		if (direct != null) {
+			return theme.font(direct)
+		}
+		val themed = listOf(
+			"hAnsiTheme",
+			"asciiTheme",
+			"eastAsiaTheme",
+			"cstheme",
+			"csTheme",
+		).firstNotNullOfOrNull { name ->
+			xml.getAttributeValue(WORD_NS, name)?.takeIf { it.isNotBlank() }
+		}
+		return theme.font(themed)
+	}
+
+	private fun resolveThemeFont(name: String?): String? {
+		return theme.font(name)
+	}
+
+	private fun paragraphTextStyle(styleName: String?): DocxTextStyle {
+		val styleId = styleName ?: defaultParagraphStyleId
+		val cacheKey = styleId ?: ""
+		return paragraphTextStyles.getOrPut(cacheKey) {
+			val style = resolvedStyle(styleId).orEmpty()
+			DocxTextStyle(
+				bold = style["bold"] as? Boolean ?: documentDefaults["r.bold"] as? Boolean ?: false,
+				italic = style["italic"] as? Boolean ?: documentDefaults["r.italic"] as? Boolean ?: false,
+				underline = style["underline"] as? Boolean ?: documentDefaults["r.underline"] as? Boolean ?: false,
+				strike = style["strike"] as? Boolean ?: documentDefaults["r.strike"] as? Boolean ?: false,
+				fontSize = style["fontSize"] as? Double ?: documentDefaults["r.fontSize"] as? Double,
+				fontFamily = style["fontFamily"] as? String ?: documentDefaults["r.fontFamily"] as? String,
+				color = style["color"] as? Int ?: documentDefaults["r.color"] as? Int,
+				highlight = style["highlight"] as? Int ?: documentDefaults["r.highlight"] as? Int,
+			)
+		}
+	}
+
+	private fun resolveThemeColor(name: String): Int? = theme.color(name)
 
 	private fun resolvedStyle(
 		id: String?,
 		seen: MutableSet<String> = mutableSetOf(),
 	): Map<String, Any?>? {
-		if (id == null || !seen.add(id)) return null
+		if (id == null) return documentDefaults.filterKeys { !it.startsWith("r.") }
+			.mapKeys { it.key.removePrefix("p.") }
+		if (!seen.add(id)) return null
+		resolvedStyleCache[id]?.let { return it }
+		if (!seen.add(id)) return null
 		val style = styles[id] ?: return null
 		val resolved = resolvedStyle(style["basedOn"] as? String, seen)
 			?.toMutableMap() ?: mutableMapOf()
+		if (styleTypes[id] == "paragraph") {
+			val linked = resolvedStyle(style["link"] as? String, seen)
+			if (linked != null) resolved.putAll(linked)
+		}
 		resolved.putAll(style.filterValues { it != null })
-		return resolved
+		return resolved.toMap().also { resolvedStyleCache[id] = it }
 	}
 
 	private fun readRelationships() {
-		if (archive.getEntry("word/_rels/document.xml.rels") == null) return
-		val input = openEntry("word/_rels/document.xml.rels")
-		val xml = createParser(input)
-		try {
-			while (xml.next() != XmlPullParser.END_DOCUMENT) {
-				if (xml.eventType != XmlPullParser.START_TAG || xml.name != "Relationship") continue
-				if (xml.getAttributeValue(null, "TargetMode") == "External") {
-					val id = xml.getAttributeValue(null, "Id") ?: continue
-					val target = xml.getAttributeValue(null, "Target") ?: continue
-					if (xml.getAttributeValue(null, "Type")?.endsWith("/hyperlink") == true) {
-						relationships[id] = target
-					}
-					continue
+		for ((id, relationship) in ooxml.relationships("word/document.xml")) {
+			if (relationship.external) {
+				if (relationship.type.endsWith("/hyperlink")) {
+					relationships[id] = relationship.target
 				}
-				val id = xml.getAttributeValue(null, "Id") ?: continue
-				val target = xml.getAttributeValue(null, "Target") ?: continue
-				relationships[id] = resolveTarget(target)
+			} else {
+				relationships[id] = relationship.target
 			}
-		} finally {
-			input.close()
 		}
+	}
+
+	private fun readSupplementalBlocks() {
+		val documentRelationships = ooxml.relationships("word/document.xml").values
+		val header = documentRelationships.firstOrNull {
+			!it.external && it.type.endsWith("/header")
+		}?.target
+		headerBlocks = header?.let {
+			readSupplementalPart(it, "Document header").take(DOCX_BATCH_BLOCKS)
+		}.orEmpty()
+	}
+
+	private fun loadTrailingBlocks() {
+		trailingBlocksLoaded = true
+		val documentRelationships = ooxml.relationships("word/document.xml").values
+		val footer = documentRelationships.firstOrNull {
+			!it.external && it.type.endsWith("/footer")
+		}?.target
+		trailingBlocks = buildList {
+			footer?.let { addAll(readSupplementalPart(it, "Document footer")) }
+			addAll(readSupplementalPart("word/footnotes.xml", "Footnotes", true))
+			addAll(readSupplementalPart("word/endnotes.xml", "Endnotes", true))
+		}.take(DOCX_MAX_SUPPLEMENTAL_BLOCKS)
+	}
+
+	private fun readSupplementalPart(
+		path: String,
+		label: String,
+		isNotesPart: Boolean = false,
+	): List<Map<String, Any?>> {
+		if (archive.getEntry(path) == null) return emptyList()
+		val previousParser = parser
+		val previousInput = documentInput
+		val previousRelationships = relationships.toMap()
+		val previousPendingBreak = pendingPageBreak
+		val previousInsideTable = insideTable
+		val previousTableId = activeTableId
+		val previousColumnWidths = tableColumnWidths.toList()
+		val input = try {
+			openEntry(path)
+		} catch (error: Exception) {
+			ooxml.recordFailure("Could not read $label: ${error.message ?: "invalid part"}")
+			return emptyList()
+		}
+		val output = mutableListOf<Map<String, Any?>>()
+		try {
+			documentInput = input
+			parser = createParser(input)
+			relationships.clear()
+			for ((id, relationship) in ooxml.relationships(path)) {
+				if (relationship.external || relationship.target.startsWith("word/media/")) {
+					relationships[id] = relationship.target
+				}
+			}
+			pendingPageBreak = false
+			insideTable = false
+			val prefix = when (label) {
+				"Footnotes", "Endnotes" -> "$label"
+				else -> label
+			}
+			if (label != "Document header") {
+				output.add(
+					mapOf(
+						"type" to "paragraph",
+						"runs" to listOf(DocxTextStyle(bold = true).channelValue(prefix)),
+					),
+				)
+			}
+			var skipped = false
+			while (parser.next() != XmlPullParser.END_DOCUMENT &&
+				output.size < DOCX_MAX_SUPPLEMENTAL_BLOCKS
+			) {
+				if (parser.eventType != XmlPullParser.START_TAG) continue
+				if (isNotesPart && parser.name in setOf("footnote", "endnote")) {
+					val noteType = parser.getAttributeValue(WORD_NS, "type")
+					if (noteType in setOf("separator", "continuationSeparator", "continuationNotice")) {
+						skipElement()
+						continue
+					}
+				}
+				if (parser.name == "p") {
+					val blocks = parseParagraph()
+					output.addAll(blocks.take(DOCX_MAX_SUPPLEMENTAL_BLOCKS - output.size))
+				} else if (parser.name in setOf("comment", "del", "moveFrom")) {
+					skipped = true
+					skipElement()
+				} else if (parser.name == "tbl") {
+					output.addAll(
+						parseNestedTableBlocks()
+							.take(DOCX_MAX_SUPPLEMENTAL_BLOCKS - output.size),
+					)
+				}
+			}
+			if (skipped) notShown.add("Tracked changes and comments are hidden")
+		} catch (error: Exception) {
+			ooxml.recordFailure("Could not parse $label: ${error.message ?: "invalid part"}")
+		} finally {
+			runCatching { input.close() }
+			parser = previousParser
+			documentInput = previousInput
+			relationships.clear()
+			relationships.putAll(previousRelationships)
+			pendingPageBreak = previousPendingBreak
+			insideTable = previousInsideTable
+			activeTableId = previousTableId
+			tableColumnWidths.clear()
+			tableColumnWidths.addAll(previousColumnWidths)
+		}
+		return output
+	}
+
+	private fun parseSectionProperties() {
+		if (firstSection != null) {
+			skipElement()
+			return
+		}
+		var width: Long? = null
+		var height: Long? = null
+		var left: Long? = null
+		var right: Long? = null
+		var top: Long? = null
+		var bottom: Long? = null
+		var depth = 1
+		while (depth > 0 && parser.next() != XmlPullParser.END_DOCUMENT) {
+			if (parser.eventType == XmlPullParser.START_TAG) {
+				depth++
+				when (parser.name) {
+					"pgSz" -> {
+						width = parser.getAttributeValue(WORD_NS, "w")?.toLongOrNull()
+						height = parser.getAttributeValue(WORD_NS, "h")?.toLongOrNull()
+					}
+					"pgMar" -> {
+						left = parser.getAttributeValue(WORD_NS, "left")?.toLongOrNull()
+						right = parser.getAttributeValue(WORD_NS, "right")?.toLongOrNull()
+						top = parser.getAttributeValue(WORD_NS, "top")?.toLongOrNull()
+						bottom = parser.getAttributeValue(WORD_NS, "bottom")?.toLongOrNull()
+					}
+					"cols" -> if ((parser.getAttributeValue(WORD_NS, "num")?.toIntOrNull() ?: 1) > 1) {
+						notShown.add("Multiple document columns are shown as one column")
+					}
+				}
+			} else if (parser.eventType == XmlPullParser.END_TAG) {
+				depth--
+			}
+		}
+		firstSection = mapOf(
+			"pageWidth" to twipsToPixels(width ?: 12_240),
+			"pageHeight" to twipsToPixels(height ?: 15_840),
+			"marginLeft" to twipsToPixels(left ?: 1_440),
+			"marginRight" to twipsToPixels(right ?: 1_440),
+			"marginTop" to twipsToPixels(top ?: 1_440),
+			"marginBottom" to twipsToPixels(bottom ?: 1_440),
+		)
 	}
 
 	private fun readNumbering() {
 		if (archive.getEntry("word/numbering.xml") == null) return
 		val abstracts = mutableMapOf<Int, MutableMap<Int, DocxNumberingDefinition>>()
 		val assignments = mutableMapOf<Int, Int>()
+		val startOverrides = mutableMapOf<Pair<Int, Int>, Int>()
 		val input = openEntry("word/numbering.xml")
 		val xml = createParser(input)
 		try {
@@ -1269,6 +1844,8 @@ private class DocxDocument private constructor(
 			var level: Int? = null
 			var format: String? = null
 			var marker: String? = null
+			var startAt = 1
+			var overrideLevel: Int? = null
 			var leftIndent: Double? = null
 			var hangingIndent: Double? = null
 			while (xml.next() != XmlPullParser.END_DOCUMENT) {
@@ -1276,13 +1853,25 @@ private class DocxDocument private constructor(
 					when (xml.name) {
 						"abstractNum" -> abstractId = xml.getAttributeValue(WORD_NS, "abstractNumId")?.toIntOrNull()
 						"lvl" -> level = xml.getAttributeValue(WORD_NS, "ilvl")?.toIntOrNull()
+						"lvlOverride" -> overrideLevel =
+							xml.getAttributeValue(WORD_NS, "ilvl")?.toIntOrNull()
+						"startOverride" -> {
+							val numId = currentNumId
+							val levelIndex = overrideLevel
+							val value = xml.getAttributeValue(WORD_NS, "val")?.toIntOrNull()
+							if (numId != null && levelIndex != null && value != null) {
+								startOverrides[numId to levelIndex] = value.coerceIn(1, 100_000)
+							}
+						}
 						"numFmt" -> format = xml.getAttributeValue(WORD_NS, "val")
 						"lvlText" -> marker = xml.getAttributeValue(WORD_NS, "val")
+						"start" -> startAt =
+							xml.getAttributeValue(WORD_NS, "val")?.toIntOrNull()?.coerceIn(1, 100_000) ?: 1
 						"ind" -> {
 							leftIndent = xml.getAttributeValue(WORD_NS, "left")
-								?.toDoubleOrNull()?.div(15.0)
+								?.toLongOrNull()?.let(::twipsToPixels)
 							hangingIndent = xml.getAttributeValue(WORD_NS, "hanging")
-								?.toDoubleOrNull()?.div(15.0)
+								?.toLongOrNull()?.let(::twipsToPixels)
 						}
 						"num" -> currentNumId =
 							xml.getAttributeValue(WORD_NS, "numId")?.toIntOrNull()
@@ -1310,14 +1899,17 @@ private class DocxDocument private constructor(
 								"lowerRoman" -> "i."
 								"upperRoman" -> "I."
 								else -> rawMarker
-							}, leftIndent, hangingIndent)
+							}, leftIndent, hangingIndent, startAt)
 						level = null
 						format = null
 						marker = null
 						leftIndent = null
 						hangingIndent = null
+						startAt = 1
 					} else if (xml.name == "num") {
 						currentNumId = null
+					} else if (xml.name == "lvlOverride") {
+						overrideLevel = null
 					} else if (xml.name == "abstractNum") {
 						abstractId = null
 					}
@@ -1328,7 +1920,9 @@ private class DocxDocument private constructor(
 		}
 		for ((numId, abstractId) in assignments) {
 			for ((level, value) in abstracts[abstractId].orEmpty()) {
-				numbering[numId to level] = value
+				numbering[numId to level] = value.copy(
+					startAt = startOverrides[numId to level] ?: value.startAt,
+				)
 			}
 		}
 	}
@@ -1413,6 +2007,24 @@ private class DocxDocument private constructor(
 		return text.toString()
 	}
 
+	private fun readEquationText(): String {
+		val text = StringBuilder()
+		var depth = 1
+		while (depth > 0 && parser.next() != XmlPullParser.END_DOCUMENT) {
+			if (parser.eventType == XmlPullParser.START_TAG) {
+				depth++
+				if (parser.name == "t") {
+					if (text.isNotEmpty()) text.append(' ')
+					text.append(keepText(readTextElement("t")))
+					depth--
+				}
+			} else if (parser.eventType == XmlPullParser.END_TAG) {
+				depth--
+			}
+		}
+		return text.toString().ifBlank { "Equation not shown" }
+	}
+
 	private fun keepText(text: String): String {
 		val remaining = (32 * 1024 * 1024 - retainedCharacters).coerceAtLeast(0)
 		val length = minOf(text.length, DOCX_MAX_CELL_TEXT, remaining)
@@ -1424,7 +2036,7 @@ private class DocxDocument private constructor(
 	private fun listMarker(numId: Int, level: Int): DocxNumberingDefinition? {
 		val definition = numbering[numId to level] ?: return null
 		val key = numId to level
-		val value = (listCounters[key] ?: 0) + 1
+		val value = (listCounters[key] ?: definition.startAt - 1) + 1
 		listCounters[key] = value
 		listCounters.keys.removeAll { it.first == numId && it.second > level }
 		val marker = when (definition.format) {
@@ -1474,36 +2086,6 @@ private class DocxDocument private constructor(
 			if (parser.eventType == XmlPullParser.START_TAG) depth++
 			else if (parser.eventType == XmlPullParser.END_TAG) depth--
 		}
-	}
-
-	private fun resolveTarget(target: String): String {
-		val path = mutableListOf<String>()
-		val pathTarget = target.substringBefore('#').substringBefore('?').replace('\\', '/')
-		val combined = if (pathTarget.startsWith("/")) pathTarget.removePrefix("/")
-		else "word/$pathTarget"
-		for (rawPart in combined.split('/')) {
-			val part = Uri.decode(rawPart)
-			when (part) {
-				"", "." -> Unit
-				".." -> {
-					if (path.isEmpty()) {
-						throw DocxReaderException("INVALID_DOCUMENT", "A document relationship is invalid")
-					}
-					path.removeAt(path.lastIndex)
-				}
-				else -> {
-					if (part.contains('/') || part.contains('\\')) {
-						throw DocxReaderException("INVALID_DOCUMENT", "A document relationship is invalid")
-					}
-					path.add(part)
-				}
-			}
-		}
-		val result = path.joinToString("/")
-		if (result.isBlank()) {
-			throw DocxReaderException("INVALID_DOCUMENT", "A document relationship is invalid")
-		}
-		return result
 	}
 
 	private fun pageBreakBlock(): Map<String, Any?> = mapOf("type" to "pageBreak")
@@ -1585,6 +2167,9 @@ private class DocxDocument private constructor(
 		}
 	}
 }
+
+private fun twipsToPixels(value: Long): Double =
+	OoxmlUnits.pointsToPixels(OoxmlUnits.twipsToPoints(value))
 
 private fun parseColor(value: String?): Int? {
 	if (value.isNullOrBlank() || value == "auto") return null

@@ -11,6 +11,10 @@ import '../common/marquee_text.dart';
 import '../common/open_spreadsheet_file.dart';
 import 'spreadsheet_grid.dart';
 
+const int _csvAutoSizeSampleRows = 1000;
+const int _csvAutoSizeMaxCharacters = 40;
+const double _csvAutoSizeMaxWidth = 320;
+
 class CsvViewerTab extends ConsumerStatefulWidget {
   const CsvViewerTab({
     super.key,
@@ -32,6 +36,8 @@ class CsvViewerTab extends ConsumerStatefulWidget {
 class _CsvViewerTabState extends ConsumerState<CsvViewerTab>
     with AutomaticKeepAliveClientMixin {
   CsvSpreadsheetGridSource? _source;
+  final GlobalKey<SpreadsheetGridState> _gridKey =
+      GlobalKey<SpreadsheetGridState>();
   Object? _loadError;
   int _loadGeneration = 0;
   bool _isVisible = false;
@@ -89,7 +95,9 @@ class _CsvViewerTabState extends ConsumerState<CsvViewerTab>
       _loadError = null;
     });
     try {
-      final session = await ref.read(csvFileRepositoryProvider).open(widget.path);
+      final session = await ref
+          .read(csvFileRepositoryProvider)
+          .open(widget.path);
       if (!mounted || !_isVisible || generation != _loadGeneration) {
         await session.close();
         return;
@@ -127,13 +135,31 @@ class _CsvViewerTabState extends ConsumerState<CsvViewerTab>
       ),
       actions: [
         IconButton(
+          tooltip: 'Go to cell',
+          onPressed: source == null
+              ? null
+              : () => showSpreadsheetGoToCell(context, _gridKey),
+          icon: const Icon(Icons.my_location),
+        ),
+        IconButton(
+          tooltip: 'Find in sheet',
+          onPressed: source == null
+              ? null
+              : () => showSpreadsheetFind(context, _gridKey),
+          icon: const Icon(Icons.search),
+        ),
+        IconButton(
           tooltip: 'Edit as text',
           onPressed: () => TabsManager.instance.openTextEditor(widget.path),
           icon: const Icon(Icons.edit_note),
         ),
       ],
       child: source != null
-          ? SpreadsheetGrid(source: source, onZoomChanged: widget.onZoomChanged)
+          ? SpreadsheetGrid(
+              key: _gridKey,
+              source: source,
+              onZoomChanged: widget.onZoomChanged,
+            )
           : Center(
               child: Padding(
                 padding: const EdgeInsets.all(24),
@@ -168,6 +194,7 @@ class CsvSpreadsheetGridSource extends SpreadsheetGridDataSource {
       (progress) {
         _progress = progress;
         notifyListeners();
+        _startAutoSizeWhenReady();
       },
       onError: (Object error) {
         _warningMessage = 'CSV reading stopped: $error';
@@ -181,6 +208,8 @@ class CsvSpreadsheetGridSource extends SpreadsheetGridDataSource {
   final Map<int, Future<SpreadsheetRowData>> _rowCache = {};
   CsvIndexProgress _progress;
   String? _warningMessage;
+  final Map<int, double> _columnWidths = {};
+  bool _isAutoSizing = false;
   bool _isClosed = false;
   bool _isDisposed = false;
 
@@ -191,7 +220,7 @@ class CsvSpreadsheetGridSource extends SpreadsheetGridDataSource {
   int get columnCount => _progress.columnCount;
 
   @override
-  bool get isIndexing => !_progress.isComplete;
+  bool get isIndexing => !_isClosed && !_progress.isComplete;
 
   @override
   bool get isTruncated => _progress.isTruncated;
@@ -202,6 +231,59 @@ class CsvSpreadsheetGridSource extends SpreadsheetGridDataSource {
 
   @override
   String? get warningMessage => _warningMessage;
+
+  @override
+  double? columnWidthAt(int columnIndex) => _columnWidths[columnIndex];
+
+  void _startAutoSizeWhenReady() {
+    if (_isAutoSizing ||
+        _isClosed ||
+        (_progress.rowCount < _csvAutoSizeSampleRows &&
+            !_progress.isComplete)) {
+      return;
+    }
+    _isAutoSizing = true;
+    unawaited(_autoSizeColumns());
+  }
+
+  Future<void> _autoSizeColumns() async {
+    final rowsToSample = _progress.rowCount < _csvAutoSizeSampleRows
+        ? _progress.rowCount
+        : _csvAutoSizeSampleRows;
+    final widths = <int, double>{};
+    try {
+      for (
+        var rowIndex = 0;
+        rowIndex < rowsToSample && !_isClosed;
+        rowIndex++
+      ) {
+        final row = await _session.readRow(rowIndex);
+        final indexes =
+            row.columnIndexes ??
+            List<int>.generate(row.cells.length, (index) => index);
+        for (final column in indexes) {
+          final length = row
+              .valueAt(column)
+              .runes
+              .length
+              .clamp(0, _csvAutoSizeMaxCharacters);
+          final width = (length * 7.0 + 24)
+              .clamp(56.0, _csvAutoSizeMaxWidth)
+              .toDouble();
+          if (width > (widths[column] ?? 56.0)) widths[column] = width;
+        }
+      }
+      if (!_isClosed) {
+        _columnWidths.addAll(widths);
+        notifyListeners();
+      }
+    } catch (error) {
+      if (!_isClosed) {
+        _warningMessage = 'CSV column sizing stopped: $error';
+        notifyListeners();
+      }
+    }
+  }
 
   @override
   Future<SpreadsheetRowData> loadRow(int rowIndex) {
@@ -242,7 +324,10 @@ class CsvSpreadsheetGridSource extends SpreadsheetGridDataSource {
 
   @override
   void dispose() {
-    if (!_isClosed) unawaited(close());
+    if (!_isClosed) {
+      notifyListeners();
+      unawaited(close());
+    }
     if (!_isDisposed) {
       _isDisposed = true;
       super.dispose();

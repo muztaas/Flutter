@@ -39,6 +39,15 @@ class _AndroidDocxReadSession implements DocxReadSession {
       blockCount: result['blockCount']! as int,
       isComplete: result['complete']! as bool,
       isTruncated: result['truncated']! as bool,
+      notShownFeatures: (result['notShown'] as List? ?? const [])
+          .cast<String>()
+          .toList(growable: false),
+      sectionPageWidth: (result['pageWidth'] as num?)?.toDouble(),
+      sectionPageHeight: (result['pageHeight'] as num?)?.toDouble(),
+      sectionMarginLeft: (result['marginLeft'] as num?)?.toDouble(),
+      sectionMarginRight: (result['marginRight'] as num?)?.toDouble(),
+      sectionMarginTop: (result['marginTop'] as num?)?.toDouble(),
+      sectionMarginBottom: (result['marginBottom'] as num?)?.toDouble(),
     );
   }
 
@@ -69,6 +78,7 @@ class _AndroidDocxReadSession implements DocxReadSession {
     styleUnderline: block['styleUnderline'] as bool? ?? false,
     styleStrikethrough: block['styleStrike'] as bool? ?? false,
     styleFontSize: (block['styleFontSize'] as num?)?.toDouble(),
+    styleFontFamily: block['styleFontFamily'] as String?,
     styleColor: block['styleColor'] as int?,
     styleHighlight: block['styleHighlight'] as int?,
     headingLevel: block['headingLevel'] as int?,
@@ -77,8 +87,15 @@ class _AndroidDocxReadSession implements DocxReadSession {
     listMarker: block['listMarker'] as String?,
     listLevel: block['listLevel'] as int? ?? 0,
     imagePath: block['imagePath'] as String?,
+    chartData: block['chartData'] is Map
+        ? Map<Object?, Object?>.from(block['chartData']! as Map)
+        : null,
     imageWidth: (block['width'] as num?)?.toDouble(),
     imageHeight: (block['height'] as num?)?.toDouble(),
+    imageCropLeft: (block['cropLeft'] as num?)?.toDouble() ?? 0,
+    imageCropTop: (block['cropTop'] as num?)?.toDouble() ?? 0,
+    imageCropRight: (block['cropRight'] as num?)?.toDouble() ?? 0,
+    imageCropBottom: (block['cropBottom'] as num?)?.toDouble() ?? 0,
     pageBreakBefore: block['pageBreakBefore'] as bool? ?? false,
     placeholder: block['placeholder'] as String?,
     floatingLeft: (block['floatingLeft'] as num?)?.toDouble(),
@@ -97,9 +114,29 @@ class _AndroidDocxReadSession implements DocxReadSession {
     paragraphIndentLeft: (block['indentLeft'] as num?)?.toDouble(),
     paragraphIndentRight: (block['indentRight'] as num?)?.toDouble(),
     paragraphHangingIndent: (block['hangingIndent'] as num?)?.toDouble(),
+    paragraphFirstLineIndent: (block['firstLineIndent'] as num?)?.toDouble(),
+    paragraphBackground: block['paragraphBackground'] as int?,
     paragraphBottomBorderColor: block['bottomBorderColor'] as int?,
     paragraphBottomBorderWidth: (block['bottomBorderWidth'] as num?)
         ?.toDouble(),
+    tableCellBackgrounds:
+        (block['cellBackgrounds'] as List? ?? const [])
+            .map((value) => value as int?)
+            .toList(growable: false),
+    tableCellVerticalMerges:
+        (block['cellVerticalMerges'] as List? ?? const [])
+            .map((value) => value as String?)
+            .toList(growable: false),
+    tableCellBorders: (block['cellBorders'] as List? ?? const [])
+        .map((value) => value as int?)
+        .toList(growable: false),
+    tableRowBackground: block['rowBackground'] as int?,
+    sectionPageWidth: (block['pageWidth'] as num?)?.toDouble(),
+    sectionPageHeight: (block['pageHeight'] as num?)?.toDouble(),
+    sectionMarginLeft: (block['marginLeft'] as num?)?.toDouble(),
+    sectionMarginRight: (block['marginRight'] as num?)?.toDouble(),
+    sectionMarginTop: (block['marginTop'] as num?)?.toDouble(),
+    sectionMarginBottom: (block['marginBottom'] as num?)?.toDouble(),
   );
 
   List<DocxTextRun> _decodeRuns(Object? value) => (value as List? ?? const [])
@@ -114,12 +151,17 @@ class _AndroidDocxReadSession implements DocxReadSession {
           underline: run['underline'] as bool? ?? false,
           strikethrough: run['strike'] as bool? ?? false,
           fontSize: (run['fontSize'] as num?)?.toDouble(),
+          fontFamily: run['fontFamily'] as String?,
           color: run['color'] as int?,
           highlight: run['highlight'] as int?,
           hyperlink: run['hyperlink'] as String?,
           imagePath: run['imagePath'] as String?,
           imageWidth: (run['width'] as num?)?.toDouble(),
           imageHeight: (run['height'] as num?)?.toDouble(),
+          imageCropLeft: (run['cropLeft'] as num?)?.toDouble() ?? 0,
+          imageCropTop: (run['cropTop'] as num?)?.toDouble() ?? 0,
+          imageCropRight: (run['cropRight'] as num?)?.toDouble() ?? 0,
+          imageCropBottom: (run['cropBottom'] as num?)?.toDouble() ?? 0,
         ),
       )
       .toList(growable: false);

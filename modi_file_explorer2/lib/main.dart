@@ -12,6 +12,27 @@ import 'presentation/shell/top_level_shell.dart';
 import 'presentation/startup/startup_permission_gate.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+const _pdfiumLicenseNoticeAssets = <({String name, String path})>[
+  (name: 'PDFium (Chromium revision 7811)', path: 'assets/pdfium/licenses/pdfium.txt'),
+  (name: 'ICU', path: 'assets/pdfium/licenses/icu.txt'),
+  (name: 'Catapult', path: 'assets/pdfium/licenses/catapult.txt'),
+  (name: 'zlib', path: 'assets/pdfium/licenses/zlib.txt'),
+  (name: 'libunwind', path: 'assets/pdfium/licenses/libunwind.txt'),
+  (name: 'libjpeg-turbo (IJG)', path: 'assets/pdfium/licenses/libjpeg_turbo.ijg'),
+  (name: 'CPU Features', path: 'assets/pdfium/licenses/cpu_features.txt'),
+  (name: 'LLVM libc', path: 'assets/pdfium/licenses/llvm-libc.txt'),
+  (name: 'Little CMS', path: 'assets/pdfium/licenses/lcms.txt'),
+  (name: 'libpng', path: 'assets/pdfium/licenses/libpng.txt'),
+  (name: 'Anti-Grain Geometry', path: 'assets/pdfium/licenses/agg23.txt'),
+  (name: 'OpenJPEG', path: 'assets/pdfium/licenses/libopenjpeg.txt'),
+  (name: 'libjpeg-turbo', path: 'assets/pdfium/licenses/libjpeg_turbo.md'),
+  (name: 'FreeType', path: 'assets/pdfium/licenses/freetype.txt'),
+  (name: 'libtiff', path: 'assets/pdfium/licenses/libtiff.txt'),
+  (name: 'fast_float', path: 'assets/pdfium/licenses/fast_float.txt'),
+  (name: 'Abseil', path: 'assets/pdfium/licenses/abseil.txt'),
+  (name: 'simdutf', path: 'assets/pdfium/licenses/simdutf.txt'),
+];
+
 const _navigationModeChannel = MethodChannel(
   'modi_file_explorer2/navigation_mode',
 );
@@ -61,6 +82,38 @@ void main() {
       'Copyright JetBrains s.r.o.; JSpecify is Copyright The JSpecify '
       'Authors.\n\n$license',
     );
+  });
+  LicenseRegistry.addLicense(() async* {
+    final license = await rootBundle.loadString('assets/fonts/Carlito/OFL.txt');
+    yield LicenseEntryWithLineBreaks(const [
+      'Carlito',
+    ], 'Copyright 2013 The Carlito Project Authors.\n\n$license');
+  });
+  LicenseRegistry.addLicense(() async* {
+    final license = await rootBundle.loadString('assets/fonts/Caladea/OFL.txt');
+    yield LicenseEntryWithLineBreaks(const [
+      'Caladea',
+    ], 'Copyright 2012 The Caladea Project Authors.\n\n$license');
+  });
+  LicenseRegistry.addLicense(() async* {
+    final pdfrxEngineLicense = await rootBundle.loadString(
+      'third_party/pdfrx_engine/LICENSE',
+    );
+    yield LicenseEntryWithLineBreaks(
+      const ['pdfrx_engine 0.4.7 (locally patched)'],
+      pdfrxEngineLicense,
+    );
+    final distributorLicense = await rootBundle.loadString(
+      'assets/pdfium/LICENSE',
+    );
+    yield LicenseEntryWithLineBreaks(
+      const ['PDFium native binary distribution (bblanchon/pdfium-binaries)'],
+      distributorLicense,
+    );
+    for (final notice in _pdfiumLicenseNoticeAssets) {
+      final license = await rootBundle.loadString(notice.path);
+      yield LicenseEntryWithLineBreaks([notice.name], license);
+    }
   });
   runApp(const ProviderScope(child: _AppBootstrap()));
 }

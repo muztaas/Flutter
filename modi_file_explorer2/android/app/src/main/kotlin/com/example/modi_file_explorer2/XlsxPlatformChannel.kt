@@ -20,6 +20,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.zip.ZipFile
+import kotlin.math.roundToInt
 
 private const val XLSX_MAX_FILE_BYTES = 1L shl 30
 private const val XLSX_MAX_ENTRY_BYTES = 64L * 1024 * 1024
@@ -32,6 +33,7 @@ private const val XLSX_MAX_CELL_CHARACTERS = 65_536
 private const val XLSX_MAX_TOTAL_CELL_CHARACTERS = 32 * 1024 * 1024
 private const val XLSX_MAX_SHARED_STRINGS = 1_000_000
 private const val XLSX_BATCH_ROWS = 128
+private const val XLSX_MAX_CHARTS_PER_SHEET = 16
 
 private class XlsxReaderException(
 	val code: String,
@@ -136,10 +138,33 @@ private data class XlsxSheet(
 	val defaultRowHeight: Double,
 )
 
+private data class XlsxStyles(
+	val numberFormats: List<Int>,
+	val customFormats: Map<Int, String>,
+	val cellStyles: List<Map<String, Any?>>,
+)
+
+private class XlsxSharedStrings(
+	private val buffer: String,
+	private val offsets: IntArray,
+	private val richRuns: Map<Int, List<Map<String, Any?>>>,
+) {
+	fun getOrNull(index: Int): String? =
+		if (index < 0 || index + 1 >= offsets.size) null
+		else buffer.substring(offsets[index], offsets[index + 1])
+	fun richRunsOrNull(index: Int): List<Map<String, Any?>>? = richRuns[index]
+
+	companion object {
+		val EMPTY = XlsxSharedStrings("", intArrayOf(0), emptyMap())
+	}
+}
+
 private data class CompactXlsxRow(
 	val rowNumber: Int,
 	val columns: IntArray,
 	val values: Array<String>,
+	val styles: Array<Map<String, Any?>>,
+	val richText: Array<List<Map<String, Any?>>?>,
 	val height: Double?,
 	val truncated: Boolean,
 ) {
@@ -147,6 +172,8 @@ private data class CompactXlsxRow(
 		"rowNumber" to rowNumber,
 		"columns" to columns.toList(),
 		"values" to values.toList(),
+		"styles" to styles.toList(),
+		"richText" to richText.toList(),
 		"height" to height,
 		"truncated" to truncated,
 	)
@@ -156,10 +183,12 @@ private class XlsxWorkbook private constructor(
 	private val archive: ZipFile,
 	private val file: File,
 	val id: String,
+	private val ooxml: OoxmlPackage,
 	private var sheets: List<XlsxSheet>,
-	private var sharedStrings: List<String>,
+	private var sharedStrings: XlsxSharedStrings,
 	private var numberFormats: List<Int>,
 	private var customFormats: Map<Int, String>,
+	private var cellStyles: List<Map<String, Any?>>,
 	private var date1904: Boolean,
 ) {
 	private var inflatedBytes = 0L
@@ -168,6 +197,17 @@ private class XlsxWorkbook private constructor(
 	private var storedCellCount = 0
 	private var sheetReader: XlsxSheetReader? = null
 	private var closed = false
+	private var activeCharts: List<Map<String, Any?>> = emptyList()
+	private var theme = OoxmlTheme(
+		emptyMap(),
+		emptyMap(),
+		emptyMap(),
+		emptyList(),
+		emptyList(),
+		emptyMap(),
+	)
+
+	fun notShownFailures(): List<String> = ooxml.failures()
 
 	fun metadata(): Map<String, Any?> = mapOf(
 		"id" to id,
@@ -194,16 +234,18 @@ private class XlsxWorkbook private constructor(
 			sharedStrings,
 			numberFormats,
 			customFormats,
+			cellStyles,
 			date1904,
 		)
-		return sheetReader!!.readNextRows()
+		activeCharts = readCharts(sheet)
+		return sheetReader!!.readNextRows() + mapOf("charts" to activeCharts)
 	}
 
 	fun readNextRows(): Map<String, Any?> {
 		ensureOpen()
 		return (sheetReader
 			?: throw XlsxReaderException("SHEET_UNAVAILABLE", "Open a worksheet first"))
-			.readNextRows()
+			.readNextRows() + mapOf("charts" to activeCharts)
 	}
 
 	fun readRow(index: Int): Map<String, Any?> {
@@ -219,6 +261,7 @@ private class XlsxWorkbook private constructor(
 		if (entry.isDirectory) {
 			throw XlsxReaderException("INVALID_WORKBOOK", "A workbook data entry is invalid")
 		}
+
 		if (entry.size > XLSX_MAX_ENTRY_BYTES) {
 			throw XlsxReaderException("ENTRY_TOO_LARGE", "A workbook section exceeds the 64 MiB limit")
 		}
@@ -238,6 +281,119 @@ private class XlsxWorkbook private constructor(
 				inflatedEntryBytes[path] = entryBytes
 			}
 		}
+	}
+
+	private fun readCharts(sheet: XlsxSheet): List<Map<String, Any?>> {
+		val drawingRelationship = ooxml.relationships(sheet.path)
+			.values.firstOrNull { it.type.endsWith("/drawing") && !it.external }
+			?: return emptyList()
+		val drawingRelationships = ooxml.relationships(drawingRelationship.target)
+		val chartTargets = drawingRelationships
+			.filterValues { it.type.endsWith("/chart") && !it.external }
+			.mapValues { it.value.target }
+		val input = ooxml.optionalPart(drawingRelationship.target) ?: return emptyList()
+		val charts = mutableListOf<Map<String, Any?>>()
+		try {
+			val parser = xmlParser(input)
+			var inAnchor = false
+			var column = 0
+			var row = 0
+			var endColumn = 0
+			var endRow = 0
+			var chartRelationshipId: String? = null
+			while (parser.next() != XmlPullParser.END_DOCUMENT) {
+				if (parser.eventType == XmlPullParser.START_TAG) {
+					when (parser.name) {
+						"oneCellAnchor", "twoCellAnchor" -> {
+							inAnchor = true
+							column = 0
+							row = 0
+							endColumn = 0
+							endRow = 0
+							chartRelationshipId = null
+						}
+						"from" -> if (inAnchor) {
+							while (parser.next() != XmlPullParser.END_DOCUMENT) {
+								if (parser.eventType == XmlPullParser.START_TAG) {
+									when (parser.name) {
+										"col" -> column = parser.nextText().toIntOrNull() ?: column
+										"row" -> row = parser.nextText().toIntOrNull() ?: row
+									}
+								} else if (parser.eventType == XmlPullParser.END_TAG &&
+									parser.name == "from"
+								) {
+									break
+								}
+							}
+						}
+						"to" -> if (inAnchor) {
+							while (parser.next() != XmlPullParser.END_DOCUMENT) {
+								if (parser.eventType == XmlPullParser.START_TAG) {
+									when (parser.name) {
+										"col" -> endColumn = parser.nextText().toIntOrNull() ?: endColumn
+										"row" -> endRow = parser.nextText().toIntOrNull() ?: endRow
+									}
+								} else if (parser.eventType == XmlPullParser.END_TAG &&
+									parser.name == "to"
+								) {
+									break
+								}
+							}
+						}
+						"chart" -> chartRelationshipId = parser.getAttributeValue(
+							"http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+							"id",
+						)
+					}
+				} else if (parser.eventType == XmlPullParser.END_TAG &&
+					parser.name in setOf("oneCellAnchor", "twoCellAnchor")
+				) {
+					val chartPath = chartRelationshipId?.let(chartTargets::get)
+					if (chartPath != null && charts.size < XLSX_MAX_CHARTS_PER_SHEET) {
+						val chartData = ooxml.optionalPart(chartPath)?.use {
+							OoxmlChartParser.parse(it, theme)
+						}
+						if (chartData != null) {
+							if (chartData["supported"] != true) {
+								val title = chartData["title"] as? String
+								ooxml.recordFailure(
+									if (title.isNullOrBlank()) "Unsupported chart type"
+									else "Unsupported chart: $title",
+								)
+							}
+							if (chartData["truncated"] == true) {
+								ooxml.recordFailure("Chart data is truncated to viewer limits")
+							}
+							charts.add(
+								mapOf(
+									"column" to column,
+									"row" to row,
+									"widthColumns" to (
+										(endColumn - column).takeIf { it > 0 }?.coerceAtMost(32) ?: 5
+									),
+									"heightRows" to (
+										(endRow - row).takeIf { it > 0 }?.coerceAtMost(80) ?: 8
+									),
+									"chartData" to chartData,
+								),
+							)
+						}
+					} else if (chartRelationshipId != null &&
+						charts.size >= XLSX_MAX_CHARTS_PER_SHEET
+					) {
+						ooxml.recordFailure(
+							"Additional worksheet charts are omitted by the 16-chart limit",
+						)
+					}
+					inAnchor = false
+				}
+			}
+		} catch (error: Exception) {
+			ooxml.recordFailure("Could not read worksheet charts: ${error.message ?: "invalid drawing"}")
+		} finally {
+			input.close()
+		}
+		return charts
 	}
 
 	internal fun keepCellText(text: String): Pair<String, Boolean> {
@@ -295,10 +451,16 @@ private class XlsxWorkbook private constructor(
 					archive = archive,
 					file = file,
 					id = UUID.randomUUID().toString(),
+					ooxml = OoxmlPackage(
+						archive,
+						XLSX_MAX_ENTRY_BYTES,
+						XLSX_MAX_TOTAL_INFLATED_BYTES,
+					),
 					sheets = emptyList(),
-					sharedStrings = emptyList(),
+					sharedStrings = XlsxSharedStrings.EMPTY,
 					numberFormats = emptyList(),
 					customFormats = emptyMap(),
+					cellStyles = emptyList(),
 					date1904 = false,
 				)
 				return workbook.readMetadata()
@@ -318,79 +480,42 @@ private class XlsxWorkbook private constructor(
 			)
 		}
 		val relationships = readRelationships()
-		val workbookInfo = readWorkbook(relationships)
+		val themePath = ooxml.relationships("xl/workbook.xml")
+			.values.firstOrNull { it.type.endsWith("/theme") && !it.external }?.target
+			?: "xl/theme/theme1.xml"
+		val themeInput = ooxml.optionalPart(themePath)
+		if (themeInput != null) {
+			try {
+				theme = OoxmlThemeParser.parse(themeInput)
+			} catch (error: Exception) {
+				ooxml.recordFailure("Could not parse $themePath: ${error.message ?: "invalid theme"}")
+			} finally {
+				themeInput.close()
+			}
+		}
 		val styles = readStyles()
+		val workbookInfo = readWorkbook(relationships)
 		sheets = workbookInfo.first
 		date1904 = workbookInfo.second
 		sharedStrings = readSharedStrings()
-		numberFormats = styles.first
-		customFormats = styles.second
+		numberFormats = styles.numberFormats
+		customFormats = styles.customFormats
+		cellStyles = styles.cellStyles
 		return this
 	}
 
 	private fun readWorkbookContentType(): String {
-		val input = openEntry("[Content_Types].xml")
-		val parser = xmlParser(input)
-		try {
-			while (parser.next() != XmlPullParser.END_DOCUMENT) {
-				if (parser.eventType == XmlPullParser.START_TAG &&
-					parser.name == "Override" &&
-					parser.getAttributeValue(null, "PartName") == "/xl/workbook.xml"
-				) {
-					return parser.getAttributeValue(null, "ContentType") ?: ""
-				}
-			}
-		} finally {
-			input.close()
-		}
-		throw XlsxReaderException("INVALID_WORKBOOK", "The XLSX workbook declaration is missing")
+		return ooxml.contentType("xl/workbook.xml")
+			?: throw XlsxReaderException(
+				"INVALID_WORKBOOK",
+				"The XLSX workbook declaration is missing",
+			)
 	}
 
 	private fun readRelationships(): Map<String, String> {
-		val result = mutableMapOf<String, String>()
-		val input = openEntry("xl/_rels/workbook.xml.rels")
-		val parser = xmlParser(input)
-		try {
-			while (parser.next() != XmlPullParser.END_DOCUMENT) {
-				if (parser.eventType != XmlPullParser.START_TAG || parser.name != "Relationship") {
-					continue
-				}
-				if (parser.getAttributeValue(null, "TargetMode") == "External") continue
-				val id = parser.getAttributeValue(null, "Id") ?: continue
-				val target = parser.getAttributeValue(null, "Target") ?: continue
-				result[id] = resolveWorkbookTarget(target)
-			}
-		} finally {
-			input.close()
-		}
-		return result
-	}
-
-	private fun resolveWorkbookTarget(target: String): String {
-		val pieces = mutableListOf<String>()
-		val normalizedTarget = target.replace('\\', '/').removePrefix("/")
-		val combined = if (normalizedTarget.startsWith("xl/")) {
-			normalizedTarget
-		} else {
-			"xl/$normalizedTarget"
-		}
-		for (piece in combined.split('/')) {
-			when (piece) {
-				"", "." -> Unit
-				".." -> {
-					if (pieces.isEmpty()) {
-						throw XlsxReaderException("INVALID_WORKBOOK", "A workbook relationship is invalid")
-					}
-					pieces.removeAt(pieces.lastIndex)
-				}
-				else -> pieces.add(piece)
-			}
-		}
-		val path = pieces.joinToString("/")
-		if (!path.startsWith("xl/")) {
-			throw XlsxReaderException("INVALID_WORKBOOK", "A workbook relationship is invalid")
-		}
-		return path
+		return ooxml.relationships("xl/workbook.xml")
+			.filterValues { !it.external }
+			.mapValues { it.value.target }
 	}
 
 	private fun readWorkbook(relationships: Map<String, String>): Pair<List<XlsxSheet>, Boolean> {
@@ -431,54 +556,130 @@ private class XlsxWorkbook private constructor(
 		return result to date1904
 	}
 
-	private fun readSharedStrings(): List<String> {
-		val entry = archive.getEntry("xl/sharedStrings.xml") ?: return emptyList()
+	internal fun readXlsxColor(parser: XmlPullParser): Int? {
+		parser.getAttributeValue(null, "rgb")?.let { rgb ->
+			val hexText = rgb.takeLast(8).let { if (it.length == 6) "FF$it" else it }
+			val hex = hexText.toLongOrNull(16) ?: return@let
+			return hex.toInt()
+		}
+		val themeIndex = parser.getAttributeValue(null, "theme")?.toIntOrNull()
+		val themeName = themeIndex?.let { index ->
+			when (index) {
+				0 -> "lt1"
+				1 -> "dk1"
+				2 -> "lt2"
+				3 -> "dk2"
+				in 4..9 -> "accent${index - 3}"
+				10 -> "hyperlink"
+				11 -> "followedHyperlink"
+				else -> null
+			}
+		}
+		if (themeName != null) {
+			val tint = parser.getAttributeValue(null, "tint")?.toDoubleOrNull()
+			val transforms = tint?.let {
+				listOf("tint" to (it * 100_000).toInt())
+			}.orEmpty()
+			return theme.color(themeName, transforms)
+		}
+		return null
+	}
+
+	private fun readSharedStrings(): XlsxSharedStrings {
+		val entry = archive.getEntry("xl/sharedStrings.xml")
+			?: return XlsxSharedStrings.EMPTY
 		if (entry.size > XLSX_MAX_ENTRY_BYTES) {
 			throw XlsxReaderException("ENTRY_TOO_LARGE", "The shared-string table exceeds the 64 MiB limit")
 		}
-		val strings = ArrayList<String>()
+		val stringBuffer = StringBuilder()
+		val offsets = ArrayList<Int>()
+		val richRunTable = mutableMapOf<Int, List<Map<String, Any?>>>()
 		val input = openEntry(entry.name)
 		val parser = xmlParser(input)
 		try {
 			var inString = false
 			val value = StringBuilder()
+			var currentRun: MutableMap<String, Any?>? = null
+			val currentRuns = mutableListOf<Map<String, Any?>>()
 			while (parser.next() != XmlPullParser.END_DOCUMENT) {
 				if (parser.eventType == XmlPullParser.START_TAG && parser.name == "si") {
 					inString = true
 					value.setLength(0)
+					currentRuns.clear()
+				} else if (parser.eventType == XmlPullParser.START_TAG &&
+					parser.name == "r" && inString
+				) {
+					currentRun = mutableMapOf()
+				} else if (parser.eventType == XmlPullParser.START_TAG &&
+					currentRun != null
+				) {
+					when (parser.name) {
+						"b" -> currentRun["bold"] =
+							parser.getAttributeValue(null, "val") != "0"
+						"i" -> currentRun["italic"] =
+							parser.getAttributeValue(null, "val") != "0"
+						"color" -> readXlsxColor(parser)?.let { currentRun["color"] = it }
+						"t" -> currentRun["text"] = readText(parser, "t")
+					}
 				} else if (parser.eventType == XmlPullParser.START_TAG &&
 					parser.name == "t" &&
 					inString
 				) {
 					value.append(readText(parser, "t"))
 				} else if (parser.eventType == XmlPullParser.END_TAG &&
+					parser.name == "r" && currentRun != null
+				) {
+					val runText = currentRun["text"] as? String ?: ""
+					value.append(runText)
+					currentRuns.add(currentRun.toMap())
+					currentRun = null
+				} else if (parser.eventType == XmlPullParser.END_TAG &&
 					parser.name == "si" &&
 					inString
 				) {
-					if (strings.size >= XLSX_MAX_SHARED_STRINGS) {
+					if (offsets.size >= XLSX_MAX_SHARED_STRINGS) {
 						throw XlsxReaderException(
 							"SHARED_STRING_LIMIT",
 							"The shared-string table exceeds the 1,000,000-item limit",
 						)
 					}
-					strings.add(value.toString())
+					offsets.add(stringBuffer.length)
+					stringBuffer.append(value)
+					if (currentRuns.any { run -> run.keys.any { it != "text" } }) {
+						richRunTable[offsets.size - 1] = currentRuns.toList()
+					}
 					inString = false
 				}
 			}
 		} finally {
 			input.close()
 		}
-		return strings
+		offsets.add(stringBuffer.length)
+		return XlsxSharedStrings(
+			stringBuffer.toString(),
+			offsets.toIntArray(),
+			richRunTable,
+		)
 	}
 
-	private fun readStyles(): Pair<List<Int>, Map<Int, String>> {
-		if (archive.getEntry("xl/styles.xml") == null) return emptyList<Int>() to emptyMap()
+	private fun readStyles(): XlsxStyles {
+		if (archive.getEntry("xl/styles.xml") == null) {
+			return XlsxStyles(emptyList(), emptyMap(), emptyList())
+		}
 		val custom = mutableMapOf<Int, String>()
 		val formats = mutableListOf<Int>()
+		val fonts = mutableListOf<Map<String, Any?>>()
+		val fills = mutableListOf<Int?>()
+		val borders = mutableListOf<Int?>()
+		val rawCellStyles = mutableListOf<MutableMap<String, Any?>>()
 		val input = openEntry("xl/styles.xml")
 		val parser = xmlParser(input)
 		try {
 			var inCellFormats = false
+			var font: MutableMap<String, Any?>? = null
+			var fillColor: Int? = null
+			var borderColor: Int? = null
+			var cellStyle: MutableMap<String, Any?>? = null
 			while (parser.next() != XmlPullParser.END_DOCUMENT) {
 				if (parser.eventType == XmlPullParser.START_TAG) {
 					when (parser.name) {
@@ -488,22 +689,75 @@ private class XlsxWorkbook private constructor(
 							if (id != null && format != null) custom[id] = format
 						}
 						"cellXfs" -> inCellFormats = true
+						"font" -> font = mutableMapOf()
+						"b" -> font?.set("bold", parser.getAttributeValue(null, "val") != "0")
+						"i" -> font?.set("italic", parser.getAttributeValue(null, "val") != "0")
+						"u" -> font?.set("underline", parser.getAttributeValue(null, "val") != "none")
+						"name" -> parser.getAttributeValue(null, "val")?.let {
+							font?.set("fontFamily", OoxmlSystemFonts.fallback(it))
+						}
+						"sz" -> font?.set("fontSize", parser.getAttributeValue(null, "val")
+							?.toDoubleOrNull()?.coerceIn(1.0, 200.0))
+						"color" -> {
+							val color = readXlsxColor(parser)
+							font?.set("fontColor", color)
+							if (fillColor == null) fillColor = color
+							if (borderColor == null) borderColor = color
+						}
+						"fill" -> fillColor = null
+						"patternFill" -> {
+							if (parser.getAttributeValue(null, "patternType") == "none") {
+								fillColor = null
+							}
+						}
+						"fgColor" -> fillColor = readXlsxColor(parser)
+						"border" -> borderColor = null
+						"left", "right", "top", "bottom", "diagonal" -> {
+							if (parser.getAttributeValue(null, "style") != null) {
+								borderColor = null
+							}
+						}
 						"xf" -> if (inCellFormats) {
-							formats.add(
-								parser.getAttributeValue(null, "numFmtId")?.toIntOrNull() ?: 0,
+							cellStyle = mutableMapOf(
+								"fontId" to (parser.getAttributeValue(null, "fontId")?.toIntOrNull() ?: 0),
+								"fillId" to (parser.getAttributeValue(null, "fillId")?.toIntOrNull() ?: 0),
+								"borderId" to (parser.getAttributeValue(null, "borderId")?.toIntOrNull() ?: 0),
+								"numFmtId" to (parser.getAttributeValue(null, "numFmtId")?.toIntOrNull() ?: 0),
 							)
+							formats.add(cellStyle!!["numFmtId"] as Int)
+							rawCellStyles.add(cellStyle!!)
+						}
+						"alignment" -> cellStyle?.apply {
+							put("horizontalAlignment", parser.getAttributeValue(null, "horizontal"))
+							put("verticalAlignment", parser.getAttributeValue(null, "vertical"))
+							put("wrapText", parser.getAttributeValue(null, "wrapText") == "1")
+							put("indent", parser.getAttributeValue(null, "indent")?.toIntOrNull() ?: 0)
 						}
 					}
-				} else if (parser.eventType == XmlPullParser.END_TAG &&
-					parser.name == "cellXfs"
-				) {
-					inCellFormats = false
+				} else if (parser.eventType == XmlPullParser.END_TAG) {
+					when (parser.name) {
+						"font" -> {
+							font?.let(fonts::add)
+							font = null
+						}
+						"fill" -> fills.add(fillColor)
+						"border" -> borders.add(borderColor)
+						"xf" -> cellStyle = null
+						"cellXfs" -> inCellFormats = false
+					}
 				}
 			}
 		} finally {
 			input.close()
 		}
-		return formats to custom
+		val resolved = rawCellStyles.map { style ->
+			val resolvedStyle = LinkedHashMap(style)
+			(fonts.getOrNull(style["fontId"] as Int) ?: emptyMap()).forEach(resolvedStyle::put)
+			resolvedStyle["fillColor"] = fills.getOrNull(style["fillId"] as Int)
+			resolvedStyle["borderColor"] = borders.getOrNull(style["borderId"] as Int)
+			resolvedStyle
+		}
+		return XlsxStyles(formats, custom, resolved)
 	}
 
 	private fun xmlParser(input: InputStream): XmlPullParser {
@@ -545,8 +799,11 @@ private class XlsxWorkbook private constructor(
 	}
 
 	private fun formatDate(value: Double, formatId: Int, format: String?): String {
-		val base = if (date1904) LocalDateTime.of(1904, 1, 1, 0, 0)
-		else LocalDateTime.of(1899, 12, 30, 0, 0)
+		val base = when {
+			date1904 -> LocalDateTime.of(1904, 1, 1, 0, 0)
+			value < 60 -> LocalDateTime.of(1899, 12, 31, 0, 0)
+			else -> LocalDateTime.of(1899, 12, 30, 0, 0)
+		}
 		val wholeDays = kotlin.math.floor(value).toLong().coerceIn(-2_000_000, 2_000_000)
 		val fractionalNanos = ((value - kotlin.math.floor(value)) * 86_400_000_000_000.0)
 			.toLong()
@@ -568,9 +825,9 @@ private class XlsxWorkbook private constructor(
 			else -> datePattern(format.orEmpty())
 		}
 		return try {
-			date.format(DateTimeFormatter.ofPattern(pattern, Locale.US))
+			date.format(DateTimeFormatter.ofPattern(pattern, Locale.getDefault()))
 		} catch (_: IllegalArgumentException) {
-			date.format(DateTimeFormatter.ofPattern("M/d/yy", Locale.US))
+			date.format(DateTimeFormatter.ofPattern("M/d/yy", Locale.getDefault()))
 		}
 	}
 
@@ -619,7 +876,10 @@ private class XlsxWorkbook private constructor(
 		if (format.isNullOrBlank() || format == "General") {
 			return if (value % 1.0 == 0.0) value.toLong().toString() else value.toString()
 		}
-		val section = format.substringBefore(';')
+		val sections = splitFormatSections(format)
+		val useNegativeSection = value < 0 && sections.size > 1
+		val section = (if (value == 0.0 && sections.size > 2) sections[2]
+			else if (useNegativeSection) sections[1] else sections[0])
 			.replace(Regex("\\[(?!\\$)[^]]*]"), "")
 			.replace(Regex("_.|\\*."), "")
 		val first = section.indexOfFirst { it in "0#?" }
@@ -631,13 +891,40 @@ private class XlsxWorkbook private constructor(
 		val prefix = formatLiteral(section.substring(0, first))
 		val suffix = formatLiteral(section.substring(last + 1))
 		return try {
-			val symbols = DecimalFormatSymbols(Locale.US)
+			val symbols = DecimalFormatSymbols.getInstance(Locale.getDefault())
 			val formatter = DecimalFormat(numericPattern, symbols)
 			formatter.isParseBigDecimal = false
-			prefix + formatter.format(value) + suffix
+			val formattedValue = if (useNegativeSection) kotlin.math.abs(value) else value
+			prefix + formatter.format(formattedValue) + suffix
 		} catch (_: IllegalArgumentException) {
 			value.toString()
 		}
+	}
+
+	private fun splitFormatSections(format: String): List<String> {
+		val sections = mutableListOf<String>()
+		val current = StringBuilder()
+		var quoted = false
+		var escaped = false
+		for (character in format) {
+			if (escaped) {
+				current.append(character)
+				escaped = false
+			} else if (character == '\\') {
+				current.append(character)
+				escaped = true
+			} else if (character == '"') {
+				current.append(character)
+				quoted = !quoted
+			} else if (character == ';' && !quoted) {
+				sections.add(current.toString())
+				current.setLength(0)
+			} else {
+				current.append(character)
+			}
+		}
+		sections.add(current.toString())
+		return sections
 	}
 
 	private fun formatLiteral(value: String): String {
@@ -694,9 +981,10 @@ private class XlsxSheetReader(
 	private val workbook: XlsxWorkbook,
 	private val sheet: XlsxSheet,
 	archive: ZipFile,
-	private val sharedStrings: List<String>,
+	private val sharedStrings: XlsxSharedStrings,
 	private val numberFormats: List<Int>,
 	private val customFormats: Map<Int, String>,
+	private val cellStyles: List<Map<String, Any?>>,
 	private val date1904: Boolean,
 ) {
 	private val sheetInput = run {
@@ -724,6 +1012,9 @@ private class XlsxSheetReader(
 	private var visibleColumns = emptyList<Int>()
 	private var columnCount = 1
 	private var defaultRowHeight = sheet.defaultRowHeight
+	private var freezeRowCount = 0
+	private var freezeColumnCount = 0
+	private var sheetTabColor: Int? = null
 	private var nextImplicitRow = 1
 	private var ended = false
 	private var truncated = false
@@ -759,7 +1050,7 @@ private class XlsxSheetReader(
 					"conditionalFormatting" -> omittedFeatures.add("conditional formatting")
 					"dataValidations" -> omittedFeatures.add("data validation")
 					"drawing" -> {
-						omittedFeatures.add("charts, images and shapes")
+						omittedFeatures.add("images and shapes")
 					}
 					"legacyDrawing" -> omittedFeatures.add("comments")
 					"pivotTableDefinition" -> omittedFeatures.add("pivot tables")
@@ -810,13 +1101,29 @@ private class XlsxSheetReader(
 						?.coerceIn(8.0, 100.0)
 						?: defaultRowHeight
 				}
+				"tabColor" -> sheetTabColor = workbook.readXlsxColor(parser)
+				"pane" -> {
+					val state = parser.getAttributeValue(null, "state")
+					if (state == "frozen" || state == "frozenSplit") {
+						freezeColumnCount = parser.getAttributeValue(null, "xSplit")
+							?.toDoubleOrNull()
+							?.toInt()
+							?.coerceIn(0, XLSX_MAX_COLUMNS)
+							?: 0
+						freezeRowCount = parser.getAttributeValue(null, "ySplit")
+							?.toDoubleOrNull()
+							?.toInt()
+							?.coerceIn(0, XLSX_MAX_ROWS)
+							?: 0
+					}
+				}
 				"sheetData" -> {
 					updateVisibleColumns()
 					return
 				}
 				"conditionalFormatting" -> omittedFeatures.add("conditional formatting")
 				"dataValidations" -> omittedFeatures.add("data validation")
-				"drawing" -> omittedFeatures.add("charts, images and shapes")
+				"drawing" -> omittedFeatures.add("images and shapes")
 				"legacyDrawing" -> omittedFeatures.add("comments")
 				"pivotTableDefinition" -> omittedFeatures.add("pivot tables")
 			}
@@ -830,7 +1137,7 @@ private class XlsxSheetReader(
 		val hidden = parser.getAttributeValue(null, "hidden") == "1" ||
 			parser.getAttributeValue(null, "hidden") == "true"
 		val height = parser.getAttributeValue(null, "ht")?.toDoubleOrNull()?.coerceIn(8.0, 400.0)
-		val cells = java.util.TreeMap<Int, String>()
+		val cells = java.util.TreeMap<Int, ParsedCell>()
 		var cellCount = 0
 		var rowTruncated = false
 		while (parser.next() != XmlPullParser.END_DOCUMENT) {
@@ -839,14 +1146,14 @@ private class XlsxSheetReader(
 			val cell = parseCell()
 			if (cell != null) {
 				cellCount++
-				if (cell.first in 0 until XLSX_MAX_COLUMNS &&
-					cell.first !in hiddenColumns &&
-					cell.second.isNotEmpty()
+				if (cell.column in 0 until XLSX_MAX_COLUMNS &&
+					cell.column !in hiddenColumns &&
+					(cell.value.isNotEmpty() || cell.hasVisibleStyle())
 				) {
-					cells[cell.first] = cell.second
-					rowTruncated = rowTruncated || cell.third
-					columnCount = maxOf(columnCount, cell.first + 1)
-				} else if (cell.first >= XLSX_MAX_COLUMNS) {
+					cells[cell.column] = cell
+					rowTruncated = rowTruncated || cell.truncated
+					columnCount = maxOf(columnCount, cell.column + 1)
+				} else if (cell.column >= XLSX_MAX_COLUMNS) {
 					rowTruncated = true
 				}
 			}
@@ -856,13 +1163,29 @@ private class XlsxSheetReader(
 		val values = arrayOfNulls<String>(cells.size)
 		cells.entries.forEachIndexed { index, entry ->
 			columns[index] = entry.key
-			values[index] = entry.value
+			values[index] = entry.value.value
 		}
 		if (cellCount > XLSX_MAX_COLUMNS) rowTruncated = true
-		return CompactXlsxRow(rowNumber, columns, Array(cells.size) { values[it] ?: "" }, height, rowTruncated)
+		return CompactXlsxRow(
+			rowNumber,
+			columns,
+			Array(cells.size) { values[it] ?: "" },
+			cells.values.map { it.style }.toTypedArray(),
+			cells.values.map { it.richText }.toTypedArray(),
+			height,
+			rowTruncated,
+		)
 	}
 
-	private fun parseCell(): Triple<Int, String, Boolean>? {
+	private data class ParsedCell(
+		val column: Int,
+		val value: String,
+		val truncated: Boolean,
+		val style: Map<String, Any?>,
+		val richText: List<Map<String, Any?>>?,
+	)
+
+	private fun parseCell(): ParsedCell? {
 		val reference = parser.getAttributeValue(null, "r")
 		val column = reference?.let(::columnIndexFromReference) ?: 0
 		val type = parser.getAttributeValue(null, "t")
@@ -877,15 +1200,50 @@ private class XlsxSheetReader(
 				"t" -> inlineText = (inlineText ?: "") + readElementText("t")
 			}
 		}
+		val sharedStringIndex = if (type == "s") rawValue?.toIntOrNull() else null
 		val value = when (type) {
-			"s" -> rawValue?.toIntOrNull()?.let(sharedStrings::getOrNull) ?: ""
+			"s" -> sharedStringIndex?.let(sharedStrings::getOrNull) ?: ""
 			"inlineStr" -> inlineText.orEmpty()
 			else -> rawValue?.let { formatValue(it, type, style) }.orEmpty()
 		}
-		if (value.isEmpty()) return null
+		val visualStyle = cellStyles.getOrNull(style) ?: emptyMap()
+		val hasVisualStyle = visualStyle.any { (key, styledValue) ->
+			styledValue != null &&
+				(key in setOf(
+					"fillColor",
+					"borderColor",
+					"fontColor",
+					"fontSize",
+					"horizontalAlignment",
+					"verticalAlignment",
+				) || (key in setOf("bold", "italic", "underline", "wrapText") &&
+					styledValue == true))
+		}
+		if (value.isEmpty() && !hasVisualStyle) {
+			return null
+		}
 		val (bounded, wasTruncated) = workbook.keepCellText(value)
-		return Triple(column, bounded, wasTruncated)
+		return ParsedCell(
+			column,
+			bounded,
+			wasTruncated,
+			visualStyle,
+			sharedStringIndex?.let(sharedStrings::richRunsOrNull),
+		)
 	}
+
+	private fun ParsedCell.hasVisibleStyle(): Boolean =
+		style.any { (key, value) ->
+			value != null &&
+				(key in setOf(
+					"fillColor",
+					"borderColor",
+					"fontColor",
+					"fontSize",
+					"horizontalAlignment",
+					"verticalAlignment",
+				) || (key in setOf("bold", "italic", "underline", "wrapText") && value == true))
+		}
 
 	private fun updateVisibleColumns() {
 		visibleColumns = (0 until columnCount.coerceAtMost(XLSX_MAX_COLUMNS))
@@ -911,6 +1269,8 @@ private class XlsxSheetReader(
 		if (type == "b") return if (value == "1") "TRUE" else "FALSE"
 		val formatId = numberFormats.getOrNull(style) ?: 0
 		val format = customFormats[formatId] ?: when (formatId) {
+			1 -> "0"
+			2 -> "0.00"
 			3 -> "#,##0"
 			4 -> "#,##0.00"
 			5 -> "$#,##0"
@@ -919,6 +1279,14 @@ private class XlsxSheetReader(
 			8 -> "$#,##0.00;($#,##0.00)"
 			9 -> "0%"
 			10 -> "0.00%"
+			11 -> "0.00E+00"
+			12 -> "# ?/?"
+			13 -> "# ??/??"
+			37 -> "#,##0;(#,##0)"
+			38 -> "#,##0;[Red](#,##0)"
+			39 -> "#,##0.00;(#,##0.00)"
+			40 -> "#,##0.00;[Red](#,##0.00)"
+			49 -> "@"
 			else -> null
 		}
 		if (format == "@") return value
@@ -941,6 +1309,10 @@ private class XlsxSheetReader(
 			"columnWidths" to widths.mapKeys { it.key.toString() },
 			"omittedFeatures" to omittedFeatures.toList(),
 			"defaultRowHeight" to defaultRowHeight,
+			"freezeRowCount" to freezeRowCount,
+			"freezeColumnCount" to freezeColumnCount,
+			"tabColor" to sheetTabColor,
+			"notShown" to (omittedFeatures.toList() + workbook.notShownFailures()).distinct(),
 		)
 	}
 
@@ -1008,8 +1380,11 @@ private fun isDateFormat(formatId: Int, format: String?): Boolean {
 }
 
 private fun formatDate(value: Double, formatId: Int, format: String?, date1904: Boolean): String {
-	val base = if (date1904) LocalDateTime.of(1904, 1, 1, 0, 0)
-	else LocalDateTime.of(1899, 12, 30, 0, 0)
+	val base = when {
+		date1904 -> LocalDateTime.of(1904, 1, 1, 0, 0)
+		value < 60 -> LocalDateTime.of(1899, 12, 31, 0, 0)
+		else -> LocalDateTime.of(1899, 12, 30, 0, 0)
+	}
 	val wholeDays = kotlin.math.floor(value).toLong().coerceIn(-2_000_000, 2_000_000)
 	val nanos = ((value - kotlin.math.floor(value)) * 86_400_000_000_000.0)
 		.toLong()
@@ -1031,9 +1406,9 @@ private fun formatDate(value: Double, formatId: Int, format: String?, date1904: 
 		else -> xlsxDatePattern(format.orEmpty())
 	}
 	return try {
-		date.format(DateTimeFormatter.ofPattern(pattern, Locale.US))
+		date.format(DateTimeFormatter.ofPattern(pattern, Locale.getDefault()))
 	} catch (_: IllegalArgumentException) {
-		date.format(DateTimeFormatter.ofPattern("M/d/yy", Locale.US))
+		date.format(DateTimeFormatter.ofPattern("M/d/yy", Locale.getDefault()))
 	}
 }
 
@@ -1082,9 +1457,15 @@ private fun formatNumber(value: Double, format: String?): String {
 	if (format.isNullOrBlank() || format == "General") {
 		return if (value % 1.0 == 0.0) value.toLong().toString() else value.toString()
 	}
-	val section = format.substringBefore(';')
+	val sections = splitNumberFormatSections(format)
+	val negativeSection = value < 0 && sections.size > 1
+	val section = (if (value == 0.0 && sections.size > 2) sections[2]
+		else if (negativeSection) sections[1] else sections[0])
 		.replace(Regex("\\[(?!\\$)[^]]*]"), "")
 		.replace(Regex("_.|\\*."), "")
+	if (section.contains('/')) {
+		return formatFraction(value, section, negativeSection)
+	}
 	val first = section.indexOfFirst { it in "0#?" }
 	if (first < 0) return value.toString()
 	val last = section.indexOfLast { it in "0#?.,%" }
@@ -1093,10 +1474,79 @@ private fun formatNumber(value: Double, format: String?): String {
 	val prefix = xlsxLiteral(section.substring(0, first))
 	val suffix = xlsxLiteral(section.substring(last + 1))
 	return try {
-		prefix + DecimalFormat(pattern, DecimalFormatSymbols(Locale.US)).format(value) + suffix
+		val formattedValue = if (negativeSection) kotlin.math.abs(value) else value
+		prefix + DecimalFormat(pattern, DecimalFormatSymbols.getInstance(Locale.getDefault()))
+			.format(formattedValue) + suffix
 	} catch (_: IllegalArgumentException) {
 		value.toString()
 	}
+}
+
+private fun splitNumberFormatSections(format: String): List<String> {
+	val sections = mutableListOf<String>()
+	val current = StringBuilder()
+	var quoted = false
+	var escaped = false
+	for (character in format) {
+		if (escaped) {
+			current.append(character)
+			escaped = false
+		} else if (character == '\\') {
+			current.append(character)
+			escaped = true
+		} else if (character == '"') {
+			current.append(character)
+			quoted = !quoted
+		} else if (character == ';' && !quoted) {
+			sections.add(current.toString())
+			current.setLength(0)
+		} else {
+			current.append(character)
+		}
+	}
+	sections.add(current.toString())
+	return sections
+}
+
+private fun formatFraction(value: Double, section: String, negativeSection: Boolean): String {
+	val slash = section.indexOf('/')
+	val denominatorPattern = section.substring(slash + 1).takeWhile { it in "0#?" }
+	val maxDenominator = when (denominatorPattern.length.coerceIn(1, 3)) {
+		1 -> 9
+		2 -> 99
+		else -> 999
+	}
+	val absolute = kotlin.math.abs(value)
+	var whole = kotlin.math.floor(absolute).toLong()
+	val fractional = absolute - whole
+	var bestNumerator = 0
+	var bestDenominator = 1
+	var bestError = Double.MAX_VALUE
+	for (denominator in 1..maxDenominator) {
+		val numerator = (fractional * denominator).roundToInt()
+		val error = kotlin.math.abs(fractional - numerator.toDouble() / denominator)
+		if (error < bestError) {
+			bestNumerator = numerator
+			bestDenominator = denominator
+			bestError = error
+		}
+	}
+	if (bestNumerator >= bestDenominator) {
+		whole++
+		bestNumerator = 0
+		bestDenominator = 1
+	}
+	val wholePatternStart = section.substring(0, slash).indexOfFirst { it in "0#?" }
+	val prefix = if (wholePatternStart < 0) xlsxLiteral(section.substring(0, slash))
+	else xlsxLiteral(section.substring(0, wholePatternStart))
+	val wholeText = if (wholePatternStart >= 0 && whole > 0) "$whole" else ""
+	val separator = if (wholeText.isNotEmpty() &&
+		section.substring(wholePatternStart, slash).contains(' ')
+	) " " else ""
+	val suffix = xlsxLiteral(section.substring(slash + 1 + denominatorPattern.length))
+	val fraction = if (bestNumerator == 0) "" else "$bestNumerator/$bestDenominator"
+	val formatted = prefix + wholeText + separator + fraction + suffix
+	return if (negativeSection) formatted else if (value < 0) "-$formatted" else formatted
 }
 
 private fun xlsxLiteral(value: String): String {
@@ -1128,7 +1578,11 @@ private fun xlsxLiteral(value: String): String {
 								"EUR", "€" -> "€"
 								"GBP", "£" -> "£"
 								"JPY", "CNY", "¥" -> "¥"
-								else -> "$"
+								else -> when {
+									currency.isEmpty() -> ""
+									currency.any { !it.isLetterOrDigit() } -> currency
+									else -> "$"
+								}
 							},
 						)
 					}

@@ -8,12 +8,17 @@ class DocxTextRun {
     this.underline = false,
     this.strikethrough = false,
     this.fontSize,
+    this.fontFamily,
     this.color,
     this.highlight,
     this.hyperlink,
     this.imagePath,
     this.imageWidth,
     this.imageHeight,
+    this.imageCropLeft = 0,
+    this.imageCropTop = 0,
+    this.imageCropRight = 0,
+    this.imageCropBottom = 0,
   });
 
   final String text;
@@ -22,12 +27,17 @@ class DocxTextRun {
   final bool underline;
   final bool strikethrough;
   final double? fontSize;
+  final String? fontFamily;
   final int? color;
   final int? highlight;
   final String? hyperlink;
   final String? imagePath;
   final double? imageWidth;
   final double? imageHeight;
+  final double imageCropLeft;
+  final double imageCropTop;
+  final double imageCropRight;
+  final double imageCropBottom;
 }
 
 class DocxBlock {
@@ -44,6 +54,7 @@ class DocxBlock {
     this.styleUnderline = false,
     this.styleStrikethrough = false,
     this.styleFontSize,
+    this.styleFontFamily,
     this.styleColor,
     this.styleHighlight,
     this.headingLevel,
@@ -52,8 +63,13 @@ class DocxBlock {
     this.listMarker,
     this.listLevel = 0,
     this.imagePath,
+    this.chartData,
     this.imageWidth,
     this.imageHeight,
+    this.imageCropLeft = 0,
+    this.imageCropTop = 0,
+    this.imageCropRight = 0,
+    this.imageCropBottom = 0,
     this.pageBreakBefore = false,
     this.placeholder,
     this.floatingLeft,
@@ -72,8 +88,20 @@ class DocxBlock {
     this.paragraphIndentLeft,
     this.paragraphIndentRight,
     this.paragraphHangingIndent,
+    this.paragraphFirstLineIndent,
+    this.paragraphBackground,
     this.paragraphBottomBorderColor,
     this.paragraphBottomBorderWidth,
+    this.tableCellBackgrounds = const [],
+    this.tableCellVerticalMerges = const [],
+    this.tableCellBorders = const [],
+    this.tableRowBackground,
+    this.sectionPageWidth,
+    this.sectionPageHeight,
+    this.sectionMarginLeft,
+    this.sectionMarginRight,
+    this.sectionMarginTop,
+    this.sectionMarginBottom,
   });
 
   final String type;
@@ -88,6 +116,7 @@ class DocxBlock {
   final bool styleUnderline;
   final bool styleStrikethrough;
   final double? styleFontSize;
+  final String? styleFontFamily;
   final int? styleColor;
   final int? styleHighlight;
   final int? headingLevel;
@@ -96,8 +125,13 @@ class DocxBlock {
   final String? listMarker;
   final int listLevel;
   final String? imagePath;
+  final Map<Object?, Object?>? chartData;
   final double? imageWidth;
   final double? imageHeight;
+  final double imageCropLeft;
+  final double imageCropTop;
+  final double imageCropRight;
+  final double imageCropBottom;
   final bool pageBreakBefore;
   final String? placeholder;
   final double? floatingLeft;
@@ -116,8 +150,20 @@ class DocxBlock {
   final double? paragraphIndentLeft;
   final double? paragraphIndentRight;
   final double? paragraphHangingIndent;
+  final double? paragraphFirstLineIndent;
+  final int? paragraphBackground;
   final int? paragraphBottomBorderColor;
   final double? paragraphBottomBorderWidth;
+  final List<int?> tableCellBackgrounds;
+  final List<String?> tableCellVerticalMerges;
+  final List<int?> tableCellBorders;
+  final int? tableRowBackground;
+  final double? sectionPageWidth;
+  final double? sectionPageHeight;
+  final double? sectionMarginLeft;
+  final double? sectionMarginRight;
+  final double? sectionMarginTop;
+  final double? sectionMarginBottom;
 }
 
 class DocxReadProgress {
@@ -127,6 +173,13 @@ class DocxReadProgress {
     required this.blockCount,
     required this.isComplete,
     required this.isTruncated,
+    this.notShownFeatures = const [],
+    this.sectionPageWidth,
+    this.sectionPageHeight,
+    this.sectionMarginLeft,
+    this.sectionMarginRight,
+    this.sectionMarginTop,
+    this.sectionMarginBottom,
   });
 
   final List<DocxBlock> blocks;
@@ -134,6 +187,13 @@ class DocxReadProgress {
   final int blockCount;
   final bool isComplete;
   final bool isTruncated;
+  final List<String> notShownFeatures;
+  final double? sectionPageWidth;
+  final double? sectionPageHeight;
+  final double? sectionMarginLeft;
+  final double? sectionMarginRight;
+  final double? sectionMarginTop;
+  final double? sectionMarginBottom;
 }
 
 abstract interface class DocxFileRepository {

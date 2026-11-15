@@ -1392,7 +1392,6 @@ class MainActivity : FlutterActivity() {
 		pptxPlatformChannel = PptxPlatformChannel(
 			flutterEngine.dartExecutor.binaryMessenger,
 		)
-		registerPdfRendererChannel(flutterEngine)
 
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, imageEditorChannelName)
 			.setMethodCallHandler { call, result ->

@@ -19,7 +19,6 @@ import '../../core/providers/open_with_providers.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/providers/quick_access_provider.dart';
 import '../../core/providers/storage_providers.dart';
-import '../../core/providers/video_providers.dart';
 import '../../core/tabs/tabs_manager.dart';
 import '../../core/utils/format_bytes.dart';
 import '../../core/utils/font_scaled_spacing.dart';
@@ -47,7 +46,13 @@ import 'home_storage_scan.dart';
 import '../storage/storage_tab.dart';
 
 const _homeRefreshStaleDelay = Duration(seconds: 5);
-const _minimumBackgroundRefreshInterval = Duration(seconds: 10);
+const _homeRecentRefreshInterval = Duration(minutes: 2);
+const _slowHomeRecentRefreshInterval = Duration(minutes: 3);
+const _verySlowHomeRecentRefreshInterval = Duration(minutes: 5);
+const _backgroundRecentRefreshInterval = Duration(minutes: 5);
+const _slowHomeRecentRefreshThreshold = Duration(minutes: 2);
+const _verySlowHomeRecentRefreshThreshold = Duration(minutes: 5);
+const _verySlowBackgroundRecentRefreshInterval = Duration(minutes: 8);
 const _homeCategoryCardsHeight = 159.5;
 const _homeAvailableStorageHeight = 215.0;
 const _homeSectionMinimumHeightFactor = 0.2;
@@ -77,9 +82,7 @@ class _RecentFile {
   final bool isInsideAndroidFolder;
 }
 
-Future<void> _prefetchStorageDriveRoots(
-  List<StorageDevice> devices,
-) async {
+Future<void> _prefetchStorageDriveRoots(List<StorageDevice> devices) async {
   for (final device in devices) {
     try {
       final cached = await FilesystemCache.instance.loadFolder(
@@ -182,6 +185,30 @@ bool _sameRecentFiles(List<_RecentFile> current, List<_RecentFile> next) {
   return true;
 }
 
+Set<String> _changedRecentFolders(
+  List<_RecentFile> previous,
+  List<_RecentFile> next,
+) {
+  final oldByPath = {for (final file in previous) file.path: file};
+  final newByPath = {for (final file in next) file.path: file};
+  final changedFolders = <String>{};
+  for (final entry in newByPath.entries) {
+    final oldFile = oldByPath[entry.key];
+    if (oldFile == null ||
+        oldFile.name != entry.value.name ||
+        oldFile.modified != entry.value.modified ||
+        oldFile.video?.size != entry.value.video?.size) {
+      changedFolders.add(File(entry.key).parent.path);
+    }
+  }
+  for (final entry in oldByPath.entries) {
+    if (!newByPath.containsKey(entry.key)) {
+      changedFolders.add(File(entry.key).parent.path);
+    }
+  }
+  return changedFolders;
+}
+
 Future<Directory?> _findDownloadsDirectory(String rootPath) async {
   try {
     final matches = await Directory(rootPath)
@@ -240,6 +267,8 @@ class _HomePageState extends ConsumerState<HomePage>
   bool _scanInProgress = false;
   bool _scanRequestedAgain = false;
   bool _forceRescanRequested = false;
+  bool _forceRecentRescanRequested = false;
+  bool _silentRescanRequested = false;
   bool _isHomeVisible = true;
   bool _cacheExpiryScheduled = false;
   bool _refreshExceededDelay = false;
@@ -250,6 +279,8 @@ class _HomePageState extends ConsumerState<HomePage>
   String? _appsSizeError;
   DateTime? _backgroundSince;
   bool _resumeRefreshInProgress = false;
+  Timer? _recentRefreshTimer;
+  Duration _lastHomeRecentRefreshDuration = Duration.zero;
 
   @override
   bool get wantKeepAlive => true;
@@ -265,7 +296,8 @@ class _HomePageState extends ConsumerState<HomePage>
       unawaited(ref.read(availableStorageDevicesProvider.notifier).refresh());
       unawaited(_refreshPrefetchPowerConstraints());
       unawaited(_expireUnusedFilesystemCaches());
-      _scanHomeStorage();
+      _scanHomeStorage(forceRefreshRecent: true);
+      _scheduleRecentRefresh();
     });
   }
 
@@ -322,6 +354,7 @@ class _HomePageState extends ConsumerState<HomePage>
     WidgetsBinding.instance.removeObserver(this);
     _tabs.removeListener(_onTabsChanged);
     _refreshDisplayTimer?.cancel();
+    _recentRefreshTimer?.cancel();
     RefreshCoordinator.instance.cancelOwner(_refreshOwner);
     super.dispose();
   }
@@ -330,6 +363,8 @@ class _HomePageState extends ConsumerState<HomePage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
+      _recentRefreshTimer?.cancel();
+      _recentRefreshTimer = null;
       _backgroundSince ??= DateTime.now();
       return;
     }
@@ -341,48 +376,60 @@ class _HomePageState extends ConsumerState<HomePage>
     }
     final backgroundSince = _backgroundSince;
     _backgroundSince = null;
-    if (backgroundSince != null &&
-        DateTime.now().difference(backgroundSince) >=
-            _minimumBackgroundRefreshInterval) {
+    if (backgroundSince != null) {
       unawaited(_refreshAfterResume());
     }
+    _scheduleRecentRefresh();
   }
 
   Future<void> _refreshAfterResume() async {
     if (_resumeRefreshInProgress || !mounted) return;
     _resumeRefreshInProgress = true;
     try {
-      final settings = ref.read(appSettingsProvider);
-      final devices = await getStorageRepository().listStorageDevices();
-      final recentDevices = devices
-          .where(
-            (device) =>
-                device.id == 'internal' ||
-                settings.includeOtherStorageDrivesInRecent,
-          )
-          .toList(growable: false);
-      final homeScanIsCurrent = await _refreshRecentDirectoryChanges(
-        recentDevices,
-        settings,
-      );
-      final selectedTab = _tabs.tabs[_tabs.selectedIndex];
-      if (selectedTab.isVideoPage) {
-        await _refreshVideoTab(selectedTab.sessionId);
-      } else if (selectedTab.storagePath != null) {
-        await StorageTabState.refreshMountedDirectories({
-          selectedTab.storagePath!,
-        });
-      }
-      if (!homeScanIsCurrent) {
-        await _scanHomeStorage(forceRefresh: true);
-        await StorageTabState.refreshMountedDirectories(
-          _tabs.tabs.map((tab) => tab.storagePath).whereType<String>(),
+      final selectedIndex = _tabs.selectedIndex;
+      final tabs = _tabs.tabs;
+      final selectedTab = selectedIndex >= 0 && selectedIndex < tabs.length
+          ? tabs[selectedIndex]
+          : null;
+      if (selectedTab != null &&
+          !selectedTab.isVideoPage &&
+          selectedTab.storagePath != null) {
+        unawaited(
+          StorageTabState.refreshMountedTabSession(selectedTab.sessionId),
         );
       }
+
+      unawaited(_storageKey.currentState?.refreshSilently());
+      final settings = ref.read(appSettingsProvider);
+      var homeScanIsCurrent = false;
+      try {
+        final devices = await getStorageRepository().listStorageDevices();
+        final recentDevices = devices
+            .where(
+              (device) =>
+                  device.id == 'internal' ||
+                  settings.includeOtherStorageDrivesInRecent,
+            )
+            .toList(growable: false);
+        homeScanIsCurrent = await _refreshRecentDirectoryChanges(
+          recentDevices,
+          settings,
+        );
+      } catch (error) {
+        debugPrint(
+          '[HomePage] Could not check Recent stamps on resume: $error',
+        );
+      }
+      await _scanHomeStorage(
+        forceRefresh: !homeScanIsCurrent,
+        forceRefreshRecent: homeScanIsCurrent,
+        silent: true,
+      );
     } catch (error) {
       debugPrint('[HomePage] Resume refresh failed: $error');
     } finally {
       _resumeRefreshInProgress = false;
+      _scheduleRecentRefresh();
     }
   }
 
@@ -398,26 +445,24 @@ class _HomePageState extends ConsumerState<HomePage>
       if (raw == null) return false;
       final previous = _decodeDriveScan(raw);
       if (previous == null || !previous.directoryStampsComplete) return false;
-      final validation = await RefreshCoordinator.instance.run<
-        Map<String, Object?>
-      >(
-        scope: 'home-stamps:${device.id}',
-        owner: _refreshOwner,
-        priority: _isHomeVisible
-            ? RefreshPriority.visiblePage
-            : RefreshPriority.openPages,
-        work: (token) async {
-          token.throwIfCancelled();
-          final result = await compute<
-            Map<String, Object?>,
-            Map<String, Object?>
-          >(validateHomeDirectoryStamps, {
-            'stamps': previous.directoryModifiedMilliseconds,
-          });
-          token.throwIfCancelled();
-          return RefreshWorkResult(result);
-        },
-      );
+      final validation = await RefreshCoordinator.instance
+          .run<Map<String, Object?>>(
+            scope: 'home-stamps:${device.id}',
+            owner: _refreshOwner,
+            priority: _isHomeVisible
+                ? RefreshPriority.visiblePage
+                : RefreshPriority.openPages,
+            work: (token) async {
+              token.throwIfCancelled();
+              final result =
+                  await compute<Map<String, Object?>, Map<String, Object?>>(
+                    validateHomeDirectoryStamps,
+                    {'stamps': previous.directoryModifiedMilliseconds},
+                  );
+              token.throwIfCancelled();
+              return RefreshWorkResult(result);
+            },
+          );
       if ((validation['changed'] as List).isNotEmpty ||
           (validation['missing'] as List).isNotEmpty) {
         return false;
@@ -425,46 +470,18 @@ class _HomePageState extends ConsumerState<HomePage>
       _driveScans[device.id] = previous;
     }
 
-    if (mounted) {
-      setState(() {
-        _recentFiles = _mergeRecentFiles(
-          devices.map((device) => _driveScans[device.id]),
-          showHiddenFiles: settings.showHiddenFilesInRecent,
-          showNomediaFiles: settings.showNomediaFilesInRecent,
-          includeAndroidFolderFiles: settings.showAndroidFolderFilesInRecent,
-          blacklistedPaths: settings.blacklistedPaths,
-          whitelistedPaths: settings.whitelistedPaths,
-        );
-      });
+    final recentFiles = _mergeRecentFiles(
+      devices.map((device) => _driveScans[device.id]),
+      showHiddenFiles: settings.showHiddenFilesInRecent,
+      showNomediaFiles: settings.showNomediaFilesInRecent,
+      includeAndroidFolderFiles: settings.showAndroidFolderFilesInRecent,
+      blacklistedPaths: settings.blacklistedPaths,
+      whitelistedPaths: settings.whitelistedPaths,
+    );
+    if (mounted && !_sameRecentFiles(_recentFiles, recentFiles)) {
+      setState(() => _recentFiles = recentFiles);
     }
     return true;
-  }
-
-  Future<void> _refreshVideoTab(String sessionId) async {
-    await ref.read(videoPageSettingsProvider.notifier).ready;
-    final controller = ref.read(videoTabProvider(sessionId).notifier);
-    final settings = ref.read(videoPageSettingsProvider);
-    final permissionGranted =
-        (await Permission.storage.status).isGranted ||
-        (await Permission.manageExternalStorage.status).isGranted;
-    try {
-      await RefreshCoordinator.instance.run<bool>(
-        scope: 'video:$sessionId:resume',
-        owner: _refreshOwner,
-        priority: RefreshPriority.visiblePage,
-        work: (token) async {
-          token.throwIfCancelled();
-          final adjusted = await controller.refresh(
-            permissionGranted: permissionGranted,
-            settings: settings,
-            showLoading: false,
-          );
-          return RefreshWorkResult(adjusted);
-        },
-      );
-    } on RefreshCancelled {
-      // Resume work can be retried at the next foreground transition.
-    }
   }
 
   Future<void> _refreshPrefetchPowerConstraints() async {
@@ -502,20 +519,12 @@ class _HomePageState extends ConsumerState<HomePage>
         return;
       }
       final total = await _calculateAppsTotalBytes();
-      if (!mounted) return;
+      if (!mounted || total == null) return;
       setState(() {
-        _categorySizes = {
-          ..._categorySizes,
-          'Apps': total == null ? null : formatBytes(total),
-        };
+        _categorySizes = {..._categorySizes, 'Apps': formatBytes(total)};
       });
     } catch (error) {
-      _appsSizeError = 'Could not refresh app sizes: $error';
-      if (mounted) {
-        setState(() {
-          _categorySizes = {..._categorySizes, 'Apps': 'Unavailable'};
-        });
-      }
+      debugPrint('[HomePage] Could not refresh app sizes on resume: $error');
     }
   }
 
@@ -529,7 +538,9 @@ class _HomePageState extends ConsumerState<HomePage>
         _lastStoragePermissionAvailable ?? _storagePermissionAvailable;
     _lastStoragePermissionAvailable = hasAccess;
     if (hasAccess && !previouslyHadAccess && mounted) {
-      _refresh();
+      unawaited(ref.read(availableStorageDevicesProvider.notifier).refresh());
+      unawaited(_storageKey.currentState?.refreshSilently());
+      unawaited(_scanHomeStorage(forceRefresh: true, silent: true));
     }
   }
 
@@ -538,8 +549,53 @@ class _HomePageState extends ConsumerState<HomePage>
       unawaited(_expireUnusedFilesystemCaches());
     }
     final isHomeVisible = _tabs.selectedIndex == 0;
-    if (_isHomeVisible == isHomeVisible || !mounted) return;
-    setState(() => _isHomeVisible = isHomeVisible);
+    if (_isHomeVisible != isHomeVisible && mounted) {
+      setState(() => _isHomeVisible = isHomeVisible);
+    }
+    _scheduleRecentRefresh();
+  }
+
+  void _scheduleRecentRefresh() {
+    _recentRefreshTimer?.cancel();
+    _recentRefreshTimer = null;
+    if (!mounted ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    final interval = _isHomeVisible
+        ? _homeRecentRefreshIntervalForDuration(_lastHomeRecentRefreshDuration)
+        : _lastHomeRecentRefreshDuration >= _verySlowHomeRecentRefreshThreshold
+        ? _verySlowBackgroundRecentRefreshInterval
+        : _backgroundRecentRefreshInterval;
+    _recentRefreshTimer = Timer(interval, () {
+      unawaited(_runPeriodicRecentRefresh());
+    });
+  }
+
+  Future<void> _runPeriodicRecentRefresh() async {
+    if (!mounted ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    if (_scanInProgress) {
+      _scheduleRecentRefresh();
+      return;
+    }
+    try {
+      await _scanHomeStorage(forceRefreshRecent: true);
+    } finally {
+      _scheduleRecentRefresh();
+    }
+  }
+
+  Duration _homeRecentRefreshIntervalForDuration(Duration duration) {
+    if (duration >= _verySlowHomeRecentRefreshThreshold) {
+      return _verySlowHomeRecentRefreshInterval;
+    }
+    if (duration >= _slowHomeRecentRefreshThreshold) {
+      return _slowHomeRecentRefreshInterval;
+    }
+    return _homeRecentRefreshInterval;
   }
 
   void _refresh() {
@@ -550,18 +606,28 @@ class _HomePageState extends ConsumerState<HomePage>
 
   Future<void> _scanHomeStorage({
     bool forceRefresh = false,
+    bool forceRefreshRecent = false,
     bool refreshRecent = true,
+    bool silent = false,
   }) async {
     if (_scanInProgress) {
+      final alreadyQueued = _scanRequestedAgain;
       _scanRequestedAgain = true;
       _forceRescanRequested = _forceRescanRequested || forceRefresh;
+      _forceRecentRescanRequested =
+          _forceRecentRescanRequested || forceRefreshRecent;
+      _silentRescanRequested = alreadyQueued
+          ? _silentRescanRequested && silent
+          : silent;
       return;
     }
     _scanInProgress = true;
+    final recentRefreshTimer = refreshRecent ? (Stopwatch()..start()) : null;
+    if (silent) _cancelScanDisplayTimer();
     if (forceRefresh) {
       getInstalledAppsRepository().clearAppSizeCache();
     }
-    if (forceRefresh || _driveScans.isEmpty) {
+    if (!silent && (forceRefresh || _driveScans.isEmpty)) {
       _startScanDisplayTimer();
     }
     final settings = ref.read(appSettingsProvider);
@@ -572,13 +638,16 @@ class _HomePageState extends ConsumerState<HomePage>
       if (Platform.isAndroid) {
         final storagePermission = await Permission.storage.status;
         final managePermission = await Permission.manageExternalStorage.status;
-        _storagePermissionAvailable =
+        final hasStoragePermission =
             storagePermission.isGranted ||
             storagePermission.isLimited ||
             managePermission.isGranted;
-        _lastStoragePermissionAvailable = _storagePermissionAvailable;
+        if (!silent || hasStoragePermission) {
+          _storagePermissionAvailable = hasStoragePermission;
+        }
+        _lastStoragePermissionAvailable = hasStoragePermission;
         if (!_storagePermissionAvailable) {
-          if (mounted) {
+          if (mounted && !silent) {
             setState(() {
               _scanLoading = false;
               _scanError = null;
@@ -586,10 +655,12 @@ class _HomePageState extends ConsumerState<HomePage>
               _refreshExceededDelay = false;
             });
           }
-          _driveScans.clear();
-          _staleDriveIds.clear();
-          await FilesystemCache.instance.clear();
-          _cancelScanDisplayTimer();
+          if (!silent) {
+            _driveScans.clear();
+            _staleDriveIds.clear();
+            await FilesystemCache.instance.clear();
+            _cancelScanDisplayTimer();
+          }
           return;
         }
       }
@@ -601,14 +672,14 @@ class _HomePageState extends ConsumerState<HomePage>
       unawaited(_prefetchStorageDriveRoots(devices));
       final internal = devices.where((device) => device.id == 'internal');
       if (internal.isEmpty) {
-        if (mounted) {
+        if (mounted && !silent) {
           setState(() {
             _scanLoading = false;
             _scanPermissionError();
             _refreshExceededDelay = false;
           });
         }
-        _cancelScanDisplayTimer();
+        if (!silent) _cancelScanDisplayTimer();
         return;
       }
       final recentDevices = devices
@@ -629,6 +700,7 @@ class _HomePageState extends ConsumerState<HomePage>
         for (final device in [...recentDevices, ...categoryDevices])
           device.id: device,
       }.values.toList();
+      final recentDriveIds = recentDevices.map((device) => device.id).toSet();
       final cachedApps = await FilesystemCache.instance.loadValue(
         'homeAppsTotal',
       );
@@ -664,8 +736,7 @@ class _HomePageState extends ConsumerState<HomePage>
             weeklyRecent: data.weeklyRecent,
             overallRecent: data.overallRecent,
             categoryBytes: data.categoryBytes,
-            directoryModifiedMilliseconds:
-                data.directoryModifiedMilliseconds,
+            directoryModifiedMilliseconds: data.directoryModifiedMilliseconds,
             directoryStampsComplete: data.directoryStampsComplete,
           );
           _staleDriveIds.remove(device.id);
@@ -673,7 +744,8 @@ class _HomePageState extends ConsumerState<HomePage>
           _staleDriveIds.add(device.id);
         }
       }
-      if (mounted &&
+      if (!silent &&
+          mounted &&
           (_driveScans.containsKey('internal') ||
               _cachedCategoryBytesByDrive.containsKey('internal'))) {
         final cachedRecentFiles = _mergeRecentFiles(
@@ -693,15 +765,17 @@ class _HomePageState extends ConsumerState<HomePage>
       final needsScan = scanDevices.any(
         (device) =>
             forceRefresh ||
+            (forceRefreshRecent && recentDriveIds.contains(device.id)) ||
             !_driveScans.containsKey(device.id) ||
             _staleDriveIds.contains(device.id),
       );
-      if (mounted && needsScan && !_scanLoading) {
+      if (!silent && mounted && needsScan && !_scanLoading) {
         _startScanDisplayTimer();
       }
       final categories = ref.read(fileTypeCategoriesProvider);
       for (final device in scanDevices) {
         if (!forceRefresh &&
+            !(forceRefreshRecent && recentDriveIds.contains(device.id)) &&
             _driveScans.containsKey(device.id) &&
             !_staleDriveIds.contains(device.id)) {
           continue;
@@ -731,8 +805,7 @@ class _HomePageState extends ConsumerState<HomePage>
         final completedScan = refreshRecent
             ? scan
             : _DriveScanData(
-                weeklyRecent:
-                    _driveScans[device.id]?.weeklyRecent ?? const [],
+                weeklyRecent: _driveScans[device.id]?.weeklyRecent ?? const [],
                 overallRecent:
                     _driveScans[device.id]?.overallRecent ?? const [],
                 categoryBytes: scan.categoryBytes,
@@ -764,6 +837,9 @@ class _HomePageState extends ConsumerState<HomePage>
         });
       }
       final categorySizes = _homeCategorySizes(categoryDevices, appsSize);
+      if (silent && appsSize == null) {
+        categorySizes['Apps'] = _categorySizes['Apps'];
+      }
       final recentFiles = _mergeRecentFiles(
         recentDevices.map((device) => _driveScans[device.id]),
         showHiddenFiles: ref.read(appSettingsProvider).showHiddenFilesInRecent,
@@ -776,25 +852,42 @@ class _HomePageState extends ConsumerState<HomePage>
         blacklistedPaths: ref.read(appSettingsProvider).blacklistedPaths,
         whitelistedPaths: ref.read(appSettingsProvider).whitelistedPaths,
       );
-      await _removeMissingQuickAccessItems();
+      await _removeMissingQuickAccessItems(silent: silent);
       if (!mounted) return;
-      setState(() {
-        if (!_sameCategorySizes(_categorySizes, categorySizes)) {
-          _categorySizes = categorySizes;
-        }
-        if (!_sameRecentFiles(_recentFiles, recentFiles)) {
-          _recentFiles = recentFiles;
-        }
-        _scanLoading = false;
-        _scanError = null;
-        _refreshExceededDelay = false;
-      });
+      final categorySizesChanged = !_sameCategorySizes(
+        _categorySizes,
+        categorySizes,
+      );
+      final recentFilesChanged = !_sameRecentFiles(_recentFiles, recentFiles);
+      final changedRecentFolders = recentFilesChanged
+          ? _changedRecentFolders(_recentFiles, recentFiles)
+          : const <String>{};
+      final shouldUpdateScanState =
+          categorySizesChanged ||
+          recentFilesChanged ||
+          _scanLoading ||
+          _scanError != null ||
+          _refreshExceededDelay;
+      if (shouldUpdateScanState) {
+        setState(() {
+          if (categorySizesChanged) _categorySizes = categorySizes;
+          if (recentFilesChanged) _recentFiles = recentFiles;
+          _scanLoading = false;
+          _scanError = null;
+          _refreshExceededDelay = false;
+        });
+      }
+      if (silent && recentFilesChanged) {
+        FileChangeNotifier.instance.publish(
+          changedRecentFolders.map(FileChange.refreshFolder),
+        );
+      }
       _cancelScanDisplayTimer();
     } on RefreshCancelled {
       _cancelScanDisplayTimer();
     } catch (error) {
       debugPrint('Home storage refresh failed: $error');
-      if (mounted) {
+      if (mounted && !silent) {
         setState(() {
           _scanLoading = false;
           _scanError = _driveScans.isEmpty
@@ -806,16 +899,37 @@ class _HomePageState extends ConsumerState<HomePage>
       _cancelScanDisplayTimer();
     } finally {
       _scanInProgress = false;
+      if (recentRefreshTimer != null) {
+        recentRefreshTimer.stop();
+        _lastHomeRecentRefreshDuration = recentRefreshTimer.elapsed;
+        if (kDebugMode) {
+          debugPrint(
+            '[HomePage] Recent scan durationMs='
+            '${recentRefreshTimer.elapsedMilliseconds}',
+          );
+        }
+      }
       if (mounted && _scanRequestedAgain) {
         final forceRescan = _forceRescanRequested;
+        final forceRecentRescan = _forceRecentRescanRequested;
+        final silentRescan = _silentRescanRequested;
         _scanRequestedAgain = false;
         _forceRescanRequested = false;
-        unawaited(_scanHomeStorage(forceRefresh: forceRescan));
+        _forceRecentRescanRequested = false;
+        _silentRescanRequested = false;
+        unawaited(
+          _scanHomeStorage(
+            forceRefresh: forceRescan,
+            forceRefreshRecent: forceRecentRescan,
+            silent: silentRescan,
+          ),
+        );
       } else if (mounted &&
           ref.read(appSettingsProvider).includeOtherStorageDrivesInRecent !=
               settings.includeOtherStorageDrivesInRecent) {
-        unawaited(_scanHomeStorage());
+        unawaited(_scanHomeStorage(silent: silent));
       }
+      _scheduleRecentRefresh();
     }
   }
 
@@ -843,7 +957,7 @@ class _HomePageState extends ConsumerState<HomePage>
     };
   }
 
-  Future<void> _removeMissingQuickAccessItems() async {
+  Future<void> _removeMissingQuickAccessItems({bool silent = false}) async {
     final quickAccessController = ref.read(quickAccessProvider.notifier);
     try {
       await quickAccessController.ready;
@@ -861,7 +975,7 @@ class _HomePageState extends ConsumerState<HomePage>
       }
     } catch (error) {
       debugPrint('Could not remove missing Quick Access items: $error');
-      if (mounted) {
+      if (mounted && !silent) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Could not validate Quick Access items: $error'),
@@ -938,10 +1052,7 @@ class _HomePageState extends ConsumerState<HomePage>
       'extensions': ref
           .read(fileTypeCategoriesProvider)
           .map(
-            (category) => [
-              category.name,
-              category.extensions.toList()..sort(),
-            ],
+            (category) => [category.name, category.extensions.toList()..sort()],
           )
           .toList(),
       'showHiddenFiles': settings.showHiddenFiles,
@@ -2196,11 +2307,7 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
             ) ==
             'Image';
     if (!isImage) {
-      return FileTypeIcon(
-        extension: extension,
-        path: path,
-        video: video,
-      );
+      return FileTypeIcon(extension: extension, path: path, video: video);
     }
 
     return ClipRRect(
@@ -2212,7 +2319,8 @@ class _QuickAccessSectionState extends ConsumerState<_QuickAccessSection> {
           path: path,
           fit: BoxFit.cover,
           loadingBuilder: (_) => FileTypeIcon(extension: extension, size: 24),
-          errorBuilder: (_, _, _) => FileTypeIcon(extension: extension, size: 24),
+          errorBuilder: (_, _, _) =>
+              FileTypeIcon(extension: extension, size: 24),
         ),
       ),
     );
@@ -2814,6 +2922,8 @@ class _AvailableStorageSectionState extends State<_AvailableStorageSection> {
     _loadDevices();
   }
 
+  Future<void> refreshSilently() => _loadDevices(silent: true);
+
   bool _sameStorageDevices(
     List<StorageDevice>? current,
     List<StorageDevice> next,
@@ -2832,39 +2942,62 @@ class _AvailableStorageSectionState extends State<_AvailableStorageSection> {
     return true;
   }
 
-  Future<void> _loadDevices() async {
+  Future<void> _loadDevices({bool silent = false}) async {
     final requestId = ++_loadRequestId;
-    final persisted = await FilesystemCache.instance.loadValue(
-      'availableStorage',
-    );
+    Map<String, Object?>? persisted;
+    try {
+      persisted = await FilesystemCache.instance.loadValue('availableStorage');
+    } catch (error) {
+      if (!silent) rethrow;
+      debugPrint(
+        '[HomePage] Could not load Available Storage snapshot: $error',
+      );
+    }
+    var restoredSnapshot = false;
     if (persisted != null && _devices == null) {
       final rawDevices = persisted['devices'];
       if (rawDevices is List) {
-        _devices = rawDevices
-            .whereType<Map>()
-            .map(
-              (raw) => StorageDevice(
-                id: raw['id']! as String,
-                name: raw['name']! as String,
-                path: raw['path']! as String,
-                usedBytes: raw['usedBytes'] as int?,
-                totalBytes: raw['totalBytes'] as int?,
-              ),
-            )
-            .toList(growable: false);
+        try {
+          _devices = rawDevices
+              .whereType<Map>()
+              .map(
+                (raw) => StorageDevice(
+                  id: raw['id']! as String,
+                  name: raw['name']! as String,
+                  path: raw['path']! as String,
+                  usedBytes: raw['usedBytes'] as int?,
+                  totalBytes: raw['totalBytes'] as int?,
+                ),
+              )
+              .toList(growable: false);
+          restoredSnapshot = true;
+        } catch (error) {
+          debugPrint('[HomePage] Invalid Available Storage snapshot: $error');
+        }
       }
     }
-    _refreshDisplayTimer?.cancel();
-    setState(() {
-      _loading = true;
-      _showStaleValues = false;
-      _loadError = null;
-    });
-    _refreshDisplayTimer = Timer(_homeRefreshStaleDelay, () {
-      if (mounted && _loading && requestId == _loadRequestId) {
-        setState(() => _showStaleValues = true);
+    if (silent) {
+      _refreshDisplayTimer?.cancel();
+      _refreshDisplayTimer = null;
+      if (mounted && _devices != null && (_loading || restoredSnapshot)) {
+        setState(() {
+          _loading = false;
+          _showStaleValues = false;
+        });
       }
-    });
+    } else {
+      _refreshDisplayTimer?.cancel();
+      setState(() {
+        _loading = true;
+        _showStaleValues = false;
+        _loadError = null;
+      });
+      _refreshDisplayTimer = Timer(_homeRefreshStaleDelay, () {
+        if (mounted && _loading && requestId == _loadRequestId) {
+          setState(() => _showStaleValues = true);
+        }
+      });
+    }
     try {
       final devices = await RefreshCoordinator.instance
           .run<List<StorageDevice>>(
@@ -2880,11 +3013,18 @@ class _AvailableStorageSectionState extends State<_AvailableStorageSection> {
             },
           );
       if (!mounted || requestId != _loadRequestId) return;
-      setState(() {
-        if (!_sameStorageDevices(_devices, devices)) _devices = devices;
-        _loading = false;
-        _showStaleValues = false;
-      });
+      final devicesChanged = !_sameStorageDevices(_devices, devices);
+      if (devicesChanged ||
+          _loading ||
+          _showStaleValues ||
+          _loadError != null) {
+        setState(() {
+          if (devicesChanged) _devices = devices;
+          _loading = false;
+          _showStaleValues = false;
+          _loadError = null;
+        });
+      }
       await FilesystemCache.instance.saveValue('availableStorage', {
         'volumeIds': devices.map((device) => device.id).toList(),
         'devices': devices
@@ -2905,11 +3045,15 @@ class _AvailableStorageSectionState extends State<_AvailableStorageSection> {
       return;
     } catch (error) {
       if (!mounted || requestId != _loadRequestId) return;
-      setState(() {
-        _loading = false;
-        _showStaleValues = false;
-        _loadError = error;
-      });
+      if (silent) {
+        debugPrint('[HomePage] Available Storage refresh failed: $error');
+      } else {
+        setState(() {
+          _loading = false;
+          _showStaleValues = false;
+          _loadError = error;
+        });
+      }
       _refreshDisplayTimer?.cancel();
     } finally {
       if (requestId == _loadRequestId) _refreshDisplayTimer = null;

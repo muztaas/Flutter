@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -21,9 +22,20 @@ import '../common/open_audio_file.dart';
 import '../common/open_pdf_file.dart';
 import '../common/open_video_file.dart';
 
-const int maxPdfBitmapDimension = 4096;
+const int _maxPdfVirtualDimension = 32768;
+const int _maxPdfTileDimension = 512;
 const int _maxPdfCacheBytes = 64 * 1024 * 1024;
+const int _pdfPreviewDimension = 384;
 const double _pageGap = 12;
+
+typedef _PdfTileKey = ({
+  int pageIndex,
+  int fullWidth,
+  int fullHeight,
+  int x,
+  int y,
+  bool isPreview,
+});
 
 class PdfViewerTab extends ConsumerStatefulWidget {
   const PdfViewerTab({
@@ -58,14 +70,17 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
   final ScrollController _verticalScroll = ScrollController();
   final ScrollController _horizontalScroll = ScrollController();
   final TextEditingController _passwordController = TextEditingController();
-  final Map<int, _CachedPdfPage> _pageCache = {};
-  final Map<int, String> _renderRequests = {};
+  final Map<_PdfTileKey, _CachedPdfTile> _pageCache = {};
+  final Map<_PdfTileKey, String> _renderRequests = {};
+  final Set<_PdfTileKey> _failedTiles = {};
   final Map<int, Object> _pageErrors = {};
   final Map<int, Offset> _activePointers = {};
   final Map<int, PdfPageInfo> _pageInfo = {};
+  final Set<int> _pageInfoRequests = {};
   final List<double> _pageOffsets = [];
 
   PdfDocumentInfo? _document;
+  PdfRendererRepository? _rendererRepository;
   Object? _openError;
   DetectedFileContent? _detectedContentMismatch;
   String? _documentId;
@@ -191,8 +206,10 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
     ++_generation;
     final requestIds = _renderRequests.values.toList(growable: false);
     _renderRequests.clear();
+    _failedTiles.clear();
     _clearCache();
-    final repository = ref.read(pdfRendererRepositoryProvider);
+    final repository = _rendererRepository;
+    if (repository == null) return;
     for (final requestId in requestIds) {
       try {
         await repository.cancelRender(requestId);
@@ -305,6 +322,7 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
         return;
       }
       final repository = ref.read(pdfRendererRepositoryProvider);
+      _rendererRepository = repository;
       openingRepository = repository;
       final document = await repository.openDocument(
         widget.path,
@@ -456,13 +474,21 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
     _pageInfo.clear();
     _pageOffsets.clear();
     _pageErrors.clear();
+    _pageInfoRequests.clear();
+    _failedTiles.clear();
     _restorePositionPending = false;
     _openError = null;
     _passwordError = null;
     _isOpening = false;
     _clearCache();
     if (mounted && !_isDisposing) setState(() {});
-    final repository = ref.read(pdfRendererRepositoryProvider);
+    final repository = _rendererRepository;
+    if (repository == null) {
+      if (mounted && _isVisible && _document == null) {
+        unawaited(_openDocument());
+      }
+      return;
+    }
     for (final requestId in requestIds) {
       try {
         await repository.cancelRender(requestId);
@@ -508,6 +534,10 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
           return 'Password-protected PDFs require Android 15 or newer in the built-in viewer.';
         case 'INVALID_PDF':
           return 'This PDF is damaged or is not a supported PDF file.';
+        case 'DAMAGED_PDF':
+          return 'This PDF appears damaged or incomplete.';
+        case 'UNSUPPORTED_PDF':
+          return 'This PDF uses a format or feature the built-in viewer cannot read.';
         default:
           return error.message ?? 'Could not open this PDF.';
       }
@@ -650,18 +680,19 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
     final document = _document;
     final documentId = _documentId;
     if (document == null || documentId == null) return;
-    final controller = TextEditingController();
     var results = <int>[];
     var resultIndex = -1;
     var searching = false;
+    var queryText = '';
     String? errorMessage;
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
         builder: (context, setDialogState) {
-          Future<void> search() async {
-            final query = controller.text.trim();
+          Future<void> search([String? submittedQuery]) async {
+            final query = (submittedQuery ?? queryText).trim();
             if (query.isEmpty || searching) return;
+            queryText = query;
             setDialogState(() {
               searching = true;
               errorMessage = null;
@@ -711,10 +742,10 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   TextField(
-                    controller: controller,
                     autofocus: true,
                     textInputAction: TextInputAction.search,
-                    onSubmitted: (_) => search(),
+                    onChanged: (value) => queryText = value,
+                    onSubmitted: search,
                     decoration: InputDecoration(
                       labelText: 'Search text',
                       suffixIcon: IconButton(
@@ -766,7 +797,7 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
                   ],
                   if (!searching &&
                       errorMessage == null &&
-                      controller.text.trim().isNotEmpty &&
+                      queryText.trim().isNotEmpty &&
                       results.isEmpty)
                     const Padding(
                       padding: EdgeInsets.only(top: 12),
@@ -785,71 +816,59 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
         },
       ),
     );
-    controller.dispose();
   }
 
   Future<void> _showGoToPageDialog() async {
     final document = _document;
     if (document == null) return;
-    final controller = TextEditingController();
+    var pageInput = '';
     String? errorText;
     final pageNumber = await showDialog<int>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Go to page'),
-          content: SizedBox(
-            width: 280,
-            child: TextField(
-              controller: controller,
-              autofocus: true,
-              keyboardType: TextInputType.number,
-              decoration: InputDecoration(
-                labelText: 'Page number',
-                helperText: '1-${document.pageCount}',
-                errorText: errorText,
+        builder: (context, setDialogState) {
+          void submitPage(String value) {
+            final number = int.tryParse(value);
+            if (number == null || number < 1 || number > document.pageCount) {
+              setDialogState(
+                () =>
+                    errorText = 'Enter a page from 1 to ${document.pageCount}.',
+              );
+              return;
+            }
+            Navigator.pop(dialogContext, number);
+          }
+
+          return AlertDialog(
+            title: const Text('Go to page'),
+            content: SizedBox(
+              width: 280,
+              child: TextField(
+                autofocus: true,
+                keyboardType: TextInputType.number,
+                onChanged: (value) => pageInput = value,
+                decoration: InputDecoration(
+                  labelText: 'Page number',
+                  helperText: '1-${document.pageCount}',
+                  errorText: errorText,
+                ),
+                onSubmitted: submitPage,
               ),
-              onSubmitted: (value) {
-                final number = int.tryParse(value);
-                if (number == null ||
-                    number < 1 ||
-                    number > document.pageCount) {
-                  setDialogState(
-                    () => errorText =
-                        'Enter a page from 1 to ${document.pageCount}.',
-                  );
-                  return;
-                }
-                Navigator.pop(dialogContext, number);
-              },
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final number = int.tryParse(controller.text);
-                if (number == null ||
-                    number < 1 ||
-                    number > document.pageCount) {
-                  setDialogState(
-                    () => errorText =
-                        'Enter a page from 1 to ${document.pageCount}.',
-                  );
-                  return;
-                }
-                Navigator.pop(dialogContext, number);
-              },
-              child: const Text('Go'),
-            ),
-          ],
-        ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => submitPage(pageInput),
+                child: const Text('Go'),
+              ),
+            ],
+          );
+        },
       ),
     );
-    controller.dispose();
     if (pageNumber != null && mounted) _jumpToPage(pageNumber);
   }
 
@@ -894,12 +913,10 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
       _viewportWidth * _zoom / _aspectRatio(pageIndex);
 
   double _pageOffset(int pageIndex) =>
-      _pageOffsets[pageIndex] * _viewportWidth * _zoom +
-      pageIndex * _pageGap;
+      _pageOffsets[pageIndex] * _viewportWidth * _zoom + pageIndex * _pageGap;
 
   double _pageOffsetAtZoom(int pageIndex, double zoom) =>
-      _pageOffsets[pageIndex] * _viewportWidth * zoom +
-      pageIndex * _pageGap;
+      _pageOffsets[pageIndex] * _viewportWidth * zoom + pageIndex * _pageGap;
 
   double _pageHeightAtZoom(int pageIndex, double zoom) =>
       _viewportWidth * zoom / _aspectRatio(pageIndex);
@@ -1010,11 +1027,38 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
     final range = _visiblePageRange();
     final pageChanged = _currentPage != range.current;
     _currentPage = range.current;
-    final firstRequired = math.max(0, range.first - 1);
-    final lastRequired = math.min(document.pageCount - 1, range.last + 1);
-    final required = <int>{
-      for (var index = firstRequired; index <= lastRequired; index++) index,
-    };
+    final visiblePages = <int>[
+      for (var index = range.first; index <= range.last; index++) index,
+    ];
+    final neighborPages = <int>[
+      if (range.first > 0) range.first - 1,
+      if (range.last + 1 < document.pageCount) range.last + 1,
+    ];
+    final required = <_PdfTileKey>{};
+
+    for (final pageIndex in [...visiblePages, ...neighborPages]) {
+      if (_pageInfo[pageIndex] == null) {
+        if (!_pageInfoRequests.contains(pageIndex) &&
+            !_pageErrors.containsKey(pageIndex)) {
+          unawaited(_loadPageInfo(pageIndex));
+        }
+        continue;
+      }
+
+      required.add(_previewTileKey(pageIndex));
+      if (visiblePages.contains(pageIndex)) {
+        final visibleTileKeys = _visibleTileKeys(pageIndex);
+        required.addAll(visibleTileKeys);
+        if (visibleTileKeys.any((key) => !_pageCache.containsKey(key))) {
+          // Keep the last rendered scale visible until the new tiles are ready.
+          required.addAll(
+            _pageCache.keys.where(
+              (key) => key.pageIndex == pageIndex && !key.isPreview,
+            ),
+          );
+        }
+      }
+    }
 
     for (final entry in _renderRequests.entries.toList()) {
       if (!required.contains(entry.key)) {
@@ -1023,20 +1067,43 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
       }
     }
     _trimCache(required);
-    for (final pageIndex in required) {
-      final cachedPage = _pageCache[pageIndex];
-      final needsHigherResolution =
-          cachedPage != null &&
-          !_cacheMeetsZoomTarget(pageIndex, cachedPage.image);
-      if ((cachedPage == null || needsHigherResolution) &&
-          !_renderRequests.containsKey(pageIndex) &&
-          !_pageErrors.containsKey(pageIndex) &&
+    for (final tileKey in required) {
+      if (!_pageCache.containsKey(tileKey) &&
+          !_failedTiles.contains(tileKey) &&
+          !_renderRequests.containsKey(tileKey) &&
+          !_pageErrors.containsKey(tileKey.pageIndex) &&
           _activeRenderCount == 0) {
-        unawaited(_renderPage(pageIndex));
+        unawaited(_renderTile(tileKey));
         break;
       }
     }
     if (pageChanged && mounted) setState(() {});
+  }
+
+  Future<void> _loadPageInfo(int pageIndex) async {
+    final document = _document;
+    if (document == null || !_isVisible) return;
+    final generation = _generation;
+    _pageInfoRequests.add(pageIndex);
+    try {
+      final info = await ref
+          .read(pdfRendererRepositoryProvider)
+          .getPageInfo(document.documentId, pageIndex);
+      if (!mounted || generation != _generation || !_isVisible) return;
+      _updatePageInfo(pageIndex, info);
+      setState(() {});
+    } catch (error) {
+      if (generation == _generation && _isVisible) {
+        _pageErrors[pageIndex] = error;
+        if (kDebugMode) {
+          debugPrint('Could not load PDF page $pageIndex dimensions: $error');
+        }
+        if (mounted) setState(() {});
+      }
+    } finally {
+      if (_generation == generation) _pageInfoRequests.remove(pageIndex);
+      if (_isVisible) _schedulePageUpdate();
+    }
   }
 
   Future<void> _cancelRequest(String requestId) async {
@@ -1047,68 +1114,99 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
     }
   }
 
-  Future<void> _renderPage(int pageIndex) async {
+  Future<void> _renderTile(_PdfTileKey tileKey) async {
     final document = _document;
     if (document == null || !_isVisible) return;
-    final requestId = '${document.documentId}:$pageIndex:${++_requestSequence}';
+    final requestId =
+        '${document.documentId}:${tileKey.pageIndex}:${++_requestSequence}';
     final generation = _generation;
-    _renderRequests[pageIndex] = requestId;
+    _renderRequests[tileKey] = requestId;
     _activeRenderCount++;
-    final pixelSize = _requestedPixelSize(pageIndex);
-    final requestedWidth = pixelSize.width;
-    final requestedHeight = pixelSize.height;
+    final tileWidth = tileKey.isPreview
+        ? tileKey.fullWidth
+        : math.min(_maxPdfTileDimension, tileKey.fullWidth - tileKey.x);
+    final tileHeight = tileKey.isPreview
+        ? tileKey.fullHeight
+        : math.min(_maxPdfTileDimension, tileKey.fullHeight - tileKey.y);
     try {
       final rendered = await ref
           .read(pdfRendererRepositoryProvider)
           .renderPage(
             documentId: document.documentId,
-            pageIndex: pageIndex,
-            width: requestedWidth,
-            height: requestedHeight,
+            pageIndex: tileKey.pageIndex,
+            fullWidth: tileKey.fullWidth,
+            fullHeight: tileKey.fullHeight,
+            x: tileKey.x,
+            y: tileKey.y,
+            width: tileWidth,
+            height: tileHeight,
             requestId: requestId,
           );
       if (!mounted ||
           generation != _generation ||
           !_isVisible ||
-          _renderRequests[pageIndex] != requestId) {
+          _renderRequests[tileKey] != requestId) {
         return;
       }
-      _updatePageInfo(pageIndex, rendered.pageInfo);
-      final codec = await ui.instantiateImageCodec(rendered.bytes);
-      late final ui.Image image;
-      try {
-        image = (await codec.getNextFrame()).image;
-      } finally {
-        codec.dispose();
-      }
+      _updatePageInfo(tileKey.pageIndex, rendered.pageInfo);
+      final image = await _decodePdfTile(rendered);
       if (!mounted ||
           generation != _generation ||
           !_isVisible ||
-          _renderRequests[pageIndex] != requestId ||
-          !_visiblePageRangeContains(pageIndex)) {
+          _renderRequests[tileKey] != requestId ||
+          !_visiblePageRangeContains(tileKey.pageIndex)) {
         image.dispose();
         return;
       }
-      _renderRequests.remove(pageIndex);
-      _pageErrors.remove(pageIndex);
-      _putInCache(pageIndex, image);
+      _renderRequests.remove(tileKey);
+      _pageErrors.remove(tileKey.pageIndex);
+      _failedTiles.remove(tileKey);
+      _putInCache(tileKey, image);
       setState(() {});
       _schedulePageUpdate();
     } catch (error) {
       if (generation != _generation || !_isVisible) return;
-      if (_renderRequests[pageIndex] == requestId) {
-        _renderRequests.remove(pageIndex);
+      if (_renderRequests[tileKey] == requestId) {
+        _renderRequests.remove(tileKey);
       }
       if (error is! PlatformException || error.code != 'RENDER_CANCELLED') {
-        _pageErrors[pageIndex] = error;
+        _failedTiles.add(tileKey);
+        if (!tileKey.isPreview) {
+          _pageErrors[tileKey.pageIndex] = error;
+        }
+        if (kDebugMode) {
+          debugPrint('Could not render PDF page ${tileKey.pageIndex}: $error');
+        }
         if (mounted) setState(() {});
       }
     } finally {
-      if (_renderRequests[pageIndex] == requestId) {
-        _renderRequests.remove(pageIndex);
+      if (_renderRequests[tileKey] == requestId) {
+        _renderRequests.remove(tileKey);
       }
       _activeRenderCount--;
       if (_isVisible) _schedulePageUpdate();
+    }
+  }
+
+  Future<ui.Image> _decodePdfTile(PdfRenderedPage rendered) async {
+    final buffer = await ui.ImmutableBuffer.fromUint8List(rendered.bytes);
+    ui.ImageDescriptor? descriptor;
+    try {
+      descriptor = ui.ImageDescriptor.raw(
+        buffer,
+        width: rendered.imageWidth,
+        height: rendered.imageHeight,
+        pixelFormat: ui.PixelFormat.bgra8888,
+      );
+      final codec = await descriptor.instantiateCodec();
+      try {
+        return (await codec.getNextFrame()).image;
+      } finally {
+        codec.dispose();
+      }
+    } finally {
+      descriptor?.dispose();
+      buffer.dispose();
     }
   }
 
@@ -1120,38 +1218,110 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
         pageIndex <= math.min(document.pageCount - 1, range.last + 1);
   }
 
-  ({int width, int height}) _requestedPixelSize(int pageIndex) {
-    final info =
-        _pageInfo[pageIndex] ??
-        PdfPageInfo(
-          width: _document!.firstPageWidth,
-          height: _document!.firstPageHeight,
-        );
-    final visible = _visiblePageRange();
-    final requiredPageCount = visible.last < visible.first
-        ? 1
-        : (visible.last - visible.first + 3).clamp(1, 5);
-    final pageMemoryLimit = math.min(
-      maxPdfBitmapDimension,
-      math.sqrt(_maxPdfCacheBytes / (requiredPageCount * 4)).floor(),
-    );
+  void _retryPage(int pageIndex) {
+    _pageErrors.remove(pageIndex);
+    _failedTiles.removeWhere((key) => key.pageIndex == pageIndex);
+    if (_pageInfo[pageIndex] == null) {
+      unawaited(_loadPageInfo(pageIndex));
+    } else {
+      setState(() {});
+      _schedulePageUpdate();
+    }
+  }
+
+  ({int width, int height}) _requestedPagePixelSize(int pageIndex) {
+    final aspectRatio = _aspectRatio(pageIndex);
     final desiredWidth = _viewportWidth * _zoom * _devicePixelRatio;
+    final desiredHeight = desiredWidth / aspectRatio;
     final scale = math.min(
-      desiredWidth / info.width,
-      math.min(
-        pageMemoryLimit / info.width,
-        pageMemoryLimit / info.height,
-      ),
+      1.0,
+      _maxPdfVirtualDimension / math.max(desiredWidth, desiredHeight),
     );
     return (
-      width: (info.width * scale).round().clamp(1, pageMemoryLimit),
-      height: (info.height * scale).round().clamp(1, pageMemoryLimit),
+      width: math.max(1, (desiredWidth * scale).round()),
+      height: math.max(1, (desiredHeight * scale).round()),
     );
   }
 
-  bool _cacheMeetsZoomTarget(int pageIndex, ui.Image image) {
-    final target = _requestedPixelSize(pageIndex);
-    return image.width >= target.width && image.height >= target.height;
+  _PdfTileKey _previewTileKey(int pageIndex) {
+    final aspectRatio = _aspectRatio(pageIndex);
+    final width = aspectRatio >= 1
+        ? _pdfPreviewDimension.toDouble()
+        : _pdfPreviewDimension * aspectRatio;
+    final height = aspectRatio >= 1
+        ? _pdfPreviewDimension / aspectRatio
+        : _pdfPreviewDimension.toDouble();
+    return (
+      pageIndex: pageIndex,
+      fullWidth: math.max(1, width.round()),
+      fullHeight: math.max(1, height.round()),
+      x: 0,
+      y: 0,
+      isPreview: true,
+    );
+  }
+
+  Set<_PdfTileKey> _visibleTileKeys(int pageIndex) {
+    if (_viewportWidth <= 0 ||
+        _viewportHeight <= 0 ||
+        _pageInfo[pageIndex] == null) {
+      return {};
+    }
+    final fullSize = _requestedPagePixelSize(pageIndex);
+    final pageWidth = _viewportWidth * _zoom;
+    final pageHeight = _pageHeight(pageIndex);
+    if (pageWidth <= 0 || pageHeight <= 0) return {};
+
+    final horizontalOffset = _horizontalScroll.hasClients
+        ? _horizontalScroll.offset
+        : 0.0;
+    final verticalOffset = _verticalScroll.hasClients
+        ? _verticalScroll.offset
+        : 0.0;
+    final left = (horizontalOffset / pageWidth).clamp(0.0, 1.0);
+    final right = ((horizontalOffset + _viewportWidth) / pageWidth).clamp(
+      0.0,
+      1.0,
+    );
+    final top = ((verticalOffset - _pageOffset(pageIndex)) / pageHeight).clamp(
+      0.0,
+      1.0,
+    );
+    final bottom =
+        ((verticalOffset + _viewportHeight - _pageOffset(pageIndex)) /
+                pageHeight)
+            .clamp(0.0, 1.0);
+    if (right <= left || bottom <= top) return {};
+
+    final firstX = (left * fullSize.width).floor().clamp(0, fullSize.width - 1);
+    final lastX = ((right * fullSize.width).ceil() - 1).clamp(
+      firstX,
+      fullSize.width - 1,
+    );
+    final firstY = (top * fullSize.height).floor().clamp(
+      0,
+      fullSize.height - 1,
+    );
+    final lastY = ((bottom * fullSize.height).ceil() - 1).clamp(
+      firstY,
+      fullSize.height - 1,
+    );
+    final firstTileX = firstX ~/ _maxPdfTileDimension;
+    final lastTileX = lastX ~/ _maxPdfTileDimension;
+    final firstTileY = firstY ~/ _maxPdfTileDimension;
+    final lastTileY = lastY ~/ _maxPdfTileDimension;
+    return {
+      for (var tileY = firstTileY; tileY <= lastTileY; tileY++)
+        for (var tileX = firstTileX; tileX <= lastTileX; tileX++)
+          (
+            pageIndex: pageIndex,
+            fullWidth: fullSize.width,
+            fullHeight: fullSize.height,
+            x: tileX * _maxPdfTileDimension,
+            y: tileY * _maxPdfTileDimension,
+            isPreview: false,
+          ),
+    };
   }
 
   void _updatePageInfo(int pageIndex, PdfPageInfo info) {
@@ -1180,14 +1350,14 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
     }
   }
 
-  void _putInCache(int pageIndex, ui.Image image) {
-    final existing = _pageCache.remove(pageIndex);
+  void _putInCache(_PdfTileKey tileKey, ui.Image image) {
+    final existing = _pageCache.remove(tileKey);
     if (existing != null) {
       _cacheSizeBytes -= existing.byteSize;
       existing.image.dispose();
     }
     final byteSize = image.width * image.height * 4;
-    _pageCache[pageIndex] = _CachedPdfPage(image, byteSize);
+    _pageCache[tileKey] = _CachedPdfTile(image, byteSize);
     _cacheSizeBytes += byteSize;
     while (_cacheSizeBytes > _maxPdfCacheBytes && _pageCache.isNotEmpty) {
       final oldestKey = _pageCache.keys.first;
@@ -1197,7 +1367,8 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
     }
   }
 
-  void _trimCache(Set<int> required) {
+  void _trimCache(Set<_PdfTileKey> required) {
+    _failedTiles.removeWhere((key) => !required.contains(key));
     for (final entry in _pageCache.entries.toList()) {
       if (required.contains(entry.key)) continue;
       _pageCache.remove(entry.key);
@@ -1245,11 +1416,14 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
 
   void _handlePointerUp(PointerEvent event) {
     _activePointers.remove(event.pointer);
-    if (_activePointers.isEmpty) _pinchInProgress = false;
+    _pinchInProgress = _activePointers.length >= 2;
     _previousPinchDistance = _activePointers.length >= 2
         ? _distanceBetweenPointers()
         : null;
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() {});
+      _schedulePageUpdate();
+    }
   }
 
   double _distanceBetweenPointers() {
@@ -1405,12 +1579,47 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
                         width: constraints.maxWidth * _zoom,
                         child: ListView.builder(
                           controller: _verticalScroll,
+                          itemExtentBuilder: (pageIndex, _) =>
+                              _pageHeight(pageIndex) + _pageGap,
                           itemCount: document.pageCount,
                           physics: _pinchInProgress
                               ? const NeverScrollableScrollPhysics()
                               : const ClampingScrollPhysics(),
                           itemBuilder: (context, pageIndex) {
-                            final cachedPage = _pageCache[pageIndex];
+                            final pixelSize = _requestedPagePixelSize(
+                              pageIndex,
+                            );
+                            final cachedTiles =
+                                _pageCache.entries
+                                    .where(
+                                      (entry) =>
+                                          entry.key.pageIndex == pageIndex &&
+                                          (entry.key.isPreview ||
+                                              (entry.key.fullWidth ==
+                                                      pixelSize.width &&
+                                                  entry.key.fullHeight ==
+                                                      pixelSize.height)),
+                                    )
+                                    .map(
+                                      (entry) => _PdfPageTile(
+                                        image: entry.value.image,
+                                        x: entry.key.x,
+                                        y: entry.key.y,
+                                        fullWidth: entry.key.fullWidth,
+                                        fullHeight: entry.key.fullHeight,
+                                        isPreview: entry.key.isPreview,
+                                      ),
+                                    )
+                                    .toList()
+                                  ..sort((left, right) {
+                                    if (left.isPreview != right.isPreview) {
+                                      return left.isPreview ? -1 : 1;
+                                    }
+                                    return (left.fullWidth * left.fullHeight)
+                                        .compareTo(
+                                          right.fullWidth * right.fullHeight,
+                                        );
+                                  });
                             final pageError = _pageErrors[pageIndex];
                             final pageWidth = constraints.maxWidth * _zoom;
                             final aspect = _aspectRatio(pageIndex);
@@ -1420,9 +1629,10 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
                                 width: pageWidth,
                                 height: pageWidth / aspect,
                                 child: _PdfPageSurface(
-                                  image: cachedPage?.image,
+                                  tiles: cachedTiles,
                                   pageNumber: pageIndex + 1,
                                   error: pageError,
+                                  onRetry: () => _retryPage(pageIndex),
                                 ),
                               ),
                             );
@@ -1565,14 +1775,16 @@ class PdfViewerTabState extends ConsumerState<PdfViewerTab>
 
 class _PdfPageSurface extends StatelessWidget {
   const _PdfPageSurface({
-    required this.image,
+    required this.tiles,
     required this.pageNumber,
     required this.error,
+    required this.onRetry,
   });
 
-  final ui.Image? image;
+  final List<_PdfPageTile> tiles;
   final int pageNumber;
   final Object? error;
+  final VoidCallback onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -1581,28 +1793,75 @@ class _PdfPageSurface extends StatelessWidget {
       return ColoredBox(
         color: surface,
         child: Center(
-          child: Text(
-            'Could not render page $pageNumber',
-            style: const TextStyle(color: Colors.black54),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Page $pageNumber cannot be shown',
+                style: const TextStyle(color: Colors.black54),
+              ),
+              TextButton(onPressed: onRetry, child: const Text('Retry')),
+            ],
           ),
         ),
       );
     }
     return ColoredBox(
       color: surface,
-      child: image == null
-          ? null
-          : RawImage(
-              image: image,
-              fit: BoxFit.fill,
-              filterQuality: FilterQuality.medium,
-            ),
+      child: LayoutBuilder(
+        builder: (context, constraints) => Stack(
+          fit: StackFit.expand,
+          clipBehavior: Clip.hardEdge,
+          children: [
+            for (final tile in tiles)
+              Positioned(
+                left: tile.isPreview
+                    ? 0
+                    : constraints.maxWidth * tile.x / tile.fullWidth,
+                top: tile.isPreview
+                    ? 0
+                    : constraints.maxHeight * tile.y / tile.fullHeight,
+                width: tile.isPreview
+                    ? constraints.maxWidth
+                    : constraints.maxWidth * tile.image.width / tile.fullWidth,
+                height: tile.isPreview
+                    ? constraints.maxHeight
+                    : constraints.maxHeight *
+                          tile.image.height /
+                          tile.fullHeight,
+                child: RawImage(
+                  image: tile.image,
+                  fit: BoxFit.fill,
+                  filterQuality: FilterQuality.medium,
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
 
-class _CachedPdfPage {
-  const _CachedPdfPage(this.image, this.byteSize);
+class _PdfPageTile {
+  const _PdfPageTile({
+    required this.image,
+    required this.x,
+    required this.y,
+    required this.fullWidth,
+    required this.fullHeight,
+    required this.isPreview,
+  });
+
+  final ui.Image image;
+  final int x;
+  final int y;
+  final int fullWidth;
+  final int fullHeight;
+  final bool isPreview;
+}
+
+class _CachedPdfTile {
+  const _CachedPdfTile(this.image, this.byteSize);
 
   final ui.Image image;
   final int byteSize;

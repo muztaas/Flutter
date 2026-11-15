@@ -5,11 +5,13 @@ class XlsxSheetInfo {
     required this.id,
     required this.name,
     required this.defaultRowHeight,
+    this.tabColor,
   });
 
   final String id;
   final String name;
   final double defaultRowHeight;
+  final int? tabColor;
 }
 
 class XlsxSheetProgress {
@@ -24,6 +26,11 @@ class XlsxSheetProgress {
     required this.visibleColumnIndexes,
     required this.columnWidths,
     required this.omittedFeatureLabels,
+    required this.freezeRowCount,
+    required this.freezeColumnCount,
+    this.tabColor,
+    this.notShownFeatures = const [],
+    this.charts = const [],
   });
 
   final List<SpreadsheetRowData> rows;
@@ -36,6 +43,11 @@ class XlsxSheetProgress {
   final List<int> visibleColumnIndexes;
   final Map<int, double> columnWidths;
   final List<String> omittedFeatureLabels;
+  final int freezeRowCount;
+  final int freezeColumnCount;
+  final int? tabColor;
+  final List<String> notShownFeatures;
+  final List<Map<Object?, Object?>> charts;
 }
 
 abstract interface class XlsxFileRepository {
