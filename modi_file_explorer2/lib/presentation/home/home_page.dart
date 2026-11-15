@@ -265,6 +265,7 @@ class _HomePageState extends ConsumerState<HomePage>
   bool _storagePermissionAvailable = true;
   String? _scanError;
   bool _scanInProgress = false;
+  Completer<void>? _scanCycleCompletion;
   bool _scanRequestedAgain = false;
   bool _forceRescanRequested = false;
   bool _forceRecentRescanRequested = false;
@@ -279,6 +280,7 @@ class _HomePageState extends ConsumerState<HomePage>
   String? _appsSizeError;
   DateTime? _backgroundSince;
   bool _resumeRefreshInProgress = false;
+  bool _manualRefreshInProgress = false;
   Timer? _recentRefreshTimer;
   Duration _lastHomeRecentRefreshDuration = Duration.zero;
 
@@ -598,10 +600,17 @@ class _HomePageState extends ConsumerState<HomePage>
     return _homeRecentRefreshInterval;
   }
 
-  void _refresh() {
-    unawaited(ref.read(availableStorageDevicesProvider.notifier).refresh());
-    _scanHomeStorage(forceRefresh: true);
-    _storageKey.currentState?.refresh();
+  Future<void> _refresh() async {
+    if (_manualRefreshInProgress || !mounted) return;
+    setState(() => _manualRefreshInProgress = true);
+    try {
+      await Future.wait([
+        _scanHomeStorage(forceRefresh: true),
+        _storageKey.currentState?.refresh() ?? Future<void>.value(),
+      ]);
+    } finally {
+      if (mounted) setState(() => _manualRefreshInProgress = false);
+    }
   }
 
   Future<void> _scanHomeStorage({
@@ -619,9 +628,11 @@ class _HomePageState extends ConsumerState<HomePage>
       _silentRescanRequested = alreadyQueued
           ? _silentRescanRequested && silent
           : silent;
+      await _scanCycleCompletion?.future;
       return;
     }
     _scanInProgress = true;
+    _scanCycleCompletion ??= Completer<void>();
     final recentRefreshTimer = refreshRecent ? (Stopwatch()..start()) : null;
     if (silent) _cancelScanDisplayTimer();
     if (forceRefresh) {
@@ -924,10 +935,18 @@ class _HomePageState extends ConsumerState<HomePage>
             silent: silentRescan,
           ),
         );
-      } else if (mounted &&
-          ref.read(appSettingsProvider).includeOtherStorageDrivesInRecent !=
-              settings.includeOtherStorageDrivesInRecent) {
-        unawaited(_scanHomeStorage(silent: silent));
+      } else {
+        if (mounted &&
+            ref.read(appSettingsProvider).includeOtherStorageDrivesInRecent !=
+                settings.includeOtherStorageDrivesInRecent) {
+          unawaited(_scanHomeStorage(silent: silent));
+        } else {
+          final completion = _scanCycleCompletion;
+          _scanCycleCompletion = null;
+          if (completion != null && !completion.isCompleted) {
+            completion.complete();
+          }
+        }
       }
       _scheduleRecentRefresh();
     }
@@ -1410,8 +1429,15 @@ class _HomePageState extends ConsumerState<HomePage>
             actions: [
               IconButton(
                 tooltip: 'Refresh',
-                onPressed: _scanLoading ? null : _refresh,
-                icon: const Icon(Icons.refresh),
+                onPressed: _scanLoading || _manualRefreshInProgress
+                    ? null
+                    : _refresh,
+                icon: Icon(
+                  Icons.refresh,
+                  color: _manualRefreshInProgress
+                      ? Theme.of(context).disabledColor
+                      : null,
+                ),
               ),
               SearchActionButton(
                 sessionId: 'home',
@@ -2918,9 +2944,7 @@ class _AvailableStorageSectionState extends State<_AvailableStorageSection> {
     super.dispose();
   }
 
-  void refresh() {
-    _loadDevices();
-  }
+  Future<void> refresh() => _loadDevices();
 
   Future<void> refreshSilently() => _loadDevices(silent: true);
 

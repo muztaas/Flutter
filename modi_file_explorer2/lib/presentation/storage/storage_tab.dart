@@ -651,7 +651,6 @@ class StorageTabState extends ConsumerState<StorageTab>
   bool _isListScrolling = false;
   int _activePointerCount = 0;
   bool _isRefreshing = false;
-  bool _driveDescendantRefreshInProgress = false;
   bool _currentFolderQuickCheckInProgress = false;
   String? _quickCheckPath;
   int? _quickCheckDirectoryModified;
@@ -775,7 +774,6 @@ class StorageTabState extends ConsumerState<StorageTab>
         WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed ||
         _currentFolderQuickCheckInProgress ||
         _isRefreshing ||
-        _driveDescendantRefreshInProgress ||
         _pendingFolderRefresh != null ||
         _queuedFolderRefreshes.isNotEmpty) {
       return;
@@ -1875,7 +1873,7 @@ class StorageTabState extends ConsumerState<StorageTab>
             _normalizedPath(currentPath) == _normalizedPath(driveRoot);
         await _runFolderRefresh(currentPath, RefreshPriority.visiblePage);
         if (isDriveRoot) {
-          await _refreshDescendants(currentPath);
+          await _refreshImmediateFolderMetadata(currentPath);
         }
       }
     } on RefreshCancelled {
@@ -1916,36 +1914,57 @@ class StorageTabState extends ConsumerState<StorageTab>
     }
   }
 
-  Future<void> _refreshDescendants(String path) async {
-    if (_driveDescendantRefreshInProgress) return;
-    _driveDescendantRefreshInProgress = true;
-    try {
-      final pending = <String>[path];
-      final visited = <String>{_normalizedPath(path)};
-      while (pending.isNotEmpty && mounted) {
-        final parentPath = pending.removeAt(0);
-        final snapshot =
-            _folderSnapshots[_directoryCacheKey(parentPath)] ??
-            const <String, Map<String, Object?>>{};
-        final childPaths = snapshot.values
-            .where((entry) => entry['isDirectory'] == true)
-            .map((entry) => entry['path']! as String)
-            .toList(growable: false);
-        for (final childPath in childPaths) {
-          if (!mounted) return;
-          if (!visited.add(_normalizedPath(childPath))) continue;
-          try {
-            await _runFolderRefresh(childPath, RefreshPriority.openPages);
-            pending.add(childPath);
-          } on RefreshCancelled {
-            return;
-          } catch (error) {
-            debugPrint('Could not refresh child folder "$childPath": $error');
-          }
-        }
+  Future<void> _refreshImmediateFolderMetadata(String rootPath) async {
+    if (!mounted ||
+        _normalizedPath(_dir?.path ?? '') != _normalizedPath(rootPath)) {
+      return;
+    }
+    final visibleDirectories = _items.whereType<Directory>().toList();
+    for (final directory in visibleDirectories) {
+      final normalizedPath = _normalizedPath(directory.path);
+      _statCache.removeWhere(
+        (path, _) => _normalizedPath(path) == normalizedPath,
+      );
+      _itemCountCache.removeWhere(
+        (key, _) => _normalizedPath(_itemCountCachePath(key)) == normalizedPath,
+      );
+    }
+
+    final settings = ref.read(appSettingsProvider);
+    final refreshStats =
+        _detailsEnabled(settings) &&
+        settings.defaultViewMode != 'grid' &&
+        (settings.showModifiedTime || settings.showModifiedDate);
+    final refreshCounts = settings.showFolderItemCount;
+    Future<void> refreshMetadata(Directory directory) async {
+      final requests = <Future<Object>>[];
+      if (refreshStats) requests.add(_statFor(directory));
+      if (refreshCounts) requests.add(_itemCountFor(directory, settings));
+      try {
+        await Future.wait(requests);
+      } catch (error) {
+        debugPrint(
+          'Could not refresh metadata for folder "${directory.path}": $error',
+        );
       }
-    } finally {
-      _driveDescendantRefreshInProgress = false;
+    }
+
+    const metadataBatchSize = 8;
+    for (
+      var index = 0;
+      index < visibleDirectories.length;
+      index += metadataBatchSize
+    ) {
+      if (!mounted ||
+          _normalizedPath(_dir?.path ?? '') != _normalizedPath(rootPath)) {
+        return;
+      }
+      final batch = visibleDirectories.skip(index).take(metadataBatchSize);
+      await Future.wait(batch.map(refreshMetadata));
+    }
+    if (mounted &&
+        _normalizedPath(_dir?.path ?? '') == _normalizedPath(rootPath)) {
+      _itemsRevision.value++;
     }
   }
 
